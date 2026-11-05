@@ -1,6 +1,5 @@
-// PhoneAgent v0.2.6
-// v0.2.6: 回退 0.2.5 的方法 E(_UICreateScreenUIImage),恢复 0.2.4 的截图逻辑,用于定位 0.2.5 启动后无反应的问题。
-// v0.2.4: 截图改为 B→C→D→A，并增加纯色图片检测，避免空白图被误判成功。
+// PhoneAgent v0.2
+// 在 v0.1(点击/滑动)基础上增加:截屏、Vision OCR、本地 HTTP 接口(127.0.0.1:8200)、后台保活。
 // 注意:截屏用的是私有接口,未经真机测试,失败时界面日志会写明原因。
 
 #import <UIKit/UIKit.h>
@@ -17,9 +16,8 @@
 #import <signal.h>
 #import <mach/mach.h>
 
-#ifndef PORT
-#define PORT 8200
-#endif
+#import <ReplayKit/ReplayKit.h>
+#import "shared.h"
 
 #pragma mark - 触摸注入 (IOHID)
 
@@ -157,67 +155,6 @@ static UIImage *imageFromSurface(void *surf, NSString **note) {
     return img;
 }
 
-// 检查 UIImage 是否真的包含屏幕内容。
-// 私有截图 API 有时会返回尺寸正确、但像素是单一纯色的“假成功”图片。
-// 当前 iPhone UI 通常同时包含背景、文字和图标；低色彩变化的图片视为无效并继续尝试下一种方法。
-static BOOL imageLooksLikeScreen(UIImage *img, NSString **note) {
-    CGImageRef source = img.CGImage;
-    if (!source) {
-        if (note) *note = @"图片没有 CGImage";
-        return NO;
-    }
-
-    const size_t side = 32;
-    uint8_t pixels[side * side * 4];
-    memset(pixels, 0, sizeof(pixels));
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(pixels, side, side, 8, side * 4, cs,
-        kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast);
-    CGColorSpaceRelease(cs);
-    if (!ctx) {
-        if (note) *note = @"创建截图检测位图失败";
-        return NO;
-    }
-
-    CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
-    CGContextDrawImage(ctx, CGRectMake(0, 0, side, side), source);
-    CGContextRelease(ctx);
-
-    int minL = 255, maxL = 0;
-    int distinct = 0;
-    uint32_t seen[side * side];
-    size_t seenCount = 0;
-
-    for (size_t i = 0; i < side * side; i++) {
-        int r = pixels[i * 4 + 0];
-        int g = pixels[i * 4 + 1];
-        int b = pixels[i * 4 + 2];
-        int lum = (299 * r + 587 * g + 114 * b) / 1000;
-        if (lum < minL) minL = lum;
-        if (lum > maxL) maxL = lum;
-
-        // 量化颜色，避免抗锯齿造成大量无意义的“不同颜色”
-        uint32_t key = ((uint32_t)(r >> 4) << 8) |
-                       ((uint32_t)(g >> 4) << 4) |
-                       (uint32_t)(b >> 4);
-        BOOL found = NO;
-        for (size_t j = 0; j < seenCount; j++) {
-            if (seen[j] == key) { found = YES; break; }
-        }
-        if (!found) {
-            seen[seenCount++] = key;
-            distinct++;
-        }
-    }
-
-    // 对当前测试界面而言，纯色/近似纯色不是有效的屏幕截图。
-    BOOL valid = (distinct >= 5 && (maxL - minL) >= 12);
-    if (!valid && note) {
-        *note = [NSString stringWithFormat:@"图片像素近似纯色(颜色种类=%d,亮度范围=%d..%d)", distinct, minL, maxL];
-    }
-    return valid;
-}
-
 // 方法 A: +[UIWindow createScreenIOSurface]
 static UIImage *shotA(NSString **note) {
     SEL sel = NSSelectorFromString(@"createScreenIOSurface");
@@ -273,26 +210,37 @@ static UIImage *shotD(NSString **note) {
     return img;
 }
 
-// 优先尝试 B→C→D，最后才尝试 A。
-// 每种方法返回图片后都检查真实像素；尺寸正常但整张纯色的图片不算截图成功。
+// 广播帧缓存(由 ReplayKit 扩展经 /frame 推送)
+static NSObject *gLock;
+static NSData *gFrame;
+static CFAbsoluteTime gFrameT, gHbT;
+
+static BOOL broadcastAlive(void) {
+    @synchronized (gLock) { return gHbT > 0 && CFAbsoluteTimeGetCurrent() - gHbT < 6; }
+}
+
+// 方法 R: 用 ReplayKit 广播扩展送来的最新一帧
+static UIImage *shotR(NSString **note) {
+    NSData *d; CFAbsoluteTime hb;
+    @synchronized (gLock) { d = gFrame; hb = gHbT; }
+    if (!d) { *note = @"还没收到广播画面(广播没开?)"; return nil; }
+    if (hb <= 0 || CFAbsoluteTimeGetCurrent() - hb > 6) { *note = @"广播已停止"; return nil; }
+    UIImage *img = [UIImage imageWithData:d];
+    if (!img) { *note = @"广播帧解码失败"; return nil; }
+    return img;
+}
+
+// 依次尝试 R→A→B→C→D;全部失败时 err 里列出每种方法的原因
 static UIImage *takeScreenshot(NSString **err) {
-    if (!pCARender) { if (err) *err = @"截屏模块未初始化"; return nil; }
     typedef UIImage *(*ShotFn)(NSString **);
-    ShotFn fns[4] = {shotB, shotC, shotD, shotA};
-    NSString *names[4] = {@"B", @"C", @"D", @"A"};
+    ShotFn fns[5] = {shotR, shotA, shotB, shotC, shotD};
+    NSString *names[5] = {@"R", @"A", @"B", @"C", @"D"};
     NSMutableString *report = [NSMutableString string];
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         NSString *note = nil;
         UIImage *img = fns[i](&note);
-        if (img) {
-            NSString *qualityNote = nil;
-            if (imageLooksLikeScreen(img, &qualityNote)) {
-                gShotMethod = names[i];
-                return img;
-            }
-            note = qualityNote ?: @"像素内容检测未通过";
-        }
-        [report appendFormat:@"%@:%@; ", names[i], note ?: @"未知失败"];
+        if (img) { gShotMethod = names[i]; return img; }
+        [report appendFormat:@"%@:%@; ", names[i], note ?: @"?"];
     }
     if (err) *err = report;
     return nil;
@@ -456,12 +404,32 @@ static void sendJSON(int c, int code, id obj) {
 }
 
 static void handleClient(int c) {
-    char buf[8192];
-    ssize_t n = read(c, buf, sizeof buf - 1);
-    if (n <= 0) { close(c); return; }
-    buf[n] = 0;
-    NSString *req = [NSString stringWithUTF8String:buf] ?: @"";
-    NSArray *parts = [[[req componentsSeparatedByString:@"\r\n"] firstObject] componentsSeparatedByString:@" "];
+    NSMutableData *raw = [NSMutableData data];
+    char buf[65536];
+    NSData *sep = [@"\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding];
+    NSRange he = NSMakeRange(NSNotFound, 0);
+    while (he.location == NSNotFound && raw.length < 262144) {
+        ssize_t n = read(c, buf, sizeof buf);
+        if (n <= 0) break;
+        [raw appendBytes:buf length:n];
+        he = [raw rangeOfData:sep options:0 range:NSMakeRange(0, raw.length)];
+    }
+    if (he.location == NSNotFound) { close(c); return; }
+    NSString *head = [[NSString alloc] initWithData:[raw subdataWithRange:NSMakeRange(0, he.location)]
+                                           encoding:NSUTF8StringEncoding] ?: @"";
+    NSUInteger bodyStart = he.location + 4;
+    long long clen = 0;
+    for (NSString *ln in [head componentsSeparatedByString:@"\r\n"])
+        if ([ln.lowercaseString hasPrefix:@"content-length:"]) clen = [[ln substringFromIndex:15] longLongValue];
+    if (clen < 0 || clen > 8 * 1024 * 1024) { close(c); return; }
+    while (raw.length < bodyStart + clen) {
+        ssize_t n = read(c, buf, sizeof buf);
+        if (n <= 0) break;
+        [raw appendBytes:buf length:n];
+    }
+    NSData *body = (clen > 0 && raw.length >= bodyStart + clen)
+        ? [raw subdataWithRange:NSMakeRange(bodyStart, (NSUInteger)clen)] : nil;
+    NSArray *parts = [[[head componentsSeparatedByString:@"\r\n"] firstObject] componentsSeparatedByString:@" "];
     if (parts.count < 2) { close(c); return; }
     NSURLComponents *uc = [NSURLComponents componentsWithString:[@"http://h" stringByAppendingString:parts[1]]];
     NSMutableDictionary *q = [NSMutableDictionary dictionary];
@@ -470,7 +438,27 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.2.6"});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.3.0", @"broadcast": @(broadcastAlive())});
+        return;
+    }
+    if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
+        if (![q[@"key"] isEqualToString:[NSString stringWithUTF8String:FRAME_KEY]]) {
+            sendJSON(c, 403, @{@"ok": @NO});
+            return;
+        }
+        BOOL was = broadcastAlive();
+        @synchronized (gLock) {
+            if ([path isEqualToString:@"/bye"]) {
+                gHbT = 0;
+            } else {
+                gHbT = CFAbsoluteTimeGetCurrent();
+                if (body.length && [path isEqualToString:@"/frame"]) { gFrame = body; gFrameT = gHbT; }
+            }
+        }
+        BOOL now = broadcastAlive();
+        if (!was && now) [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:@"广播扩展已连接(收到心跳/画面)"];
+        if (was && !now) [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:@"广播已停止"];
+        sendJSON(c, 200, @{@"ok": @YES});
         return;
     }
     if (![q[@"token"] isEqualToString:gToken]) {
@@ -559,6 +547,21 @@ static NSString *startServer(void) {
     UILabel *tip = [UILabel new];
     tip.numberOfLines = 0;
     tip.text = [NSString stringWithFormat:@"屏幕 %.0f x %.0f pt。按按钮后 3 秒内切到别的 App,等它自己执行。", s.width, s.height];
+    UILabel *bl = [UILabel new];
+    bl.numberOfLines = 0;
+    bl.text = @"屏幕广播(截屏用):点右边按钮 → 选 PhoneAgent → 开始直播";
+    RPSystemBroadcastPickerView *pv = [[RPSystemBroadcastPickerView alloc] initWithFrame:CGRectMake(0, 0, 56, 56)];
+    pv.preferredExtension = @"com.example.phoneagent.broadcast";
+    pv.showsMicrophoneButton = NO;
+    [pv.widthAnchor constraintEqualToConstant:56].active = YES;
+    [pv.heightAnchor constraintEqualToConstant:56].active = YES;
+    UIStackView *brow = [[UIStackView alloc] initWithArrangedSubviews:@[bl, pv]];
+    brow.axis = UILayoutConstraintAxisHorizontal;
+    brow.spacing = 10;
+    brow.alignment = UIStackViewAlignmentCenter;
+    __weak VC *wself = self;
+    [NSNotificationCenter.defaultCenter addObserverForName:@"pa.say" object:nil queue:nil
+                                                usingBlock:^(NSNotification *n) { [wself say:[n.object description]]; }];
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
         tip, self.xf, self.yf,
         [self btn:@"3 秒后点击 (x,y)" action:@selector(onTap)],
@@ -566,6 +569,7 @@ static NSString *startServer(void) {
         [self btn:@"3 秒后 截屏 + OCR" action:@selector(onOCR)],
         [self btn:@"后台保活 开/关" action:@selector(onKeep)],
         [self btn:@"诊断 IOSurface" action:@selector(onDiag)],
+        brow,
         self.log]];
     st.axis = UILayoutConstraintAxisVertical;
     st.spacing = 10;
@@ -650,6 +654,7 @@ static NSString *startServer(void) {
 @implementation AD
 - (BOOL)application:(UIApplication *)a didFinishLaunchingWithOptions:(NSDictionary *)o {
     signal(SIGPIPE, SIG_IGN);
+    gLock = [NSObject new];
     gToken = [NSUserDefaults.standardUserDefaults stringForKey:@"token"];
     if (!gToken) {
         gToken = [NSString stringWithFormat:@"%06u", arc4random_uniform(1000000)];
