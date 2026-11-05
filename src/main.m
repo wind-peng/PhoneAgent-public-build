@@ -1,5 +1,5 @@
-// PhoneAgent v0.2
-// 在 v0.1(点击/滑动)基础上增加:截屏、Vision OCR、本地 HTTP 接口(127.0.0.1:8200)、后台保活。
+// PhoneAgent v0.2.4
+// v0.2.4: 截图改为 B→C→D→A，并增加纯色图片检测，避免空白图被误判成功。
 // 注意:截屏用的是私有接口,未经真机测试,失败时界面日志会写明原因。
 
 #import <UIKit/UIKit.h>
@@ -156,6 +156,67 @@ static UIImage *imageFromSurface(void *surf, NSString **note) {
     return img;
 }
 
+// 检查 UIImage 是否真的包含屏幕内容。
+// 私有截图 API 有时会返回尺寸正确、但像素是单一纯色的“假成功”图片。
+// 当前 iPhone UI 通常同时包含背景、文字和图标；低色彩变化的图片视为无效并继续尝试下一种方法。
+static BOOL imageLooksLikeScreen(UIImage *img, NSString **note) {
+    CGImageRef source = img.CGImage;
+    if (!source) {
+        if (note) *note = @"图片没有 CGImage";
+        return NO;
+    }
+
+    const size_t side = 32;
+    uint8_t pixels[side * side * 4];
+    memset(pixels, 0, sizeof(pixels));
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(pixels, side, side, 8, side * 4, cs,
+        kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(cs);
+    if (!ctx) {
+        if (note) *note = @"创建截图检测位图失败";
+        return NO;
+    }
+
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, side, side), source);
+    CGContextRelease(ctx);
+
+    int minL = 255, maxL = 0;
+    int distinct = 0;
+    uint32_t seen[side * side];
+    size_t seenCount = 0;
+
+    for (size_t i = 0; i < side * side; i++) {
+        int r = pixels[i * 4 + 0];
+        int g = pixels[i * 4 + 1];
+        int b = pixels[i * 4 + 2];
+        int lum = (299 * r + 587 * g + 114 * b) / 1000;
+        if (lum < minL) minL = lum;
+        if (lum > maxL) maxL = lum;
+
+        // 量化颜色，避免抗锯齿造成大量无意义的“不同颜色”
+        uint32_t key = ((uint32_t)(r >> 4) << 8) |
+                       ((uint32_t)(g >> 4) << 4) |
+                       (uint32_t)(b >> 4);
+        BOOL found = NO;
+        for (size_t j = 0; j < seenCount; j++) {
+            if (seen[j] == key) { found = YES; break; }
+        }
+        if (!found) {
+            seen[seenCount++] = key;
+            distinct++;
+        }
+    }
+
+    // 对当前测试界面而言，纯色/近似纯色不是有效的屏幕截图。
+    BOOL valid = (distinct >= 5 && (maxL - minL) >= 12);
+    if (!valid && note) {
+        *note = [NSString stringWithFormat:@"图片像素近似纯色(颜色种类=%d,亮度范围=%d..%d)", distinct, minL, maxL];
+    }
+    return valid;
+}
+
 // 方法 A: +[UIWindow createScreenIOSurface]
 static UIImage *shotA(NSString **note) {
     SEL sel = NSSelectorFromString(@"createScreenIOSurface");
@@ -211,18 +272,26 @@ static UIImage *shotD(NSString **note) {
     return img;
 }
 
-// 依次尝试 A→B→C→D;全部失败时 err 里列出每种方法的原因
+// 优先尝试 B→C→D，最后才尝试 A。
+// 每种方法返回图片后都检查真实像素；尺寸正常但整张纯色的图片不算截图成功。
 static UIImage *takeScreenshot(NSString **err) {
     if (!pCARender) { if (err) *err = @"截屏模块未初始化"; return nil; }
     typedef UIImage *(*ShotFn)(NSString **);
-    ShotFn fns[4] = {shotA, shotB, shotC, shotD};
-    NSString *names[4] = {@"A", @"B", @"C", @"D"};
+    ShotFn fns[4] = {shotB, shotC, shotD, shotA};
+    NSString *names[4] = {@"B", @"C", @"D", @"A"};
     NSMutableString *report = [NSMutableString string];
     for (int i = 0; i < 4; i++) {
         NSString *note = nil;
         UIImage *img = fns[i](&note);
-        if (img) { gShotMethod = names[i]; return img; }
-        [report appendFormat:@"%@:%@; ", names[i], note ?: @"?"];
+        if (img) {
+            NSString *qualityNote = nil;
+            if (imageLooksLikeScreen(img, &qualityNote)) {
+                gShotMethod = names[i];
+                return img;
+            }
+            note = qualityNote ?: @"像素内容检测未通过";
+        }
+        [report appendFormat:@"%@:%@; ", names[i], note ?: @"未知失败"];
     }
     if (err) *err = report;
     return nil;
@@ -400,7 +469,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.2.3"});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.2.4"});
         return;
     }
     if (![q[@"token"] isEqualToString:gToken]) {
