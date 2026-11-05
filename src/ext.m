@@ -9,6 +9,8 @@
 #import <unistd.h>
 #import <signal.h>
 #import <string.h>
+#import <dlfcn.h>
+#import <CoreVideo/CoreVideo.h>
 #import "shared.h"
 
 static void postToHost(NSString *path, NSData *body) {
@@ -36,6 +38,19 @@ static void postToHost(NSString *path, NSData *body) {
     close(s);
 }
 
+// 在扩展进程里试一下能不能创建 IOSurface(用来判断这个限制是不是整个 App 都有)
+static int iosurfaceWorks(void) {
+    void *h = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
+    if (!h) return -1;
+    void *(*create)(CFDictionaryRef) = dlsym(h, "IOSurfaceCreate");
+    if (!create) return -1;
+    NSDictionary *d = @{@"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
+                        @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @(0x42475241)};
+    void *sf = create((__bridge CFDictionaryRef)d);
+    if (sf) { CFRelease(sf); return 1; }
+    return 0;
+}
+
 @interface SampleHandler : RPBroadcastSampleHandler
 @end
 
@@ -45,16 +60,18 @@ static void postToHost(NSString *path, NSData *body) {
     dispatch_queue_t _q;
     dispatch_source_t _timer;
     volatile int _inflight;
+    int _isf;
 }
 
 - (void)broadcastStartedWithSetupInfo:(NSDictionary<NSString *, NSObject *> *)setupInfo {
     signal(SIGPIPE, SIG_IGN);
+    _isf = iosurfaceWorks();
     _ci = [CIContext contextWithOptions:nil];
     _q = dispatch_queue_create("pa.net", DISPATCH_QUEUE_SERIAL);
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _q);
     dispatch_source_set_timer(_timer, DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC, NSEC_PER_SEC / 2);
     dispatch_source_set_event_handler(_timer, ^{
-        postToHost(@"/hb?key=" FRAME_KEY, [NSData data]);
+        postToHost([NSString stringWithFormat:@"/hb?key=%s&is=%d", FRAME_KEY, self->_isf], [NSData data]);
     });
     dispatch_resume(_timer);
 }
@@ -78,9 +95,38 @@ static void postToHost(NSString *path, NSData *body) {
                                              options:@{(id)kCGImageDestinationLossyCompressionQuality: @0.6}];
         CGColorSpaceRelease(cs);
         if (!jpg) return;
+
+        // 同时把原始 NV12 数据(去掉行尾填充)一起发过去,主 App 的 OCR 可以直接用,不必再转格式
+        uint32_t w = (uint32_t)CVPixelBufferGetWidth(pb), h = (uint32_t)CVPixelBufferGetHeight(pb);
+        OSType fmt = CVPixelBufferGetPixelFormatType(pb);
+        NSMutableData *nv = nil;
+        if (CVPixelBufferGetPlaneCount(pb) == 2 &&
+            (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
+             fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)) {
+            CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+            size_t yw = CVPixelBufferGetWidthOfPlane(pb, 0), yh = CVPixelBufferGetHeightOfPlane(pb, 0);
+            size_t yrb = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+            size_t cw = CVPixelBufferGetWidthOfPlane(pb, 1), ch = CVPixelBufferGetHeightOfPlane(pb, 1);
+            size_t crb = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+            const uint8_t *ys = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+            const uint8_t *cs2 = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+            if (ys && cs2) {
+                nv = [NSMutableData dataWithLength:yw * yh + cw * 2 * ch];
+                uint8_t *dst = nv.mutableBytes;
+                for (size_t r = 0; r < yh; r++) memcpy(dst + r * yw, ys + r * yrb, yw);
+                dst += yw * yh;
+                for (size_t r = 0; r < ch; r++) memcpy(dst + r * cw * 2, cs2 + r * crb, cw * 2);
+            }
+            CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+        }
+        uint32_t hdr[6] = {0x31464150 /* 'PAF1' */, w, h, (uint32_t)jpg.length, (uint32_t)nv.length, (uint32_t)fmt};
+        NSMutableData *pkt = [NSMutableData dataWithCapacity:sizeof hdr + jpg.length + nv.length];
+        [pkt appendBytes:hdr length:sizeof hdr];
+        [pkt appendData:jpg];
+        if (nv) [pkt appendData:nv];
         _inflight = 1;
         dispatch_async(_q, ^{
-            postToHost(@"/frame?key=" FRAME_KEY, jpg);
+            postToHost(@"/frame?key=" FRAME_KEY, pkt);
             self->_inflight = 0;
         });
     }
