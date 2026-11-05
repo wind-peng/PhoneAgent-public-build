@@ -5,6 +5,7 @@
 #import <UIKit/UIKit.h>
 #import <Vision/Vision.h>
 #import <AVFoundation/AVFoundation.h>
+#import <CoreVideo/CoreVideo.h>
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <mach/mach_time.h>
@@ -88,7 +89,7 @@ static void doSwipe(double x1, double y1, double x2, double y2, int steps, int m
     sendFinger(x2 / s.width, y2 / s.height, 2);
 }
 
-#pragma mark - 截屏 (CARenderServer + IOSurface)
+#pragma mark - 截屏(多种方法依次尝试,并记录每种的结果)
 
 static void (*pCARender)(uint32_t, CFStringRef, void *, int, int);
 static void *(*pSurfCreate)(CFDictionaryRef);
@@ -96,6 +97,10 @@ static int (*pSurfLock)(void *, uint32_t, uint32_t *);
 static int (*pSurfUnlock)(void *, uint32_t, uint32_t *);
 static void *(*pSurfBase)(void *);
 static size_t (*pSurfRowBytes)(void *);
+static size_t (*pSurfW)(void *);
+static size_t (*pSurfH)(void *);
+static CGImageRef (*pUIGetScreenImage)(void);
+static NSString *gShotMethod = @"";
 
 static NSString *loadShot(void) {
     void *qc = dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", RTLD_NOW);
@@ -108,45 +113,33 @@ static NSString *loadShot(void) {
     LOADQ(pSurfUnlock, is, "IOSurfaceUnlock")
     LOADQ(pSurfBase, is, "IOSurfaceGetBaseAddress")
     LOADQ(pSurfRowBytes, is, "IOSurfaceGetBytesPerRow")
+    LOADQ(pSurfW, is, "IOSurfaceGetWidth")
+    LOADQ(pSurfH, is, "IOSurfaceGetHeight")
+    pUIGetScreenImage = dlsym(RTLD_DEFAULT, "UIGetScreenImage"); // 可能不存在,不算失败
     return nil;
 }
 
-// 返回原生分辨率截图;失败返回 nil 并写 err
-static UIImage *takeScreenshot(NSString **err) {
-    if (!pCARender) { if (err) *err = @"截屏模块未初始化"; return nil; }
-    CGSize px = UIScreen.mainScreen.nativeBounds.size;
-    size_t w = (size_t)px.width, h = (size_t)px.height;
-    size_t bpr = ((w * 4) + 63) & ~(size_t)63; // IOSurface 要求每行字节数按 64 对齐
-    NSDictionary *full = @{
-        @"IOSurfaceWidth": @(w), @"IOSurfaceHeight": @(h),
-        @"IOSurfaceBytesPerElement": @4, @"IOSurfaceBytesPerRow": @(bpr),
-        @"IOSurfacePixelFormat": @(0x42475241), // 'BGRA'
-        @"IOSurfaceAllocSize": @(bpr * h)};
-    NSDictionary *minimal = @{
-        @"IOSurfaceWidth": @(w), @"IOSurfaceHeight": @(h),
-        @"IOSurfaceBytesPerElement": @4,
-        @"IOSurfacePixelFormat": @(0x42475241)};
-    void *surf = pSurfCreate((__bridge CFDictionaryRef)full);
-    if (!surf) surf = pSurfCreate((__bridge CFDictionaryRef)minimal);
-    if (!surf) {
-        if (err) *err = [NSString stringWithFormat:@"IOSurfaceCreate 失败(两种参数都不行,%zux%zu)", w, h];
+// 把 BGRA 的 IOSurface 拷出来做成 UIImage;note 写失败原因
+static UIImage *imageFromSurface(void *surf, NSString **note) {
+    pSurfLock(surf, 1, NULL);
+    size_t w = pSurfW(surf), h = pSurfH(surf), rb = pSurfRowBytes(surf);
+    uint8_t *base = pSurfBase(surf);
+    if (!base || !w || !h || !rb) {
+        pSurfUnlock(surf, 1, NULL);
+        if (note) *note = [NSString stringWithFormat:@"surface 无效(%zux%zu rb=%zu)", w, h, rb];
         return nil;
     }
-    pCARender(0, CFSTR("LCD"), surf, 0, 0);
-    pSurfLock(surf, 1, NULL);
-    uint8_t *base = pSurfBase(surf);
-    size_t rb = pSurfRowBytes(surf);
     NSData *data = [NSData dataWithBytes:base length:rb * h];
-    // 粗略判断是不是全黑/全空:抽样 400 个点
-    BOOL allZero = YES;
-    for (int i = 0; i < 400 && allZero; i++) {
-        size_t off = ((size_t)i * 7919 * 4) % (rb * h - 4);
-        if (((const uint8_t *)data.bytes)[off] || ((const uint8_t *)data.bytes)[off + 1] ||
-            ((const uint8_t *)data.bytes)[off + 2]) allZero = NO;
-    }
     pSurfUnlock(surf, 1, NULL);
-    CFRelease(surf);
-    if (allZero) { if (err) *err = @"截到的画面全黑(CARenderServer 可能没权限)"; return nil; }
+    const uint8_t *bytes = data.bytes;
+    BOOL allZero = YES;
+    for (int i = 0; i < 600 && allZero; i++) {
+        size_t off = (((size_t)i * 7919) % (w * h)) * 4;
+        size_t row = off / (w * 4), col = (off % (w * 4));
+        size_t o = row * rb + col;
+        if (bytes[o] || bytes[o + 1] || bytes[o + 2]) allZero = NO;
+    }
+    if (allZero) { if (note) *note = @"画面全黑"; return nil; }
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGDataProviderRef dp = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
     CGImageRef cg = CGImageCreate(w, h, 8, 32, rb, cs,
@@ -154,10 +147,82 @@ static UIImage *takeScreenshot(NSString **err) {
                                   dp, NULL, false, kCGRenderingIntentDefault);
     CGColorSpaceRelease(cs);
     CGDataProviderRelease(dp);
-    if (!cg) { if (err) *err = @"CGImageCreate 失败"; return nil; }
+    if (!cg) { if (note) *note = @"CGImageCreate 失败"; return nil; }
     UIImage *img = [UIImage imageWithCGImage:cg scale:1 orientation:UIImageOrientationUp];
     CGImageRelease(cg);
     return img;
+}
+
+// 方法 A: +[UIWindow createScreenIOSurface]
+static UIImage *shotA(NSString **note) {
+    SEL sel = NSSelectorFromString(@"createScreenIOSurface");
+    if (![UIWindow respondsToSelector:sel]) { *note = @"UIWindow 没有 createScreenIOSurface"; return nil; }
+    void *surf = ((void *(*)(id, SEL))objc_msgSend)(UIWindow.class, sel);
+    if (!surf) { *note = @"createScreenIOSurface 返回空"; return nil; }
+    UIImage *img = imageFromSurface(surf, note);
+    CFRelease(surf);
+    return img;
+}
+
+// 方法 B: UIGetScreenImage()
+static UIImage *shotB(NSString **note) {
+    if (!pUIGetScreenImage) { *note = @"没有 UIGetScreenImage 符号"; return nil; }
+    CGImageRef cg = pUIGetScreenImage();
+    if (!cg) { *note = @"UIGetScreenImage 返回空"; return nil; }
+    UIImage *img = [UIImage imageWithCGImage:cg];
+    CGImageRelease(cg);
+    return img;
+}
+
+// 方法 C: 自己 IOSurfaceCreate,再让 CARenderServer 渲染进去
+static UIImage *shotC(NSString **note) {
+    CGSize px = UIScreen.mainScreen.nativeBounds.size;
+    size_t w = (size_t)px.width, h = (size_t)px.height;
+    size_t bpr = ((w * 4) + 63) & ~(size_t)63;
+    NSDictionary *full = @{@"IOSurfaceWidth": @(w), @"IOSurfaceHeight": @(h),
+                           @"IOSurfaceBytesPerElement": @4, @"IOSurfaceBytesPerRow": @(bpr),
+                           @"IOSurfacePixelFormat": @(0x42475241), @"IOSurfaceAllocSize": @(bpr * h)};
+    void *surf = pSurfCreate((__bridge CFDictionaryRef)full);
+    if (!surf) { *note = @"IOSurfaceCreate 失败"; return nil; }
+    pCARender(0, CFSTR("LCD"), surf, 0, 0);
+    UIImage *img = imageFromSurface(surf, note);
+    CFRelease(surf);
+    return img;
+}
+
+// 方法 D: 用 CVPixelBuffer 创建带 IOSurface 的缓冲,再让 CARenderServer 渲染进去
+static UIImage *shotD(NSString **note) {
+    CGSize px = UIScreen.mainScreen.nativeBounds.size;
+    size_t w = (size_t)px.width, h = (size_t)px.height;
+    NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+                            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)};
+    CVPixelBufferRef pb = NULL;
+    CVReturn r = CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
+                                     (__bridge CFDictionaryRef)attrs, &pb);
+    if (r != kCVReturnSuccess || !pb) { *note = [NSString stringWithFormat:@"CVPixelBufferCreate 失败(%d)", (int)r]; return nil; }
+    void *surf = (void *)CVPixelBufferGetIOSurface(pb);
+    if (!surf) { CVPixelBufferRelease(pb); *note = @"CVPixelBuffer 没有 IOSurface"; return nil; }
+    pCARender(0, CFSTR("LCD"), surf, 0, 0);
+    UIImage *img = imageFromSurface(surf, note);
+    CVPixelBufferRelease(pb);
+    return img;
+}
+
+// 依次尝试 A→B→C→D;全部失败时 err 里列出每种方法的原因
+static UIImage *takeScreenshot(NSString **err) {
+    if (!pCARender) { if (err) *err = @"截屏模块未初始化"; return nil; }
+    typedef UIImage *(*ShotFn)(NSString **);
+    ShotFn fns[4] = {shotA, shotB, shotC, shotD};
+    NSString *names[4] = {@"A", @"B", @"C", @"D"};
+    NSMutableString *report = [NSMutableString string];
+    for (int i = 0; i < 4; i++) {
+        NSString *note = nil;
+        UIImage *img = fns[i](&note);
+        if (img) { gShotMethod = names[i]; return img; }
+        [report appendFormat:@"%@:%@; ", names[i], note ?: @"?"];
+    }
+    if (err) *err = report;
+    return nil;
 }
 
 static UIImage *resizeToWidth(UIImage *img, CGFloat width) {
@@ -281,7 +346,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.2.1"});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.2.2"});
         return;
     }
     if (![q[@"token"] isEqualToString:gToken]) {
@@ -440,7 +505,7 @@ static NSString *startServer(void) {
         double t1 = CFAbsoluteTimeGetCurrent() - t0;
         NSArray *items = ocrImage(img, &err);
         if (!items) { [self say:[NSString stringWithFormat:@"截屏成功(%.0fx%.0f, %.2fs),但 %@", img.size.width, img.size.height, t1, err]]; return; }
-        NSMutableString *m = [NSMutableString stringWithFormat:@"截屏 %.0fx%.0f %.2fs;OCR %lu 条 %.2fs", img.size.width, img.size.height, t1,
+        NSMutableString *m = [NSMutableString stringWithFormat:@"截屏(方法%@) %.0fx%.0f %.2fs;OCR %lu 条 %.2fs", gShotMethod, img.size.width, img.size.height, t1,
                               (unsigned long)items.count, CFAbsoluteTimeGetCurrent() - t0 - t1];
         for (NSDictionary *it in [items subarrayWithRange:NSMakeRange(0, MIN(items.count, 10))])
             [m appendFormat:@"\n  (%@,%@) %@", it[@"x"], it[@"y"], it[@"text"]];
