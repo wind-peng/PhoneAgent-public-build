@@ -10,7 +10,7 @@ jobs:
       - name: Install ldid
         run: brew install ldid
       - name: Build .tipa
-        run: ./build.sh
+        run: bash ./build.sh
       - uses: actions/upload-artifact@v4
         with:
           name: PhoneAgent-tipa
