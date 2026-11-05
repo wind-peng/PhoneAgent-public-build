@@ -1,9 +1,22 @@
-// PhoneAgent M1: 验证 TrollStore App 能否用 IOHID 私有接口"点屏幕"
-// 注意:这是未经真机测试的起点代码,私有接口细节可能需要按日志调整。
+// PhoneAgent v0.2
+// 在 v0.1(点击/滑动)基础上增加:截屏、Vision OCR、本地 HTTP 接口(127.0.0.1:8200)、后台保活。
+// 注意:截屏用的是私有接口,未经真机测试,失败时界面日志会写明原因。
 
 #import <UIKit/UIKit.h>
+#import <Vision/Vision.h>
+#import <AVFoundation/AVFoundation.h>
+#import <objc/message.h>
 #import <dlfcn.h>
 #import <mach/mach_time.h>
+#import <sys/socket.h>
+#import <netinet/in.h>
+#import <arpa/inet.h>
+#import <unistd.h>
+#import <signal.h>
+
+#define PORT 8200
+
+#pragma mark - 触摸注入 (IOHID)
 
 typedef void *IOHIDEventRef;
 typedef void *IOHIDEventSystemClientRef;
@@ -33,7 +46,7 @@ static NSString *loadHID(void) {
     LOAD(pSetInt, "IOHIDEventSetIntegerValue")
     LOAD(pSetSender, "IOHIDEventSetSenderID")
     gClient = pClientCreate(kCFAllocatorDefault);
-    if (!gClient) return @"IOHIDEventSystemClientCreate 返回空(多半是 entitlement 没生效)";
+    if (!gClient) return @"IOHIDEventSystemClientCreate 返回空";
     return nil;
 }
 
@@ -41,10 +54,10 @@ static NSString *loadHID(void) {
 static void sendFinger(double nx, double ny, int phase) {
     uint64_t t = mach_absolute_time();
     BOOL touching = (phase != 2);
-    uint32_t mask = (phase == 1) ? 0x4 : 0x3; // 0x1 range, 0x2 touch, 0x4 position
-    IOHIDEventRef hand = pCreateDigitizer(kCFAllocatorDefault, t, 3 /*hand*/, 0, 0, mask, 0,
+    uint32_t mask = (phase == 1) ? 0x4 : 0x3;
+    IOHIDEventRef hand = pCreateDigitizer(kCFAllocatorDefault, t, 3, 0, 0, mask, 0,
                                           nx, ny, 0, 0, 0, touching, touching, 0);
-    pSetInt(hand, 0xb0019, 1); // IsDisplayIntegrated
+    pSetInt(hand, 0xb0019, 1);
     IOHIDEventRef finger = pCreateFinger(kCFAllocatorDefault, t, 1, 2, mask, nx, ny, 0,
                                          touching ? 1.0 : 0.0, 0, touching, touching, 0);
     pAppend(hand, finger, 0);
@@ -54,7 +67,7 @@ static void sendFinger(double nx, double ny, int phase) {
     CFRelease(hand);
 }
 
-static CGSize screenSize(void) { return UIScreen.mainScreen.bounds.size; } // 竖屏,单位 pt
+static CGSize screenSize(void) { return UIScreen.mainScreen.bounds.size; } // pt
 
 static void doTap(double x, double y) {
     CGSize s = screenSize();
@@ -65,6 +78,7 @@ static void doTap(double x, double y) {
 
 static void doSwipe(double x1, double y1, double x2, double y2, int steps, int ms) {
     CGSize s = screenSize();
+    if (steps < 2) steps = 2;
     sendFinger(x1 / s.width, y1 / s.height, 0);
     for (int i = 1; i <= steps; i++) {
         double k = (double)i / steps;
@@ -73,6 +87,247 @@ static void doSwipe(double x1, double y1, double x2, double y2, int steps, int m
     }
     sendFinger(x2 / s.width, y2 / s.height, 2);
 }
+
+#pragma mark - 截屏 (CARenderServer + IOSurface)
+
+static void (*pCARender)(uint32_t, CFStringRef, void *, int, int);
+static void *(*pSurfCreate)(CFDictionaryRef);
+static int (*pSurfLock)(void *, uint32_t, uint32_t *);
+static int (*pSurfUnlock)(void *, uint32_t, uint32_t *);
+static void *(*pSurfBase)(void *);
+static size_t (*pSurfRowBytes)(void *);
+
+static NSString *loadShot(void) {
+    void *qc = dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", RTLD_NOW);
+    void *is = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
+    if (!qc || !is) return @"dlopen QuartzCore/IOSurface 失败";
+#define LOADQ(var, h, name) var = dlsym(h, name); if (!var) return @"缺少符号 " name;
+    LOADQ(pCARender, qc, "CARenderServerRenderDisplay")
+    LOADQ(pSurfCreate, is, "IOSurfaceCreate")
+    LOADQ(pSurfLock, is, "IOSurfaceLock")
+    LOADQ(pSurfUnlock, is, "IOSurfaceUnlock")
+    LOADQ(pSurfBase, is, "IOSurfaceGetBaseAddress")
+    LOADQ(pSurfRowBytes, is, "IOSurfaceGetBytesPerRow")
+    return nil;
+}
+
+// 返回原生分辨率截图;失败返回 nil 并写 err
+static UIImage *takeScreenshot(NSString **err) {
+    if (!pCARender) { if (err) *err = @"截屏模块未初始化"; return nil; }
+    CGSize px = UIScreen.mainScreen.nativeBounds.size;
+    size_t w = (size_t)px.width, h = (size_t)px.height, bpr = w * 4;
+    NSDictionary *props = @{
+        @"IOSurfaceWidth": @(w), @"IOSurfaceHeight": @(h),
+        @"IOSurfaceBytesPerElement": @4, @"IOSurfaceBytesPerRow": @(bpr),
+        @"IOSurfacePixelFormat": @(0x42475241), // 'BGRA'
+        @"IOSurfaceAllocSize": @(bpr * h)};
+    void *surf = pSurfCreate((__bridge CFDictionaryRef)props);
+    if (!surf) { if (err) *err = @"IOSurfaceCreate 失败"; return nil; }
+    pCARender(0, CFSTR("LCD"), surf, 0, 0);
+    pSurfLock(surf, 1, NULL);
+    uint8_t *base = pSurfBase(surf);
+    size_t rb = pSurfRowBytes(surf);
+    NSData *data = [NSData dataWithBytes:base length:rb * h];
+    // 粗略判断是不是全黑/全空:抽样 400 个点
+    BOOL allZero = YES;
+    for (int i = 0; i < 400 && allZero; i++) {
+        size_t off = ((size_t)i * 7919 * 4) % (rb * h - 4);
+        if (((const uint8_t *)data.bytes)[off] || ((const uint8_t *)data.bytes)[off + 1] ||
+            ((const uint8_t *)data.bytes)[off + 2]) allZero = NO;
+    }
+    pSurfUnlock(surf, 1, NULL);
+    CFRelease(surf);
+    if (allZero) { if (err) *err = @"截到的画面全黑(CARenderServer 可能没权限)"; return nil; }
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGDataProviderRef dp = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
+    CGImageRef cg = CGImageCreate(w, h, 8, 32, rb, cs,
+                                  kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
+                                  dp, NULL, false, kCGRenderingIntentDefault);
+    CGColorSpaceRelease(cs);
+    CGDataProviderRelease(dp);
+    if (!cg) { if (err) *err = @"CGImageCreate 失败"; return nil; }
+    UIImage *img = [UIImage imageWithCGImage:cg scale:1 orientation:UIImageOrientationUp];
+    CGImageRelease(cg);
+    return img;
+}
+
+static UIImage *resizeToWidth(UIImage *img, CGFloat width) {
+    if (width <= 0 || width >= img.size.width) return img;
+    CGFloat k = width / img.size.width;
+    CGSize ns = CGSizeMake(width, img.size.height * k);
+    UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat];
+    f.scale = 1; f.opaque = YES;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:ns format:f];
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *c) {
+        [img drawInRect:CGRectMake(0, 0, ns.width, ns.height)];
+    }];
+}
+
+#pragma mark - OCR (Vision)
+
+// 返回 [{text,x,y,w,h}],坐标是屏幕点(pt),x/y 为中心点
+static NSArray *ocrImage(UIImage *img, NSString **err) {
+    CGSize s = screenSize();
+    NSMutableArray *out = [NSMutableArray array];
+    VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] init];
+    req.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+    req.recognitionLanguages = @[@"zh-Hans", @"en-US"];
+    req.usesLanguageCorrection = YES;
+    VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCGImage:img.CGImage options:@{}];
+    NSError *e = nil;
+    if (![h performRequests:@[req] error:&e]) {
+        if (err) *err = [NSString stringWithFormat:@"OCR 失败: %@", e.localizedDescription];
+        return nil;
+    }
+    for (VNRecognizedTextObservation *o in req.results) {
+        VNRecognizedText *t = [[o topCandidates:1] firstObject];
+        if (!t.string.length) continue;
+        CGRect b = o.boundingBox; // 归一化,原点在左下
+        [out addObject:@{
+            @"text": t.string,
+            @"x": @((int)round((b.origin.x + b.size.width / 2) * s.width)),
+            @"y": @((int)round((1 - b.origin.y - b.size.height / 2) * s.height)),
+            @"w": @((int)round(b.size.width * s.width)),
+            @"h": @((int)round(b.size.height * s.height))}];
+    }
+    return out;
+}
+
+#pragma mark - 打开 App
+
+static BOOL openApp(NSString *bid) {
+    Class c = NSClassFromString(@"LSApplicationWorkspace");
+    if (!c) return NO;
+    id ws = ((id (*)(id, SEL))objc_msgSend)(c, NSSelectorFromString(@"defaultWorkspace"));
+    if (!ws) return NO;
+    return ((BOOL (*)(id, SEL, id))objc_msgSend)(ws, NSSelectorFromString(@"openApplicationWithBundleID:"), bid);
+}
+
+#pragma mark - 后台保活(静音循环)
+
+static AVAudioPlayer *gPlayer;
+
+static NSData *silentWav(void) {
+    uint32_t rate = 8000, n = rate * 2, dataLen = n; // 1 秒 16bit 单声道
+    NSMutableData *d = [NSMutableData data];
+    void (^w32)(uint32_t) = ^(uint32_t v) { [d appendBytes:&v length:4]; };
+    void (^w16)(uint16_t) = ^(uint16_t v) { [d appendBytes:&v length:2]; };
+    [d appendBytes:"RIFF" length:4]; w32(36 + dataLen);
+    [d appendBytes:"WAVEfmt " length:8]; w32(16); w16(1); w16(1); w32(rate); w32(rate * 2); w16(2); w16(16);
+    [d appendBytes:"data" length:4]; w32(dataLen);
+    [d increaseLengthBy:dataLen];
+    return d;
+}
+
+static NSString *setKeepAlive(BOOL on) {
+    if (!on) { [gPlayer stop]; gPlayer = nil; return @"后台保活已关"; }
+    AVAudioSession *s = AVAudioSession.sharedInstance;
+    NSError *e = nil;
+    [s setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&e];
+    [s setActive:YES error:&e];
+    gPlayer = [[AVAudioPlayer alloc] initWithData:silentWav() error:&e];
+    if (!gPlayer) return [NSString stringWithFormat:@"保活失败: %@", e.localizedDescription];
+    gPlayer.numberOfLoops = -1;
+    gPlayer.volume = 0.01;
+    [gPlayer play];
+    return @"后台保活已开";
+}
+
+#pragma mark - 本地 HTTP 接口
+
+static NSString *gToken;
+
+static void sendResp(int c, int code, NSString *ctype, NSData *body) {
+    NSString *head = [NSString stringWithFormat:
+        @"HTTP/1.1 %d OK\r\nContent-Type: %@\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n",
+        code, ctype, (unsigned long)body.length];
+    NSData *hd = [head dataUsingEncoding:NSUTF8StringEncoding];
+    write(c, hd.bytes, hd.length);
+    const uint8_t *p = body.bytes; size_t left = body.length;
+    while (left > 0) {
+        ssize_t n = write(c, p, left);
+        if (n <= 0) break;
+        p += n; left -= n;
+    }
+    close(c);
+}
+
+static void sendJSON(int c, int code, id obj) {
+    NSData *d = [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil] ?: [NSData data];
+    sendResp(c, code, @"application/json; charset=utf-8", d);
+}
+
+static void handleClient(int c) {
+    char buf[8192];
+    ssize_t n = read(c, buf, sizeof buf - 1);
+    if (n <= 0) { close(c); return; }
+    buf[n] = 0;
+    NSString *req = [NSString stringWithUTF8String:buf] ?: @"";
+    NSArray *parts = [[[req componentsSeparatedByString:@"\r\n"] firstObject] componentsSeparatedByString:@" "];
+    if (parts.count < 2) { close(c); return; }
+    NSURLComponents *uc = [NSURLComponents componentsWithString:[@"http://h" stringByAppendingString:parts[1]]];
+    NSMutableDictionary *q = [NSMutableDictionary dictionary];
+    for (NSURLQueryItem *i in uc.queryItems) q[i.name] = i.value ?: @"";
+    NSString *path = uc.path ?: @"/";
+    CGSize s = screenSize();
+
+    if ([path isEqualToString:@"/ping"]) {
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.2"});
+        return;
+    }
+    if (![q[@"token"] isEqualToString:gToken]) {
+        sendJSON(c, 403, @{@"ok": @NO, @"error": @"token 不对"});
+        return;
+    }
+    if ([path isEqualToString:@"/tap"]) {
+        doTap([q[@"x"] doubleValue], [q[@"y"] doubleValue]);
+        sendJSON(c, 200, @{@"ok": @YES});
+    } else if ([path isEqualToString:@"/swipe"]) {
+        int ms = q[@"ms"] ? [q[@"ms"] intValue] : 300;
+        doSwipe([q[@"x1"] doubleValue], [q[@"y1"] doubleValue],
+                [q[@"x2"] doubleValue], [q[@"y2"] doubleValue], 20, ms);
+        sendJSON(c, 200, @{@"ok": @YES});
+    } else if ([path isEqualToString:@"/open"]) {
+        BOOL ok = openApp(q[@"bundle"] ?: @"");
+        sendJSON(c, 200, @{@"ok": @(ok)});
+    } else if ([path isEqualToString:@"/screenshot"]) {
+        NSString *err = nil;
+        UIImage *img = takeScreenshot(&err);
+        if (!img) { sendJSON(c, 500, @{@"ok": @NO, @"error": err ?: @"未知错误"}); return; }
+        img = resizeToWidth(img, [q[@"w"] doubleValue]);
+        sendResp(c, 200, @"image/jpeg", UIImageJPEGRepresentation(img, 0.6));
+    } else if ([path isEqualToString:@"/ocr"]) {
+        NSString *err = nil;
+        UIImage *img = takeScreenshot(&err);
+        if (!img) { sendJSON(c, 500, @{@"ok": @NO, @"error": err ?: @"未知错误"}); return; }
+        NSArray *items = ocrImage(img, &err);
+        if (!items) { sendJSON(c, 500, @{@"ok": @NO, @"error": err ?: @"未知错误"}); return; }
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"items": items});
+    } else {
+        sendJSON(c, 404, @{@"ok": @NO, @"error": @"未知接口"});
+    }
+}
+
+static NSString *startServer(void) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return @"socket 失败";
+    int on = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_port = htons(PORT); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(sock, (struct sockaddr *)&a, sizeof a) != 0) { close(sock); return [NSString stringWithFormat:@"bind %d 失败(端口被占用?)", PORT]; }
+    if (listen(sock, 8) != 0) { close(sock); return @"listen 失败"; }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        while (1) {
+            int c = accept(sock, NULL, NULL);
+            if (c < 0) continue;
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ handleClient(c); });
+        }
+    });
+    return nil;
+}
+
+#pragma mark - 界面
 
 @interface VC : UIViewController
 @property (nonatomic, strong) UITextField *xf, *yf;
@@ -90,7 +345,7 @@ static void doSwipe(double x1, double y1, double x2, double y2, int steps, int m
 - (UIButton *)btn:(NSString *)title action:(SEL)a {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     [b setTitle:title forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
+    b.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
     [b addTarget:self action:a forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
@@ -102,27 +357,44 @@ static void doSwipe(double x1, double y1, double x2, double y2, int steps, int m
     self.yf = [self field:@"y (pt)" text:[NSString stringWithFormat:@"%d", (int)(s.height / 2)]];
     self.log = [UILabel new];
     self.log.numberOfLines = 0;
-    self.log.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
+    self.log.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
     UILabel *tip = [UILabel new];
     tip.numberOfLines = 0;
-    tip.text = [NSString stringWithFormat:@"屏幕 %.0f x %.0f pt\n填好坐标,按按钮后 3 秒内按 Home 回到桌面/别的 App,等它自己点。", s.width, s.height];
+    tip.text = [NSString stringWithFormat:@"屏幕 %.0f x %.0f pt。按按钮后 3 秒内切到别的 App,等它自己执行。", s.width, s.height];
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
         tip, self.xf, self.yf,
         [self btn:@"3 秒后点击 (x,y)" action:@selector(onTap)],
         [self btn:@"3 秒后上滑一次" action:@selector(onSwipe)],
+        [self btn:@"3 秒后 截屏 + OCR" action:@selector(onOCR)],
+        [self btn:@"后台保活 开/关" action:@selector(onKeep)],
         self.log]];
     st.axis = UILayoutConstraintAxisVertical;
-    st.spacing = 14;
+    st.spacing = 10;
     st.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:st];
+    UIScrollView *sv = [UIScrollView new];
+    sv.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:sv];
+    [sv addSubview:st];
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [st.topAnchor constraintEqualToAnchor:g.topAnchor constant:24],
-        [st.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:20],
-        [st.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-20]]];
+        [sv.topAnchor constraintEqualToAnchor:g.topAnchor],
+        [sv.bottomAnchor constraintEqualToAnchor:g.bottomAnchor],
+        [sv.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [sv.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [st.topAnchor constraintEqualToAnchor:sv.contentLayoutGuide.topAnchor constant:16],
+        [st.bottomAnchor constraintEqualToAnchor:sv.contentLayoutGuide.bottomAnchor constant:-16],
+        [st.leadingAnchor constraintEqualToAnchor:sv.frameLayoutGuide.leadingAnchor constant:20],
+        [st.trailingAnchor constraintEqualToAnchor:sv.frameLayoutGuide.trailingAnchor constant:-20]]];
     [self.view addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self.view action:@selector(endEditing:)]];
-    NSString *err = loadHID();
-    [self say:err ? [@"初始化失败: " stringByAppendingString:err] : @"HID 初始化成功"];
+
+    NSString *e1 = loadHID();
+    [self say:e1 ? [@"触摸初始化失败: " stringByAppendingString:e1] : @"触摸: 初始化成功"];
+    NSString *e2 = loadShot();
+    [self say:e2 ? [@"截屏初始化失败: " stringByAppendingString:e2] : @"截屏: 符号加载成功"];
+    NSString *e3 = startServer();
+    [self say:e3 ? [@"HTTP 服务失败: " stringByAppendingString:e3]
+                 : [NSString stringWithFormat:@"HTTP 服务: 127.0.0.1:%d\ntoken: %@\n在 Safari 打开:\nhttp://127.0.0.1:%d/ping", PORT, gToken, PORT]];
+    [self say:setKeepAlive(YES)];
 }
 - (void)say:(NSString *)m {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -131,24 +403,43 @@ static void doSwipe(double x1, double y1, double x2, double y2, int steps, int m
 }
 - (void)runLater:(void (^)(void))block name:(NSString *)name {
     [self.view endEditing:YES];
-    if (!gClient) { [self say:@"HID 没初始化,不能执行"]; return; }
     __block UIBackgroundTaskIdentifier bg = [UIApplication.sharedApplication
         beginBackgroundTaskWithExpirationHandler:^{ [UIApplication.sharedApplication endBackgroundTask:bg]; }];
     [self say:[name stringByAppendingString:@": 3 秒后执行"]];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
                    dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         block();
-        [self say:[name stringByAppendingString:@": 已发送"]];
         dispatch_async(dispatch_get_main_queue(), ^{ [UIApplication.sharedApplication endBackgroundTask:bg]; });
     });
 }
 - (void)onTap {
+    if (!gClient) { [self say:@"触摸没初始化"]; return; }
     double x = self.xf.text.doubleValue, y = self.yf.text.doubleValue;
-    [self runLater:^{ doTap(x, y); } name:[NSString stringWithFormat:@"点击(%.0f,%.0f)", x, y]];
+    [self runLater:^{ doTap(x, y); [self say:@"点击已发送"]; } name:[NSString stringWithFormat:@"点击(%.0f,%.0f)", x, y]];
 }
 - (void)onSwipe {
+    if (!gClient) { [self say:@"触摸没初始化"]; return; }
     CGSize s = screenSize();
-    [self runLater:^{ doSwipe(s.width / 2, s.height * 0.75, s.width / 2, s.height * 0.3, 20, 300); } name:@"上滑"];
+    [self runLater:^{ doSwipe(s.width / 2, s.height * 0.75, s.width / 2, s.height * 0.3, 20, 300); [self say:@"上滑已发送"]; } name:@"上滑"];
+}
+- (void)onOCR {
+    [self runLater:^{
+        NSString *err = nil;
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        UIImage *img = takeScreenshot(&err);
+        if (!img) { [self say:[@"截屏失败: " stringByAppendingString:err ?: @"?"]]; return; }
+        double t1 = CFAbsoluteTimeGetCurrent() - t0;
+        NSArray *items = ocrImage(img, &err);
+        if (!items) { [self say:[NSString stringWithFormat:@"截屏成功(%.0fx%.0f, %.2fs),但 %@", img.size.width, img.size.height, t1, err]]; return; }
+        NSMutableString *m = [NSMutableString stringWithFormat:@"截屏 %.0fx%.0f %.2fs;OCR %lu 条 %.2fs", img.size.width, img.size.height, t1,
+                              (unsigned long)items.count, CFAbsoluteTimeGetCurrent() - t0 - t1];
+        for (NSDictionary *it in [items subarrayWithRange:NSMakeRange(0, MIN(items.count, 10))])
+            [m appendFormat:@"\n  (%@,%@) %@", it[@"x"], it[@"y"], it[@"text"]];
+        [self say:m];
+    } name:@"截屏+OCR"];
+}
+- (void)onKeep {
+    [self say:setKeepAlive(gPlayer == nil)];
 }
 @end
 
@@ -157,6 +448,12 @@ static void doSwipe(double x1, double y1, double x2, double y2, int steps, int m
 @end
 @implementation AD
 - (BOOL)application:(UIApplication *)a didFinishLaunchingWithOptions:(NSDictionary *)o {
+    signal(SIGPIPE, SIG_IGN);
+    gToken = [NSUserDefaults.standardUserDefaults stringForKey:@"token"];
+    if (!gToken) {
+        gToken = [NSString stringWithFormat:@"%06u", arc4random_uniform(1000000)];
+        [NSUserDefaults.standardUserDefaults setObject:gToken forKey:@"token"];
+    }
     self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     self.window.rootViewController = [VC new];
     [self.window makeKeyAndVisible];
