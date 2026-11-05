@@ -312,6 +312,7 @@ static NSArray *ocrWithHandler(VNImageRequestHandler *h, NSString **err) {
 }
 
 // 用广播扩展送来的原始 NV12 数据建一个"不带 IOSurface"的 CVPixelBuffer 直接交给 Vision
+// 注意:锁失败或平面地址为空时必须返回 nil(走图片路径),绝不能直接 memcpy,否则闪退。
 static NSArray *ocrNV12(NSString **err) {
     NSData *nv; uint32_t w, h, fmt;
     @synchronized (gLock) { nv = gNV12; w = gNW; h = gNH; fmt = gNFmt; }
@@ -322,22 +323,38 @@ static NSArray *ocrNV12(NSString **err) {
         if (err) *err = [NSString stringWithFormat:@"建 CVPixelBuffer 失败(%d)", (int)r];
         return nil;
     }
-    CVPixelBufferLockBaseAddress(pb, 0);
+    if (CVPixelBufferGetPlaneCount(pb) != 2) {
+        CVPixelBufferRelease(pb);
+        if (err) *err = [NSString stringWithFormat:@"NV12 缓冲区平面数不对(%lu)", (unsigned long)CVPixelBufferGetPlaneCount(pb)];
+        return nil;
+    }
+    CVReturn lr = CVPixelBufferLockBaseAddress(pb, 0);
+    if (lr != kCVReturnSuccess) {
+        CVPixelBufferRelease(pb);
+        if (err) *err = [NSString stringWithFormat:@"锁 CVPixelBuffer 失败(%d)", (int)lr];
+        return nil;
+    }
     size_t yw = CVPixelBufferGetWidthOfPlane(pb, 0), yh = CVPixelBufferGetHeightOfPlane(pb, 0);
     size_t cw = CVPixelBufferGetWidthOfPlane(pb, 1), ch = CVPixelBufferGetHeightOfPlane(pb, 1);
+    size_t yrb = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+    size_t crb = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+    void *yd = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    void *cd = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+    if (!yw || !yh || !cw || !ch || !yrb || !crb || !yd || !cd) {
+        CVPixelBufferUnlockBaseAddress(pb, 0); CVPixelBufferRelease(pb);
+        if (err) *err = [NSString stringWithFormat:@"NV12 平面无效 w=%u h=%u fmt=0x%x nv=%lu yw=%zu yh=%zu cw=%zu ch=%zu yrb=%zu crb=%zu yd=%p cd=%p",
+                         w, h, fmt, (unsigned long)nv.length, yw, yh, cw, ch, yrb, crb, yd, cd];
+        return nil;
+    }
     if (nv.length != yw * yh + cw * 2 * ch) {
         CVPixelBufferUnlockBaseAddress(pb, 0); CVPixelBufferRelease(pb);
-        if (err) *err = @"NV12 数据长度对不上";
+        if (err) *err = [NSString stringWithFormat:@"NV12 数据长度对不上(数据%lu,要%zu)", (unsigned long)nv.length, yw * yh + cw * 2 * ch];
         return nil;
     }
     const uint8_t *src = nv.bytes;
-    uint8_t *yd = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-    size_t yrb = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
-    for (size_t i = 0; i < yh; i++) memcpy(yd + i * yrb, src + i * yw, yw);
+    for (size_t i = 0; i < yh; i++) memcpy((uint8_t *)yd + i * yrb, src + i * yw, yw);
     src += yw * yh;
-    uint8_t *cd = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-    size_t crb = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
-    for (size_t i = 0; i < ch; i++) memcpy(cd + i * crb, src + i * cw * 2, cw * 2);
+    for (size_t i = 0; i < ch; i++) memcpy((uint8_t *)cd + i * crb, src + i * cw * 2, cw * 2);
     CVPixelBufferUnlockBaseAddress(pb, 0);
     VNImageRequestHandler *h2 = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pb options:@{}];
     NSArray *out = ocrWithHandler(h2, err);
