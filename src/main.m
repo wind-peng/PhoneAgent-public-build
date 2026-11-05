@@ -6,6 +6,7 @@
 #import <Vision/Vision.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreVideo/CoreVideo.h>
+#import <ImageIO/ImageIO.h>
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <mach/mach_time.h>
@@ -227,13 +228,30 @@ static UIImage *shotR(NSString **note) {
     @synchronized (gLock) { d = gFrame; hb = gHbT; }
     if (!d) { *note = @"还没收到广播画面(广播没开?)"; return nil; }
     if (hb <= 0 || CFAbsoluteTimeGetCurrent() - hb > 6) { *note = @"广播已停止"; return nil; }
-    UIImage *img = [UIImage imageWithData:d];
-    if (!img) { *note = @"广播帧解码失败"; return nil; }
+    CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)d, NULL);
+    if (!src) { *note = @"广播 JPEG 解码器创建失败"; return nil; }
+    NSDictionary *props = (__bridge_transfer NSDictionary *)CGImageSourceCopyPropertiesAtIndex(src, 0, NULL);
+    NSNumber *w = props[(NSString *)kCGImagePropertyPixelWidth];
+    NSNumber *h = props[(NSString *)kCGImagePropertyPixelHeight];
+    if (!w || !h || w.unsignedIntegerValue == 0 || h.unsignedIntegerValue == 0 ||
+        w.unsignedIntegerValue > 8192 || h.unsignedIntegerValue > 8192) {
+        CFRelease(src);
+        *note = @"广播 JPEG 尺寸无效";
+        return nil;
+    }
+    CGImageRef cg = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+    CFRelease(src);
+    if (!cg) { *note = @"广播帧解码失败"; return nil; }
+    UIImage *img = [UIImage imageWithCGImage:cg scale:1 orientation:UIImageOrientationUp];
+    CGImageRelease(cg);
     return img;
 }
 
 // 依次尝试 R→A→B→C→D;全部失败时 err 里列出每种方法的原因
 static UIImage *takeScreenshot(NSString **err) {
+    // 广播开启时禁止调用 A-D 的私有 IOSurface 截图接口。
+    // 这些接口与 ReplayKit 同时工作时可能触发系统进程级崩溃，必须只使用广播帧。
+    if (broadcastAlive()) return shotR(err);
     typedef UIImage *(*ShotFn)(NSString **);
     ShotFn fns[5] = {shotR, shotA, shotB, shotC, shotD};
     NSString *names[5] = {@"R", @"A", @"B", @"C", @"D"};
@@ -262,103 +280,101 @@ static UIImage *resizeToWidth(UIImage *img, CGFloat width) {
 
 #pragma mark - OCR (Vision)
 
-// 返回 [{text,x,y,w,h}],坐标是屏幕点(pt),x/y 为中心点
-// 说明:App 在后台时不能用 GPU,所以强制只用 CPU;并依次尝试 3 种设置。
+// 返回 [{text,x,y,w,h}],坐标是屏幕点(pt),x/y 为中心点。
+// iOS 16.1 的 Vision Revision 3 Accurate 模型在本项目环境中会触发
+// "Semaphore object deallocated while in use"，因此固定使用 Revision 1/Fast。
 static NSArray *ocrWithHandler(VNImageRequestHandler *h, NSString **err) {
+    if (!h) { if (err) *err = @"Vision 请求处理器为空"; return nil; }
     CGSize s = screenSize();
-    NSMutableArray *notes = [NSMutableArray array];
-    for (int attempt = 0; attempt < 3; attempt++) {
-        VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] init];
-        req.usesCPUOnly = YES;
-        if (attempt == 0) {
-            req.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
-            req.recognitionLanguages = @[@"zh-Hans", @"en-US"];
-            req.usesLanguageCorrection = YES;
-        } else if (attempt == 1) {
-            req.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
-        } else {
-            req.recognitionLevel = VNRequestTextRecognitionLevelFast;
-            req.usesLanguageCorrection = NO;
-        }
-        NSError *e = nil;
-        BOOL ok = NO;
-        @try { ok = [h performRequests:@[req] error:&e]; }
-        @catch (NSException *ex) {
-            [notes addObject:[NSString stringWithFormat:@"第%d次异常:%@", attempt + 1, ex.reason]];
-            continue;
-        }
-        if (!ok) {
-            NSString *m = e ? e.localizedDescription : @"无错误信息";
-            if (m.length > 80) m = [m substringToIndex:80];
-            [notes addObject:[NSString stringWithFormat:@"第%d次失败:%@", attempt + 1, m]];
-            continue;
-        }
-        NSMutableArray *out = [NSMutableArray array];
-        for (VNRecognizedTextObservation *o in req.results) {
-            VNRecognizedText *t = [[o topCandidates:1] firstObject];
-            if (!t.string.length) continue;
-            CGRect bb = o.boundingBox;
-            [out addObject:@{
-                @"text": t.string,
-                @"x": @((int)round((bb.origin.x + bb.size.width / 2) * s.width)),
-                @"y": @((int)round((1 - bb.origin.y - bb.size.height / 2) * s.height)),
-                @"w": @((int)round(bb.size.width * s.width)),
-                @"h": @((int)round(bb.size.height * s.height))}];
-        }
-        return out;
+    VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] init];
+    req.revision = VNRecognizeTextRequestRevision1;
+    req.recognitionLevel = VNRequestTextRecognitionLevelFast;
+    req.recognitionLanguages = @[@"zh-Hans", @"en-US"];
+    req.usesLanguageCorrection = NO;
+    req.usesCPUOnly = YES;
+    NSError *e = nil;
+    BOOL ok = NO;
+    @try { ok = [h performRequests:@[req] error:&e]; }
+    @catch (NSException *ex) {
+        if (err) *err = [NSString stringWithFormat:@"Vision 异常:%@", ex.reason ?: @"未知异常"];
+        return nil;
     }
-    if (err) *err = [notes componentsJoinedByString:@";"];
-    return nil;
+    if (!ok) {
+        if (err) *err = e.localizedDescription ?: @"Vision 识别失败";
+        return nil;
+    }
+    NSMutableArray *out = [NSMutableArray array];
+    for (VNRecognizedTextObservation *o in req.results) {
+        VNRecognizedText *t = [[o topCandidates:1] firstObject];
+        if (!t.string.length) continue;
+        CGRect bb = o.boundingBox;
+        [out addObject:@{
+            @"text": t.string,
+            @"x": @((int)round((bb.origin.x + bb.size.width / 2) * s.width)),
+            @"y": @((int)round((1 - bb.origin.y - bb.size.height / 2) * s.height)),
+            @"w": @((int)round(bb.size.width * s.width)),
+            @"h": @((int)round(bb.size.height * s.height))}];
+    }
+    return out;
 }
 
 // 用广播扩展送来的原始 NV12 数据建一个"不带 IOSurface"的 CVPixelBuffer 直接交给 Vision
-// 注意:锁失败或平面地址为空时必须返回 nil(走图片路径),绝不能直接 memcpy,否则闪退。
 static NSArray *ocrNV12(NSString **err) {
-    // v0.4.2 加固后开广播仍闪退,说明崩点就在这条路(建缓冲/Vision 用它)。
-    // 先整条停用,只走图片路径;IOSurface 现在能建了,图片路径的 Vision 应能自己建缓冲。
-    if (err) *err = @"NV12 路径已停用";
-    return nil;
     NSData *nv; uint32_t w, h, fmt;
     @synchronized (gLock) { nv = gNV12; w = gNW; h = gNH; fmt = gNFmt; }
     if (!nv.length || !w || !h) { if (err) *err = @"没有 NV12 数据"; return nil; }
+    if (w > 8192 || h > 8192 || (w & 1) || (h & 1)) {
+        if (err) *err = [NSString stringWithFormat:@"NV12 尺寸无效(%ux%u)", w, h];
+        return nil;
+    }
+    if (fmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange &&
+        fmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) {
+        if (err) *err = [NSString stringWithFormat:@"不支持的 NV12 格式(0x%x)", fmt];
+        return nil;
+    }
+    size_t expected = (size_t)w * h + (size_t)w * h / 2;
+    if (nv.length != expected) {
+        if (err) *err = [NSString stringWithFormat:@"NV12 长度无效(%lu,应为%lu)",
+                         (unsigned long)nv.length, (unsigned long)expected];
+        return nil;
+    }
     CVPixelBufferRef pb = NULL;
     CVReturn r = CVPixelBufferCreate(kCFAllocatorDefault, w, h, fmt, NULL, &pb);
     if (r != kCVReturnSuccess || !pb) {
         if (err) *err = [NSString stringWithFormat:@"建 CVPixelBuffer 失败(%d)", (int)r];
         return nil;
     }
-    if (CVPixelBufferGetPlaneCount(pb) != 2) {
+    r = CVPixelBufferLockBaseAddress(pb, 0);
+    if (r != kCVReturnSuccess) {
         CVPixelBufferRelease(pb);
-        if (err) *err = [NSString stringWithFormat:@"NV12 缓冲区平面数不对(%lu)", (unsigned long)CVPixelBufferGetPlaneCount(pb)];
-        return nil;
-    }
-    CVReturn lr = CVPixelBufferLockBaseAddress(pb, 0);
-    if (lr != kCVReturnSuccess) {
-        CVPixelBufferRelease(pb);
-        if (err) *err = [NSString stringWithFormat:@"锁 CVPixelBuffer 失败(%d)", (int)lr];
+        if (err) *err = [NSString stringWithFormat:@"锁定 NV12 缓冲失败(%d)", (int)r];
         return nil;
     }
     size_t yw = CVPixelBufferGetWidthOfPlane(pb, 0), yh = CVPixelBufferGetHeightOfPlane(pb, 0);
     size_t cw = CVPixelBufferGetWidthOfPlane(pb, 1), ch = CVPixelBufferGetHeightOfPlane(pb, 1);
-    size_t yrb = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
-    size_t crb = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
-    void *yd = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-    void *cd = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-    if (!yw || !yh || !cw || !ch || !yrb || !crb || !yd || !cd) {
+    uint8_t *yd = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    uint8_t *cd = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+    if (!yw || !yh || !cw || !ch || !yd || !cd || nv.length != yw * yh + cw * 2 * ch) {
         CVPixelBufferUnlockBaseAddress(pb, 0); CVPixelBufferRelease(pb);
-        if (err) *err = [NSString stringWithFormat:@"NV12 平面无效 w=%u h=%u fmt=0x%x nv=%lu yw=%zu yh=%zu cw=%zu ch=%zu yrb=%zu crb=%zu yd=%p cd=%p",
-                         w, h, fmt, (unsigned long)nv.length, yw, yh, cw, ch, yrb, crb, yd, cd];
-        return nil;
-    }
-    if (nv.length != yw * yh + cw * 2 * ch) {
-        CVPixelBufferUnlockBaseAddress(pb, 0); CVPixelBufferRelease(pb);
-        if (err) *err = [NSString stringWithFormat:@"NV12 数据长度对不上(数据%lu,要%zu)", (unsigned long)nv.length, yw * yh + cw * 2 * ch];
+        if (err) *err = @"NV12 平面或数据长度无效";
         return nil;
     }
     const uint8_t *src = nv.bytes;
-    for (size_t i = 0; i < yh; i++) memcpy((uint8_t *)yd + i * yrb, src + i * yw, yw);
+    size_t yrb = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+    if (yrb < yw) {
+        CVPixelBufferUnlockBaseAddress(pb, 0); CVPixelBufferRelease(pb);
+        if (err) *err = @"NV12 Y 平面行宽无效";
+        return nil;
+    }
+    for (size_t i = 0; i < yh; i++) memcpy(yd + i * yrb, src + i * yw, yw);
     src += yw * yh;
-    for (size_t i = 0; i < ch; i++) memcpy((uint8_t *)cd + i * crb, src + i * cw * 2, cw * 2);
+    size_t crb = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+    if (crb < cw * 2) {
+        CVPixelBufferUnlockBaseAddress(pb, 0); CVPixelBufferRelease(pb);
+        if (err) *err = @"NV12 UV 平面行宽无效";
+        return nil;
+    }
+    for (size_t i = 0; i < ch; i++) memcpy(cd + i * crb, src + i * cw * 2, cw * 2);
     CVPixelBufferUnlockBaseAddress(pb, 0);
     VNImageRequestHandler *h2 = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pb options:@{}];
     NSArray *out = ocrWithHandler(h2, err);
@@ -367,22 +383,25 @@ static NSArray *ocrNV12(NSString **err) {
 }
 
 static NSArray *ocrImage(UIImage *img, NSString **err) {
+    if (!img.CGImage) { if (err) *err = @"截图没有有效图像"; return nil; }
+    // ReplayKit 在大屏设备上可能提供 2K~3K 图像；先缩小再交给 Vision，避免 OCR 峰值内存导致进程被系统杀掉。
+    UIImage *ocrImg = resizeToWidth(img, 900);
     NSMutableString *notes = [NSMutableString string];
-    if ([gShotMethod isEqualToString:@"R"]) {
-        NSString *e1 = nil;
-        NSArray *r = ocrNV12(&e1);
-        if (r) return r;
-        [notes appendFormat:@"[NV12路径]%@ ", e1];
-    }
+    // 广播帧的 NV12 缓冲由 ReplayKit 提供，格式和 IOSurface 能力随系统版本变化。
+    // 直接把它交给 Vision 在部分设备上会触发 CoreVideo/Vision 原生崩溃；
+    // 已经校验并解码的 JPEG 是稳定路径，先用它完成 OCR。
     NSString *e2 = nil;
-    if (!img.CGImage) {
-        if (err) *err = [NSString stringWithFormat:@"OCR 全部失败 [NV12路径]%@ [图片路径]图片没有 CGImage", notes];
-        return nil;
-    }
-    VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCGImage:img.CGImage options:@{}];
+    VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCGImage:ocrImg.CGImage options:@{}];
     NSArray *r = ocrWithHandler(h, &e2);
     if (r) return r;
     [notes appendFormat:@"[图片路径]%@", e2];
+    // JPEG OCR 失败时，才尝试经过完整校验的 NV12；失败只作为普通错误返回。
+    if ([gShotMethod isEqualToString:@"R"]) {
+        NSString *e1 = nil;
+        NSArray *nv = ocrNV12(&e1);
+        if (nv) return nv;
+        [notes appendFormat:@" [NV12路径]%@", e1 ?: @"失败"];
+    }
     if (err) *err = [NSString stringWithFormat:@"OCR 全部失败 %@", notes];
     return nil;
 }
@@ -537,7 +556,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.4.1", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.5.0", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -745,8 +764,12 @@ static BOOL paySheetVisible(NSArray *items) {
     return NO;
 }
 
-static void agentRun(NSString *task, NSString *base, NSString *key, NSString *model) {
+static void agentRun(NSString *task, NSString *base, NSString *key, NSString *model,
+                     void (^done)(BOOL ok, NSString *note, NSArray *items)) {
     gAgentRunning = YES;
+    BOOL ok = NO;
+    NSString *note = @"任务结束";
+    NSArray *lastItems = nil;
     NSMutableArray *history = [NSMutableArray array];
     NSString *lastSig = @""; int same = 0;
     CGSize sc = screenSize();
@@ -754,15 +777,16 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     for (int step = 1; step <= 25 && gAgentRunning; step++) {
         NSString *err = nil;
         UIImage *img = takeScreenshot(&err);
-        if (!img) { agentSay([@"截屏失败,任务停止:" stringByAppendingString:err ?: @"?"]); break; }
+        if (!img) { note = [@"截屏失败,任务停止:" stringByAppendingString:err ?: @"?"]; agentSay(note); break; }
         NSArray *items = ocrImage(img, &err);
-        if (!items) { agentSay([@"OCR 失败,任务停止:" stringByAppendingString:err ?: @"?"]); break; }
-        if (paySheetVisible(items)) { agentSay(@"看到支付/密码界面,已停止,请手动处理"); break; }
+        if (!items) { note = [@"OCR 失败,任务停止:" stringByAppendingString:err ?: @"?"]; agentSay(note); break; }
+        if (paySheetVisible(items)) { note = @"看到支付/密码界面,已停止,请手动处理"; agentSay(note); break; }
         items = [items sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
             int ya = [a[@"y"] intValue] / 12, yb = [b[@"y"] intValue] / 12;
             if (ya != yb) return ya < yb ? NSOrderedAscending : NSOrderedDescending;
             return [(NSNumber *)a[@"x"] compare:(NSNumber *)b[@"x"]];
         }];
+        lastItems = items;
         NSMutableString *screen = [NSMutableString string];
         int n = 0;
         for (NSDictionary *it in items) {
@@ -774,7 +798,7 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
         if (!screen.length) [screen appendString:@"(没识别到文字)\n"];
         if ([screen isEqualToString:lastSig]) same++; else same = 0;
         lastSig = [screen copy];
-        if (same >= 4) { agentSay(@"屏幕连续多步没变化,已停止"); break; }
+        if (same >= 4) { note = @"屏幕连续多步没变化,已停止"; agentSay(note); break; }
 
         NSMutableString *hist = [NSMutableString string];
         NSUInteger from = history.count > 8 ? history.count - 8 : 0;
@@ -787,7 +811,7 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
                           @{@"role": @"user", @"content": user}];
         NSDictionary *act = callLLM(base, key, model, msgs, &err);
         if (!gAgentRunning) break;
-        if (!act) { agentSay([@"调用模型失败,任务停止:" stringByAppendingString:err ?: @"?"]); break; }
+        if (!act) { note = [@"调用模型失败,任务停止:" stringByAppendingString:err ?: @"?"]; agentSay(note); break; }
 
         NSString *action = [[act[@"action"] description] lowercaseString] ?: @"";
         NSString *thought = [act[@"thought"] description] ?: @"";
@@ -798,13 +822,16 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
         agentSay([NSString stringWithFormat:@"第%d步:%@ → %@", step, thought, action]);
 
         if ([action isEqualToString:@"done"] || [action isEqualToString:@"stop"]) {
-            agentSay([NSString stringWithFormat:@"%@:%@", [action isEqualToString:@"done"] ? @"任务完成" : @"任务停止", [act[@"text"] description] ?: @""]);
+            NSString *t = [act[@"text"] description] ?: @"";
+            agentSay([NSString stringWithFormat:@"%@:%@", [action isEqualToString:@"done"] ? @"任务完成" : @"任务停止", t]);
+            if ([action isEqualToString:@"done"]) { ok = YES; note = t.length ? t : @"任务完成"; }
+            else note = t.length ? [@"任务停止:" stringByAppendingString:t] : @"任务停止";
             break;
         }
         NSString *result = @"已执行";
         if ([action isEqualToString:@"tap"] || [action isEqualToString:@"long_press"]) {
             NSString *danger = dangerNear(items, x, y);
-            if (danger) { agentSay([NSString stringWithFormat:@"拦截:要点击的位置是「%@」,属于支付/结算,已停止,请手动操作", danger]); break; }
+            if (danger) { note = [NSString stringWithFormat:@"拦截:要点击的位置是「%@」,属于支付/结算,已停止,请手动操作", danger]; agentSay(note); break; }
             if ([action isEqualToString:@"tap"]) doTap(x, y); else doLongPress(x, y, 900);
             [history addObject:[NSString stringWithFormat:@"%d. %@(%.0f,%.0f)", step, action, x, y]];
             sleep(2);
@@ -832,15 +859,97 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
         }
         if (![result isEqualToString:@"已执行"] && ![result isEqualToString:@"已打开"]) agentSay([@"提示:" stringByAppendingString:result]);
     }
+    if (!ok && gAgentRunning && [note isEqualToString:@"任务结束"]) note = @"25 步还没完成,已停止";
+    if (!ok && !gAgentRunning && [note isEqualToString:@"任务结束"]) note = @"任务已被手动停止";
     if (gAgentRunning) agentSay(@"任务结束");
     else agentSay(@"任务已被停止");
     gAgentRunning = NO;
+    if (done) done(ok, note, lastItems);
+}
+
+#pragma mark - 中转站 (微信 → Muse → 中转站 → 手机)
+
+static BOOL gRelayOn = NO;
+static BOOL gRelayBusy = NO;
+
+// 同步调中转站接口,返回 JSON 字典;失败返回 nil 并在 err 里写原因。
+static NSDictionary *relayJSON(NSString *method, NSString *path, NSDictionary *body, NSString **err) {
+    NSString *base = [NSUserDefaults.standardUserDefaults stringForKey:@"relay_base"] ?: @"https://dapeng.pythonanywhere.com";
+    while ([base hasSuffix:@"/"]) base = [base substringToIndex:base.length - 1];
+    NSURL *url = [NSURL URLWithString:[base stringByAppendingString:path]];
+    if (!url) { if (err) *err = @"中转站地址格式不对"; return nil; }
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:url];
+    r.HTTPMethod = method; r.timeoutInterval = 15;
+    [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    if (body) r.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    __block NSData *data = nil; __block NSError *e = nil; __block NSInteger code = 0;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *er) {
+        data = d; e = er; code = [(NSHTTPURLResponse *)resp statusCode];
+        dispatch_semaphore_signal(sem);
+    }] resume];
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    if (e || !data) { if (err) *err = [NSString stringWithFormat:@"网络错误:%@", e.localizedDescription ?: @"无数据"]; return nil; }
+    if (code != 200) { if (err) *err = [NSString stringWithFormat:@"中转站返回 %ld", (long)code]; return nil; }
+    NSDictionary *j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![j isKindOfClass:NSDictionary.class]) { if (err) *err = @"中转站返回格式不认识"; return nil; }
+    return j;
+}
+
+// 后台循环:每 2 秒问一次中转站有没有新任务;领到就跑,跑完把结果发回去。
+// 在后台队列跑,agentRun 本身是同步的,一次只跑一个任务。
+static void relayPollLoop(void) {
+    NSString *lastErr = nil;
+    while (gRelayOn) {
+        if (gRelayBusy) { sleep(1); continue; }
+        NSString *token = [NSUserDefaults.standardUserDefaults stringForKey:@"relay_token"] ?: @"";
+        NSString *err = nil;
+        NSDictionary *j = relayJSON(@"GET", [NSString stringWithFormat:@"/pa/poll?token=%@", token], nil, &err);
+        if (!j) {
+            if (![err isEqualToString:lastErr]) { agentSay([@"中转站连接失败:" stringByAppendingString:err]); lastErr = err; }
+            sleep(2); continue;
+        }
+        lastErr = nil;
+        NSDictionary *job = j[@"job"];
+        if (![job isKindOfClass:NSDictionary.class]) { sleep(2); continue; }
+        NSString *jobId = [job[@"id"] description] ?: @"";
+        NSString *goal = [job[@"goal"] description] ?: @"";
+        if (!jobId.length || !goal.length) { sleep(2); continue; }
+        gRelayBusy = YES;
+        agentSay([NSString stringWithFormat:@"中转站领到任务:%@", goal]);
+        NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+        NSString *key = [d stringForKey:@"llm_key"] ?: @"";
+        NSString *base = [d stringForKey:@"llm_base"] ?: @"";
+        NSString *model = [d stringForKey:@"llm_model"] ?: @"";
+        if (!key.length || !base.length || !model.length) {
+            agentSay(@"API Key、接口地址、模型名没填,任务做不了");
+            NSString *e2 = nil;
+            relayJSON(@"POST", @"/pa/result", @{@"token": token, @"job_id": jobId, @"status": @"failed",
+                                                @"note": @"手机里没填 API Key、接口地址、模型名", @"ocr": @[]}, &e2);
+            gRelayBusy = NO;
+            continue;
+        }
+        agentRun(goal, base, key, model, ^(BOOL ok, NSString *note, NSArray *items) {
+            NSMutableArray *ocr = [NSMutableArray array];
+            for (NSDictionary *it in items ?: @[]) {
+                if (ocr.count >= 40) break;
+                [ocr addObject:@{@"text": it[@"text"] ?: @"", @"x": it[@"x"] ?: @0, @"y": it[@"y"] ?: @0}];
+            }
+            NSString *e3 = nil;
+            NSDictionary *r = relayJSON(@"POST", @"/pa/result",
+                @{@"token": token, @"job_id": jobId, @"status": ok ? @"done" : @"failed",
+                  @"note": note ?: @"", @"ocr": ocr}, &e3);
+            if (r) agentSay([NSString stringWithFormat:@"任务结果已发回中转站:%@", ok ? @"完成" : @"失败"]);
+            else agentSay([@"任务结果发回失败:" stringByAppendingString:e3 ?: @"?"]);
+            gRelayBusy = NO;
+        });
+    }
 }
 
 #pragma mark - 界面
 
 @interface VC : UIViewController
-@property (nonatomic, strong) UITextField *xf, *yf, *keyF, *baseF, *modelF, *taskF;
+@property (nonatomic, strong) UITextField *xf, *yf, *keyF, *baseF, *modelF, *taskF, *relayBaseF, *relayTokenF;
 @property (nonatomic, strong) UILabel *log;
 @end
 
@@ -885,6 +994,11 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     self.baseF = [self tfield:@"接口地址" key:@"llm_base" secure:NO def:@"https://api.deepseek.com"];
     self.modelF = [self tfield:@"模型名" key:@"llm_model" secure:NO def:@"deepseek-chat"];
     self.taskF = [self tfield:@"任务,例如:打开淘宝,搜索 保温杯,加入购物车" key:@"llm_task" secure:NO def:@""];
+    UILabel *rl = [UILabel new];
+    rl.numberOfLines = 0;
+    rl.text = @"中转站(微信控制用):填好下面的地址和密钥,点「中转站 开」,手机每 2 秒问一次有没有新任务。";
+    self.relayBaseF = [self tfield:@"中转站地址" key:@"relay_base" secure:NO def:@"https://dapeng.pythonanywhere.com"];
+    self.relayTokenF = [self tfield:@"中转站密钥" key:@"relay_token" secure:YES def:@""];
     UILabel *bl = [UILabel new];
     bl.numberOfLines = 0;
     bl.text = @"屏幕广播(截屏用):点右边按钮 → 选 PhoneAgent → 开始直播";
@@ -911,6 +1025,8 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
         self.keyF, self.baseF, self.modelF, self.taskF,
         [self btn:@"开始任务" action:@selector(onStartAgent)],
         [self btn:@"停止任务" action:@selector(onStopAgent)],
+        rl, self.relayBaseF, self.relayTokenF,
+        [self btn:@"中转站 开/关" action:@selector(onRelay)],
         self.log]];
     st.axis = UILayoutConstraintAxisVertical;
     st.spacing = 10;
@@ -998,9 +1114,27 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     [d setObject:model forKey:@"llm_model"]; [d setObject:task forKey:@"llm_task"];
     if (!gPlayer) [self say:setKeepAlive(YES)];
     if (!broadcastAlive()) [self say:@"提醒:屏幕广播还没开,没有广播会截屏失败"];
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ agentRun(task, base, key, model); });
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ agentRun(task, base, key, model, nil); });
 }
 - (void)onStopAgent { gAgentRunning = NO; [self say:@"正在停止任务..."]; }
+- (void)onRelay {
+    if (gRelayOn) { gRelayOn = NO; [self say:@"中转站已关闭"]; return; }
+    [self.view endEditing:YES];
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    NSString *key = [self.keyF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *llmBase = [self.baseF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *model = [self.modelF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *base = [self.relayBaseF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *token = [self.relayTokenF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!key.length || !llmBase.length || !model.length) { [self say:@"先填好 API Key、接口地址、模型名再开中转站"]; return; }
+    if (!token.length) { [self say:@"中转站密钥还没填"]; return; }
+    [d setObject:key forKey:@"llm_key"]; [d setObject:llmBase forKey:@"llm_base"]; [d setObject:model forKey:@"llm_model"];
+    [d setObject:base.length ? base : @"https://dapeng.pythonanywhere.com" forKey:@"relay_base"];
+    [d setObject:token forKey:@"relay_token"];
+    gRelayOn = YES;
+    [self say:@"中转站已开启,每 2 秒问一次有没有新任务"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ relayPollLoop(); });
+}
 - (void)onDiag { [self say:diagReport()]; }
 - (void)onKeep {
     [self say:setKeepAlive(gPlayer == nil)];
