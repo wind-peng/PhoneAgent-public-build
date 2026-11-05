@@ -14,8 +14,11 @@
 #import <arpa/inet.h>
 #import <unistd.h>
 #import <signal.h>
+#import <mach/mach.h>
 
+#ifndef PORT
 #define PORT 8200
+#endif
 
 #pragma mark - 触摸注入 (IOHID)
 
@@ -267,6 +270,57 @@ static NSArray *ocrImage(UIImage *img, NSString **err) {
     return out;
 }
 
+#pragma mark - 诊断:为什么创建不了 IOSurface
+
+static NSString *diagReport(void) {
+    NSMutableString *r = [NSMutableString stringWithString:@"[诊断]\n"];
+    [r appendFormat:@"uid=%d home=%@\n", getuid(), NSHomeDirectory()];
+    [r appendFormat:@"可写 /var/mobile/Library: %@\n", access("/var/mobile/Library", W_OK) == 0 ? @"是" : @"否"];
+    // 1) 实际生效的 entitlement
+    void *sec = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOW);
+    void *(*fTask)(CFAllocatorRef) = sec ? dlsym(sec, "SecTaskCreateFromSelf") : NULL;
+    CFTypeRef (*fVal)(void *, CFStringRef, CFErrorRef *) = sec ? dlsym(sec, "SecTaskCopyValueForEntitlement") : NULL;
+    if (fTask && fVal) {
+        void *task = fTask(kCFAllocatorDefault);
+        NSArray *keys = @[@"platform-application", @"com.apple.private.security.no-sandbox",
+                          @"com.apple.private.security.no-container",
+                          @"com.apple.private.hid.client.event-dispatch",
+                          @"com.apple.backboard.client"];
+        for (NSString *k in keys) {
+            CFTypeRef v = task ? fVal(task, (__bridge CFStringRef)k, NULL) : NULL;
+            [r appendFormat:@"  %@ = %@\n", [k stringByReplacingOccurrencesOfString:@"com.apple.private." withString:@""], v ? (__bridge id)v : @"无"];
+            if (v) CFRelease(v);
+        }
+    } else {
+        [r appendString:@"  读取 entitlement 失败(缺少 Security 符号)\n"];
+    }
+    // 2) 能不能打开 IOSurfaceRoot
+    void *k = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+    CFMutableDictionaryRef (*fMatch)(const char *) = k ? dlsym(k, "IOServiceMatching") : NULL;
+    uint32_t (*fGet)(uint32_t, CFDictionaryRef) = k ? dlsym(k, "IOServiceGetMatchingService") : NULL;
+    int (*fOpen)(uint32_t, uint32_t, uint32_t, uint32_t *) = k ? dlsym(k, "IOServiceOpen") : NULL;
+    int (*fClose)(uint32_t) = k ? dlsym(k, "IOServiceClose") : NULL;
+    if (fMatch && fGet && fOpen) {
+        uint32_t svc = fGet(0, fMatch("IOSurfaceRoot"));
+        [r appendFormat:@"IOSurfaceRoot 服务: %@\n", svc ? @"找到" : @"没找到"];
+        if (svc) {
+            uint32_t conn = 0;
+            int kr = fOpen(svc, mach_task_self(), 0, &conn);
+            [r appendFormat:@"IOServiceOpen(IOSurfaceRoot) = 0x%x %@\n", (unsigned)kr, kr == 0 ? @"(成功)" : @"(失败)"];
+            if (kr == 0 && fClose) fClose(conn);
+        }
+    }
+    // 3) 小尺寸 IOSurface
+    if (pSurfCreate) {
+        NSDictionary *d = @{@"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64,
+                            @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @(0x42475241)};
+        void *sf = pSurfCreate((__bridge CFDictionaryRef)d);
+        [r appendFormat:@"64x64 IOSurfaceCreate: %@", sf ? @"成功" : @"失败"];
+        if (sf) CFRelease(sf);
+    }
+    return r;
+}
+
 #pragma mark - 打开 App
 
 static BOOL openApp(NSString *bid) {
@@ -346,7 +400,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.2.2"});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.2.3"});
         return;
     }
     if (![q[@"token"] isEqualToString:gToken]) {
@@ -441,6 +495,7 @@ static NSString *startServer(void) {
         [self btn:@"3 秒后上滑一次" action:@selector(onSwipe)],
         [self btn:@"3 秒后 截屏 + OCR" action:@selector(onOCR)],
         [self btn:@"后台保活 开/关" action:@selector(onKeep)],
+        [self btn:@"诊断 IOSurface" action:@selector(onDiag)],
         self.log]];
     st.axis = UILayoutConstraintAxisVertical;
     st.spacing = 10;
@@ -469,6 +524,7 @@ static NSString *startServer(void) {
     [self say:e3 ? [@"HTTP 服务失败: " stringByAppendingString:e3]
                  : [NSString stringWithFormat:@"HTTP 服务: 127.0.0.1:%d\ntoken: %@\n在 Safari 打开:\nhttp://127.0.0.1:%d/ping", PORT, gToken, PORT]];
     [self say:setKeepAlive(YES)];
+    [self say:diagReport()];
 }
 - (void)say:(NSString *)m {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -512,6 +568,7 @@ static NSString *startServer(void) {
         [self say:m];
     } name:@"截屏+OCR"];
 }
+- (void)onDiag { [self say:diagReport()]; }
 - (void)onKeep {
     [self say:setKeepAlive(gPlayer == nil)];
 }
