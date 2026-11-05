@@ -115,14 +115,23 @@ static NSString *loadShot(void) {
 static UIImage *takeScreenshot(NSString **err) {
     if (!pCARender) { if (err) *err = @"截屏模块未初始化"; return nil; }
     CGSize px = UIScreen.mainScreen.nativeBounds.size;
-    size_t w = (size_t)px.width, h = (size_t)px.height, bpr = w * 4;
-    NSDictionary *props = @{
+    size_t w = (size_t)px.width, h = (size_t)px.height;
+    size_t bpr = ((w * 4) + 63) & ~(size_t)63; // IOSurface 要求每行字节数按 64 对齐
+    NSDictionary *full = @{
         @"IOSurfaceWidth": @(w), @"IOSurfaceHeight": @(h),
         @"IOSurfaceBytesPerElement": @4, @"IOSurfaceBytesPerRow": @(bpr),
         @"IOSurfacePixelFormat": @(0x42475241), // 'BGRA'
         @"IOSurfaceAllocSize": @(bpr * h)};
-    void *surf = pSurfCreate((__bridge CFDictionaryRef)props);
-    if (!surf) { if (err) *err = @"IOSurfaceCreate 失败"; return nil; }
+    NSDictionary *minimal = @{
+        @"IOSurfaceWidth": @(w), @"IOSurfaceHeight": @(h),
+        @"IOSurfaceBytesPerElement": @4,
+        @"IOSurfacePixelFormat": @(0x42475241)};
+    void *surf = pSurfCreate((__bridge CFDictionaryRef)full);
+    if (!surf) surf = pSurfCreate((__bridge CFDictionaryRef)minimal);
+    if (!surf) {
+        if (err) *err = [NSString stringWithFormat:@"IOSurfaceCreate 失败(两种参数都不行,%zux%zu)", w, h];
+        return nil;
+    }
     pCARender(0, CFSTR("LCD"), surf, 0, 0);
     pSurfLock(surf, 1, NULL);
     uint8_t *base = pSurfBase(surf);
@@ -272,7 +281,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.2"});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.2.1"});
         return;
     }
     if (![q[@"token"] isEqualToString:gToken]) {
