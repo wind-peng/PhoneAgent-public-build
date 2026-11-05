@@ -1,5 +1,5 @@
-// PhoneAgent v0.2.5
-// v0.2.5: 增加方法 E: _UICreateScreenUIImage(),让系统内部完成截图,优先尝试。
+// PhoneAgent v0.2.6
+// v0.2.6: 回退 0.2.5 的方法 E(_UICreateScreenUIImage),恢复 0.2.4 的截图逻辑,用于定位 0.2.5 启动后无反应的问题。
 // v0.2.4: 截图改为 B→C→D→A，并增加纯色图片检测，避免空白图被误判成功。
 // 注意:截屏用的是私有接口,未经真机测试,失败时界面日志会写明原因。
 
@@ -104,7 +104,6 @@ static size_t (*pSurfRowBytes)(void *);
 static size_t (*pSurfW)(void *);
 static size_t (*pSurfH)(void *);
 static CGImageRef (*pUIGetScreenImage)(void);
-static UIImage *(*pUICreateScreenUIImage)(void);
 static NSString *gShotMethod = @"";
 
 static NSString *loadShot(void) {
@@ -121,11 +120,6 @@ static NSString *loadShot(void) {
     LOADQ(pSurfW, is, "IOSurfaceGetWidth")
     LOADQ(pSurfH, is, "IOSurfaceGetHeight")
     pUIGetScreenImage = dlsym(RTLD_DEFAULT, "UIGetScreenImage"); // 可能不存在,不算失败
-    // 方法 E: UIKit 私有截图函数,历史上的 iOS 截图实现曾用它。
-    // 在 iOS 16 上可能已不存在,找不到也不算失败,继续试其他方法。
-    void *ui = dlopen("/System/Library/Frameworks/UIKit.framework/UIKit", RTLD_NOW);
-    pUICreateScreenUIImage = ui ? dlsym(ui, "_UICreateScreenUIImage") : NULL;
-    if (!pUICreateScreenUIImage) pUICreateScreenUIImage = dlsym(RTLD_DEFAULT, "_UICreateScreenUIImage");
     return nil;
 }
 
@@ -224,14 +218,6 @@ static BOOL imageLooksLikeScreen(UIImage *img, NSString **note) {
     return valid;
 }
 
-// 方法 E: _UICreateScreenUIImage(),让系统内部完成截图
-static UIImage *shotE(NSString **note) {
-    if (!pUICreateScreenUIImage) { *note = @"没有 _UICreateScreenUIImage 符号"; return nil; }
-    UIImage *img = pUICreateScreenUIImage();
-    if (!img) { *note = @"_UICreateScreenUIImage 返回空"; return nil; }
-    return img;
-}
-
 // 方法 A: +[UIWindow createScreenIOSurface]
 static UIImage *shotA(NSString **note) {
     SEL sel = NSSelectorFromString(@"createScreenIOSurface");
@@ -287,15 +273,15 @@ static UIImage *shotD(NSString **note) {
     return img;
 }
 
-// 优先尝试 E→B→C→D，最后才尝试 A。
+// 优先尝试 B→C→D，最后才尝试 A。
 // 每种方法返回图片后都检查真实像素；尺寸正常但整张纯色的图片不算截图成功。
 static UIImage *takeScreenshot(NSString **err) {
     if (!pCARender) { if (err) *err = @"截屏模块未初始化"; return nil; }
     typedef UIImage *(*ShotFn)(NSString **);
-    ShotFn fns[5] = {shotE, shotB, shotC, shotD, shotA};
-    NSString *names[5] = {@"E", @"B", @"C", @"D", @"A"};
+    ShotFn fns[4] = {shotB, shotC, shotD, shotA};
+    NSString *names[4] = {@"B", @"C", @"D", @"A"};
     NSMutableString *report = [NSMutableString string];
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 4; i++) {
         NSString *note = nil;
         UIImage *img = fns[i](&note);
         if (img) {
@@ -484,7 +470,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.2.5"});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.2.6"});
         return;
     }
     if (![q[@"token"] isEqualToString:gToken]) {
