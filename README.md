@@ -1,17 +1,28 @@
-# PhoneAgent M1:验证 TrollStore App 能不能"点屏幕"
+# PhoneAgent v0.2:截屏 + OCR + 本地接口 + 后台保活
 
 ## 编译
-1. 新建一个 GitHub 仓库,把本目录所有文件(包括隐藏的 `.github` 文件夹)原样上传。
-2. 进入仓库的 Actions 页面,等 `build-tipa` 跑完(失败的话把日志最后 30 行发给我)。
-3. 在运行结果底部的 Artifacts 里下载 `PhoneAgent-tipa`,解压得到 `PhoneAgent.tipa`。
+和上一版一样:把本目录所有文件(含隐藏的 `.github` 文件夹)上传到 GitHub 仓库,
+Actions 跑完后下载 `PhoneAgent-tipa`,解压出 `PhoneAgent.tipa`,用 TrollStore 安装(会覆盖旧版)。
 
-## 安装与测试
-1. 用 TrollStore 打开 `PhoneAgent.tipa` 安装。
-2. 打开 App,顶部日志应显示"HID 初始化成功"。
-3. 填一个桌面上某个图标的坐标(单位是 pt,不是像素),点"3 秒后点击",马上按 Home 回桌面,等 3 秒看图标是否被点开。
-4. 再试"3 秒后上滑一次",在桌面或浏览器里看是否滚动。
+## 测试(按顺序)
+1. 打开 App,看日志。应该有:
+   - 触摸: 初始化成功
+   - 截屏: 符号加载成功
+   - HTTP 服务: 127.0.0.1:8200,并显示 6 位 token
+   - 后台保活已开
+2. 点"3 秒后 截屏 + OCR",马上切到一个有文字的 App(比如设置),等 3 秒,回来看日志:
+   会显示截屏分辨率、耗时、OCR 识别到的文字及坐标(单位 pt,可直接喂给点击)。
+3. 在 Safari 打开 `http://127.0.0.1:8200/ping`,应返回 JSON。
+   再试 `http://127.0.0.1:8200/ocr?token=你的token`、`/screenshot?token=...&w=540`。
+
+## 接口(都在手机本机 127.0.0.1:8200,除 /ping 外都要 ?token=)
+- /ping
+- /tap?x=&y=
+- /swipe?x1=&y1=&x2=&y2=&ms=
+- /open?bundle=com.apple.mobilesafari
+- /screenshot?w=540        (JPEG,w 可缩小宽度)
+- /ocr                     (JSON,items 里 x/y 是文字中心点,单位 pt)
 
 ## 出问题时告诉我
-- TrollStore 安装失败:把报错文字发来,多半是某个 entitlement 不被接受,删掉 entitlements.plist 里对应一行重编。
-- 初始化失败:把日志第一行发来。
-- 初始化成功但点了没反应:告诉我是桌面还是 App 里,我再调整事件参数。
+- 日志里"截屏失败"后面的文字(例如"全黑"或"缺少符号")。
+- Safari 打不开 /ping 时,说明服务没起来或被系统挂起,把日志发我。
