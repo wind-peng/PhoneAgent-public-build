@@ -1,4 +1,4 @@
-# PhoneAgent v0.2.1:截屏 + OCR + 本地接口 + 后台保活
+# PhoneAgent v0.2.2:截屏 + OCR + 本地接口 + 后台保活
 
 ## 编译
 和上一版一样:把本目录所有文件(含隐藏的 `.github` 文件夹)上传到 GitHub 仓库,
