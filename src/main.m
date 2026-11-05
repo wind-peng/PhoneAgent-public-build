@@ -314,6 +314,10 @@ static NSArray *ocrWithHandler(VNImageRequestHandler *h, NSString **err) {
 // 用广播扩展送来的原始 NV12 数据建一个"不带 IOSurface"的 CVPixelBuffer 直接交给 Vision
 // 注意:锁失败或平面地址为空时必须返回 nil(走图片路径),绝不能直接 memcpy,否则闪退。
 static NSArray *ocrNV12(NSString **err) {
+    // v0.4.2 加固后开广播仍闪退,说明崩点就在这条路(建缓冲/Vision 用它)。
+    // 先整条停用,只走图片路径;IOSurface 现在能建了,图片路径的 Vision 应能自己建缓冲。
+    if (err) *err = @"NV12 路径已停用";
+    return nil;
     NSData *nv; uint32_t w, h, fmt;
     @synchronized (gLock) { nv = gNV12; w = gNW; h = gNH; fmt = gNFmt; }
     if (!nv.length || !w || !h) { if (err) *err = @"没有 NV12 数据"; return nil; }
@@ -371,6 +375,10 @@ static NSArray *ocrImage(UIImage *img, NSString **err) {
         [notes appendFormat:@"[NV12路径]%@ ", e1];
     }
     NSString *e2 = nil;
+    if (!img.CGImage) {
+        if (err) *err = [NSString stringWithFormat:@"OCR 全部失败 [NV12路径]%@ [图片路径]图片没有 CGImage", notes];
+        return nil;
+    }
     VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCGImage:img.CGImage options:@{}];
     NSArray *r = ocrWithHandler(h, &e2);
     if (r) return r;
