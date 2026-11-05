@@ -6,6 +6,7 @@
 #import <Vision/Vision.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreVideo/CoreVideo.h>
+#import <CoreImage/CoreImage.h>
 #import <ImageIO/ImageIO.h>
 #import <objc/message.h>
 #import <dlfcn.h>
@@ -278,11 +279,28 @@ static UIImage *resizeToWidth(UIImage *img, CGFloat width) {
     }];
 }
 
+static UIImage *prepareOCRImage(UIImage *src) {
+    UIImage *scaled = resizeToWidth(src, 1400);
+    CIImage *input = [[CIImage alloc] initWithImage:scaled];
+    if (!input) return scaled;
+    CIFilter *filter = [CIFilter filterWithName:@"CIColorControls"];
+    [filter setValue:input forKey:kCIInputImageKey];
+    [filter setValue:@0.0 forKey:kCIInputSaturationKey];
+    [filter setValue:@1.18 forKey:kCIInputContrastKey];
+    [filter setValue:@0.02 forKey:kCIInputBrightnessKey];
+    CIContext *ctx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @YES}];
+    CGImageRef cg = [ctx createCGImage:filter.outputImage fromRect:filter.outputImage.extent];
+    if (!cg) return scaled;
+    UIImage *out = [UIImage imageWithCGImage:cg scale:1 orientation:UIImageOrientationUp];
+    CGImageRelease(cg);
+    return out;
+}
+
 #pragma mark - OCR (Vision)
 
 // 返回 [{text,x,y,w,h}],坐标是屏幕点(pt),x/y 为中心点。
-// iOS 16.1 的 Vision Revision 3 Accurate 模型在本项目环境中会触发
-// "Semaphore object deallocated while in use"，因此固定使用 Revision 1/Fast。
+// iOS 16.1 的 Vision Revision 3 模型在本项目环境中会触发
+// "Semaphore object deallocated while in use"，因此固定使用稳定的 Revision 1/Fast。
 static NSArray *ocrWithHandler(VNImageRequestHandler *h, NSString **err) {
     if (!h) { if (err) *err = @"Vision 请求处理器为空"; return nil; }
     CGSize s = screenSize();
@@ -384,8 +402,8 @@ static NSArray *ocrNV12(NSString **err) {
 
 static NSArray *ocrImage(UIImage *img, NSString **err) {
     if (!img.CGImage) { if (err) *err = @"截图没有有效图像"; return nil; }
-    // ReplayKit 在大屏设备上可能提供 2K~3K 图像；先缩小再交给 Vision，避免 OCR 峰值内存导致进程被系统杀掉。
-    UIImage *ocrImg = resizeToWidth(img, 900);
+    // 先放大、灰度化并提高对比度，再交给稳定的 Revision 1/Fast，改善小字识别。
+    UIImage *ocrImg = prepareOCRImage(img);
     NSMutableString *notes = [NSMutableString string];
     // 广播帧的 NV12 缓冲由 ReplayKit 提供，格式和 IOSurface 能力随系统版本变化。
     // 直接把它交给 Vision 在部分设备上会触发 CoreVideo/Vision 原生崩溃；
@@ -556,7 +574,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.5.0", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.5.1", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -681,6 +699,24 @@ static NSString *bundleForAppName(NSString *name, NSString **info) {
     return r;
 }
 
+static NSDictionary *parseModelJSON(NSString *raw) {
+    if (![raw isKindOfClass:NSString.class]) return nil;
+    NSString *s = [raw stringByReplacingOccurrencesOfString:@"```json" withString:@""];
+    s = [s stringByReplacingOccurrencesOfString:@"```" withString:@""];
+    s = [s stringByReplacingOccurrencesOfString:@"：" withString:@":"];
+    s = [s stringByReplacingOccurrencesOfString:@"，" withString:@","];
+    s = [s stringByReplacingOccurrencesOfString:@"“" withString:@"\""];
+    s = [s stringByReplacingOccurrencesOfString:@"”" withString:@"\""];
+    s = [s stringByReplacingOccurrencesOfString:@"mvisible_text\"\"" withString:@"\"visible_text\":\""];
+    NSRange begin = [s rangeOfString:@"{"];
+    NSRange end = [s rangeOfString:@"}" options:NSBackwardsSearch];
+    if (begin.location == NSNotFound || end.location == NSNotFound || end.location < begin.location) return nil;
+    s = [s substringWithRange:NSMakeRange(begin.location, end.location - begin.location + 1)];
+    id obj = [NSJSONSerialization JSONObjectWithData:[s dataUsingEncoding:NSUTF8StringEncoding]
+                                               options:0 error:nil];
+    return [obj isKindOfClass:NSDictionary.class] ? obj : nil;
+}
+
 static NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSArray *messages, NSString **err) {
     while ([base hasSuffix:@"/"]) base = [base substringToIndex:base.length - 1];
     NSURL *url = [NSURL URLWithString:[base stringByAppendingString:@"/chat/completions"]];
@@ -690,8 +726,8 @@ static NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSA
     r.timeoutInterval = 90;
     [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     [r setValue:[@"Bearer " stringByAppendingString:key] forHTTPHeaderField:@"Authorization"];
-    NSDictionary *body = @{@"model": model, @"messages": messages, @"temperature": @0.2,
-                           @"max_tokens": @500, @"response_format": @{@"type": @"json_object"}};
+    NSDictionary *body = @{@"model": model, @"messages": messages, @"temperature": @0.1,
+                           @"max_tokens": @700, @"response_format": @{@"type": @"json_object"}};
     r.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
     __block NSData *data = nil; __block NSError *e = nil; __block NSInteger code = 0;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
@@ -712,8 +748,7 @@ static NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSA
     if (![content isKindOfClass:NSString.class]) { *err = @"接口返回格式不认识"; return nil; }
     content = [[content stringByReplacingOccurrencesOfString:@"```json" withString:@""]
                stringByReplacingOccurrencesOfString:@"```" withString:@""];
-    NSDictionary *act = [NSJSONSerialization JSONObjectWithData:[content dataUsingEncoding:NSUTF8StringEncoding]
-                                                        options:0 error:nil];
+    NSDictionary *act = parseModelJSON(content);
     if (![act isKindOfClass:NSDictionary.class]) {
         *err = [NSString stringWithFormat:@"模型没返回 JSON: %@", content.length > 120 ? [content substringToIndex:120] : content];
         return nil;
@@ -722,23 +757,83 @@ static NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSA
 }
 
 static NSString *const kAgentSystem =
-@"你是一个控制 iPhone 的智能体,屏幕大小 390x844 pt。每一步你会收到:任务、最近的动作历史、当前屏幕上识别到的文字及其中心坐标(x,y,单位 pt)。\n"
-@"只输出一个 JSON 对象,不要输出其他内容。字段:thought(一句话说明意图)、action、以及该动作需要的参数。\n"
+@"你是一个控制 iPhone 的视觉智能体,屏幕大小 390x844 pt。每一步都会收到当前屏幕截图、任务和最近的动作历史。请直接观察截图中的中文和界面，不要依赖本地 OCR。\n"
+@"只输出一个 JSON 对象,不要输出其他内容。thought 不超过20个字；visible_text 只抄录关键文字且不超过120字；然后输出 action 和参数。\n"
 @"action 可选值:\n"
 @"- tap: 参数 x,y。点击。\n"
 @"- long_press: 参数 x,y。长按。\n"
 @"- swipe: 参数 x,y,x2,y2。从(x,y)滑到(x2,y2)。往下看更多内容用从下往上滑(y 大,y2 小)。\n"
 @"- open_app: 参数 name(App 的中文名)。直接打开 App。\n"
+@"- input_text: 参数 x,y,text。程序会把 text 写入剪贴板、点击并长按(x,y)输入框呼出菜单；下一步必须观察并点击“粘贴”或“允许粘贴”，再确认输入框出现目标文字。这是输入文字的首选动作。\n"
 @"- set_clipboard: 参数 text。把文字放进剪贴板。输入文字的办法:set_clipboard,然后 tap 输入框,再 long_press 输入框,再 tap 弹出的\"粘贴\",若出现\"允许粘贴\"就点它。\n"
 @"- wait: 等待 1.5 秒。\n"
 @"- done: 参数 text。任务已完成。\n"
 @"- stop: 参数 text。无法继续或需要人工处理。\n"
 @"规则:\n"
-@"1. 坐标只能取自屏幕文字列表,或根据版面(如底部标签栏、右上角图标)合理推断。\n"
+@"1. 坐标使用屏幕 pt 坐标,只能取自截图中的文字/控件位置,或根据版面合理推断。\n"
 @"2. 只做到\"加入购物车\"为止。绝不点击结算、支付、提交订单、立即购买、确认付款;遇到这些步骤立即 stop。\n"
 @"3. 每步只做一个动作。\n"
 @"4. 屏幕连续没变化就换一种办法,仍不行就 stop。\n"
-@"5. 看不到想要的内容时,先上滑或换搜索词,不要重复无效动作。";
+@"5. 看不到想要的内容时,先上滑或换搜索词,不要重复无效动作。\n"
+@"6. visible_text 必须如实抄录截图中的关键文字,如果看到支付密码、付款、结算、提交订单等内容,action 必须为 stop。\n"
+@"7. input_text 后如果看到“粘贴”或“允许粘贴”，必须点击对应菜单；如果输入框仍为空，重新使用 input_text，不要只重复 tap。";
+
+static NSArray *visionMessages(NSString *task, NSString *history, UIImage *img, NSString **err) {
+    UIImage *scaled = resizeToWidth(img, 1400);
+    NSData *jpg = UIImageJPEGRepresentation(scaled, 0.85);
+    if (!jpg.length) { if (err) *err = @"截图 JPEG 编码失败"; return nil; }
+    NSString *b64 = [jpg base64EncodedStringWithOptions:0];
+    if (!b64.length) { if (err) *err = @"截图 Base64 编码失败"; return nil; }
+    NSString *text = [NSString stringWithFormat:
+                      @"任务:%@\n\n最近的动作:\n%@\n请观察下面这张当前屏幕截图并返回一个 JSON 动作。",
+                      task, history.length ? history : @"(还没有)"];
+    NSDictionary *image = @{ @"type": @"image_url",
+                             @"image_url": @{ @"url": [@"data:image/jpeg;base64," stringByAppendingString:b64],
+                                               @"detail": @"original" }};
+    NSDictionary *user = @{ @"role": @"user", @"content": @[
+        @{ @"type": @"text", @"text": text }, image ] };
+    return @[ @{ @"role": @"system", @"content": kAgentSystem }, user ];
+}
+
+static NSArray *textMessages(NSString *task, NSString *history, NSArray *items) {
+    NSMutableString *screen = [NSMutableString string];
+    int n = 0;
+    for (NSDictionary *it in items) {
+        if (n++ >= 120) break;
+        NSString *t = it[@"text"];
+        if (t.length > 60) t = [t substringToIndex:60];
+        [screen appendFormat:@"(%@,%@) %@\n", it[@"x"], it[@"y"], t];
+    }
+    if (!screen.length) [screen appendString:@"(本地 OCR 没有识别到文字)\n"];
+    NSString *user = [NSString stringWithFormat:
+                      @"任务:%@\n\n最近的动作:\n%@\n当前屏幕文字(x,y 文字):\n%@",
+                      task, history.length ? history : @"(还没有)\n", screen];
+    return @[ @{ @"role": @"system", @"content": kAgentSystem },
+              @{ @"role": @"user", @"content": user } ];
+}
+
+static NSArray *hybridMessages(NSString *task, NSString *history, UIImage *img, NSArray *items, NSString **err) {
+    UIImage *scaled = resizeToWidth(img, 1100);
+    NSData *jpg = UIImageJPEGRepresentation(scaled, 0.68);
+    if (!jpg.length) { if (err) *err = @"缩略截图 JPEG 编码失败"; return nil; }
+    NSMutableString *ocr = [NSMutableString string];
+    int n = 0;
+    for (NSDictionary *it in items) {
+        if (n++ >= 120) break;
+        NSString *t = it[@"text"];
+        if (t.length > 60) t = [t substringToIndex:60];
+        [ocr appendFormat:@"(%@,%@) %@\n", it[@"x"], it[@"y"], t];
+    }
+    if (!ocr.length) [ocr appendString:@"(本地 OCR 没有识别到文字)\n"];
+    NSString *text = [NSString stringWithFormat:
+                      @"任务:%@\n\n最近的动作:\n%@\n本地 OCR 文字和中心坐标(仅作参考):\n%@\n请同时观察这张当前屏幕截图，结合实际布局决定一个 JSON 动作。",
+                      task, history.length ? history : @"(还没有)", ocr];
+    NSDictionary *image = @{ @"type": @"image_url",
+                             @"image_url": @{ @"url": [@"data:image/jpeg;base64," stringByAppendingString:[jpg base64EncodedStringWithOptions:0]],
+                                               @"detail": @"low" }};
+    return @[ @{ @"role": @"system", @"content": kAgentSystem },
+              @{ @"role": @"user", @"content": @[ @{ @"type": @"text", @"text": text }, image ] } ];
+}
 
 static NSArray *kDangerWords(void) {
     return @[@"立即支付", @"确认支付", @"去支付", @"付款", @"提交订单", @"立即购买", @"去结算", @"结算",
@@ -764,8 +859,10 @@ static BOOL paySheetVisible(NSArray *items) {
     return NO;
 }
 
+// done 在任务结束时回调:ok=是否完成,note=结果说明,items=最后一次截屏的 OCR 结果。
 static void agentRun(NSString *task, NSString *base, NSString *key, NSString *model,
                      void (^done)(BOOL ok, NSString *note, NSArray *items)) {
+    if ([model isEqualToString:@"deepseek-chat"] || !model.length) model = @"deepseek-flash";
     gAgentRunning = YES;
     BOOL ok = NO;
     NSString *note = @"任务结束";
@@ -779,39 +876,36 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
         UIImage *img = takeScreenshot(&err);
         if (!img) { note = [@"截屏失败,任务停止:" stringByAppendingString:err ?: @"?"]; agentSay(note); break; }
         NSArray *items = ocrImage(img, &err);
-        if (!items) { note = [@"OCR 失败,任务停止:" stringByAppendingString:err ?: @"?"]; agentSay(note); break; }
-        if (paySheetVisible(items)) { note = @"看到支付/密码界面,已停止,请手动处理"; agentSay(note); break; }
-        items = [items sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-            int ya = [a[@"y"] intValue] / 12, yb = [b[@"y"] intValue] / 12;
-            if (ya != yb) return ya < yb ? NSOrderedAscending : NSOrderedDescending;
-            return [(NSNumber *)a[@"x"] compare:(NSNumber *)b[@"x"]];
-        }];
-        lastItems = items;
-        NSMutableString *screen = [NSMutableString string];
-        int n = 0;
-        for (NSDictionary *it in items) {
-            if (n++ >= 120) break;
-            NSString *t = it[@"text"];
-            if (t.length > 40) t = [t substringToIndex:40];
-            [screen appendFormat:@"(%@,%@) %@\n", it[@"x"], it[@"y"], t];
-        }
-        if (!screen.length) [screen appendString:@"(没识别到文字)\n"];
+        if (items) lastItems = items;
+        NSString *localText = @"";
+        for (NSDictionary *it in items) localText = [localText stringByAppendingFormat:@"%@", it[@"text"] ?: @""];
+        BOOL localOK = items.count >= 2 && localText.length >= 6;
+        NSString *screen = localOK ? localText : [NSString stringWithFormat:@"截图(%lu bytes)",
+                            (unsigned long)UIImageJPEGRepresentation(img, 0.15).length];
         if ([screen isEqualToString:lastSig]) same++; else same = 0;
         lastSig = [screen copy];
         if (same >= 4) { note = @"屏幕连续多步没变化,已停止"; agentSay(note); break; }
+        if (localOK && paySheetVisible(items)) { note = @"本地 OCR 看到支付/密码界面,已停止,请手动处理"; agentSay(note); break; }
 
         NSMutableString *hist = [NSMutableString string];
         NSUInteger from = history.count > 8 ? history.count - 8 : 0;
         for (NSUInteger i = from; i < history.count; i++) [hist appendFormat:@"%@\n", history[i]];
-        NSString *user = [NSString stringWithFormat:@"任务:%@\n\n最近的动作:\n%@\n%@当前屏幕文字(x,y 文字):\n%@",
-                          task, hist.length ? hist : @"(还没有)\n",
-                          same > 0 ? [NSString stringWithFormat:@"注意:屏幕和上一步相比没有变化(已连续 %d 次)。\n", same] : @"",
-                          screen];
-        NSArray *msgs = @[@{@"role": @"system", @"content": kAgentSystem},
-                          @{@"role": @"user", @"content": user}];
+        NSArray *msgs = hybridMessages(task, hist, img, items, &err);
+        if (!msgs) { note = [@"截图视觉请求失败:" stringByAppendingString:err ?: @"?"]; agentSay(note); break; }
         NSDictionary *act = callLLM(base, key, model, msgs, &err);
+        if (!act && localOK) agentSay(@"OCR+截图请求失败,稍后自动重试");
+        if (!act) {
+            agentSay(@"模型返回异常,1秒后重试");
+            sleep(1);
+            act = callLLM(base, key, model, msgs, &err);
+        }
         if (!gAgentRunning) break;
         if (!act) { note = [@"调用模型失败,任务停止:" stringByAppendingString:err ?: @"?"]; agentSay(note); break; }
+
+        NSString *visible = [act[@"visible_text"] description] ?: @"";
+        BOOL dangerous = NO;
+        for (NSString *word in kDangerWords()) if ([visible containsString:word]) { dangerous = YES; break; }
+        if (dangerous) { note = @"视觉模型识别到支付/付款相关内容,任务已停止"; agentSay(note); break; }
 
         NSString *action = [[act[@"action"] description] lowercaseString] ?: @"";
         NSString *thought = [act[@"thought"] description] ?: @"";
@@ -830,7 +924,7 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
         }
         NSString *result = @"已执行";
         if ([action isEqualToString:@"tap"] || [action isEqualToString:@"long_press"]) {
-            NSString *danger = dangerNear(items, x, y);
+            NSString *danger = localOK ? dangerNear(items, x, y) : nil;
             if (danger) { note = [NSString stringWithFormat:@"拦截:要点击的位置是「%@」,属于支付/结算,已停止,请手动操作", danger]; agentSay(note); break; }
             if ([action isEqualToString:@"tap"]) doTap(x, y); else doLongPress(x, y, 900);
             [history addObject:[NSString stringWithFormat:@"%d. %@(%.0f,%.0f)", step, action, x, y]];
@@ -847,6 +941,26 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
             else result = info ?: @"打开失败";
             [history addObject:[NSString stringWithFormat:@"%d. open_app(%@) → %@", step, name, result]];
             sleep(3);
+        } else if ([action isEqualToString:@"input_text"]) {
+            NSString *text = [act[@"text"] description] ?: @"";
+            __block NSString *clipboardCheck = nil;
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                UIPasteboard *p = UIPasteboard.generalPasteboard;
+                p.string = text;
+                clipboardCheck = p.string;
+            });
+            if (![clipboardCheck isEqualToString:text]) {
+                result = @"剪贴板写入校验失败,未执行粘贴";
+                [history addObject:[NSString stringWithFormat:@"%d. input_text clipboard_failed", step]];
+                sleep(1);
+                continue;
+            }
+            doTap(x, y);
+            usleep(800 * 1000);
+            doLongPress(x, y, 1100);
+            result = @"剪贴板已确认,已聚焦输入框并呼出粘贴菜单;下一步请点击粘贴或允许粘贴";
+            [history addObject:[NSString stringWithFormat:@"%d. input_text(%.0f,%.0f,%@)", step, x, y, text]];
+            sleep(2);
         } else if ([action isEqualToString:@"set_clipboard"]) {
             NSString *text = [act[@"text"] description] ?: @"";
             dispatch_sync(dispatch_get_main_queue(), ^{ UIPasteboard.generalPasteboard.string = text; });
@@ -992,7 +1106,7 @@ static void relayPollLoop(void) {
     tip.text = [NSString stringWithFormat:@"屏幕 %.0f x %.0f pt。按按钮后 3 秒内切到别的 App,等它自己执行。", s.width, s.height];
     self.keyF = [self tfield:@"API Key" key:@"llm_key" secure:YES def:@""];
     self.baseF = [self tfield:@"接口地址" key:@"llm_base" secure:NO def:@"https://api.deepseek.com"];
-    self.modelF = [self tfield:@"模型名" key:@"llm_model" secure:NO def:@"deepseek-chat"];
+    self.modelF = [self tfield:@"视觉模型名" key:@"llm_model" secure:NO def:@"deepseek-flash"];
     self.taskF = [self tfield:@"任务,例如:打开淘宝,搜索 保温杯,加入购物车" key:@"llm_task" secure:NO def:@""];
     UILabel *rl = [UILabel new];
     rl.numberOfLines = 0;
@@ -1088,18 +1202,20 @@ static void relayPollLoop(void) {
 - (void)onOCR {
     [self runLater:^{
         NSString *err = nil;
-        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
         UIImage *img = takeScreenshot(&err);
         if (!img) { [self say:[@"截屏失败: " stringByAppendingString:err ?: @"?"]]; return; }
-        double t1 = CFAbsoluteTimeGetCurrent() - t0;
-        NSArray *items = ocrImage(img, &err);
-        if (!items) { [self say:[NSString stringWithFormat:@"截屏成功(%.0fx%.0f, %.2fs),但 %@", img.size.width, img.size.height, t1, err]]; return; }
-        NSMutableString *m = [NSMutableString stringWithFormat:@"截屏(方法%@) %.0fx%.0f %.2fs;OCR %lu 条 %.2fs", gShotMethod, img.size.width, img.size.height, t1,
-                              (unsigned long)items.count, CFAbsoluteTimeGetCurrent() - t0 - t1];
-        for (NSDictionary *it in [items subarrayWithRange:NSMakeRange(0, MIN(items.count, 10))])
-            [m appendFormat:@"\n  (%@,%@) %@", it[@"x"], it[@"y"], it[@"text"]];
-        [self say:m];
-    } name:@"截屏+OCR"];
+        NSString *key = [self.keyF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        NSString *base = [self.baseF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        NSString *model = [self.modelF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if ([model isEqualToString:@"deepseek-chat"] || !model.length) model = @"deepseek-flash";
+        if (!key.length || !base.length) { [self say:@"请先填写 API Key 和接口地址"]; return; }
+        NSArray *msgs = visionMessages(@"识别当前屏幕中的文字和主要按钮，只返回 JSON，visible_text 写出识别到的关键原文，action 返回 done。", @"", img, &err);
+        NSDictionary *result = msgs ? callLLM(base, key, model, msgs, &err) : nil;
+        if (!result) { [self say:[@"视觉模型失败: " stringByAppendingString:err ?: @"?"]]; return; }
+        [self say:[NSString stringWithFormat:@"视觉识别(方法%@) %.0fx%.0f\n%@",
+                   gShotMethod, img.size.width, img.size.height,
+                   [result[@"visible_text"] description] ?: @"(模型未返回文字)"]];
+    } name:@"截图+视觉识别"];
 }
 - (void)onStartAgent {
     [self.view endEditing:YES];
