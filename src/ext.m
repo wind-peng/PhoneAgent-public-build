@@ -92,7 +92,7 @@ static int iosurfaceWorks(void) {
         CIImage *ci = [CIImage imageWithCVPixelBuffer:pb];
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
         NSData *jpg = [_ci JPEGRepresentationOfImage:ci colorSpace:cs
-                                             options:@{(id)kCGImageDestinationLossyCompressionQuality: @0.6}];
+                                             options:@{(id)kCGImageDestinationLossyCompressionQuality: @0.85}];
         CGColorSpaceRelease(cs);
         if (!jpg) return;
 
