@@ -1500,7 +1500,7 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     NSString *key = [ud stringForKey:@"llm_key"], *base = [ud stringForKey:@"llm_base"], *model = [ud stringForKey:@"llm_model2"];
     NSString *say = nil;
-    if (!task.length) say = @"收到语音任务,但文字是空的";
+    if (!task.length) say = [NSString stringWithFormat:@"收到语音任务,但文字是空的|url=%@|query=%@|qkeys=%@", url.absoluteString ?: @"(nil)", uc.query ?: @"(nil)", [[q allKeys] componentsJoinedByString:@","]];
     else if (!key.length || !base.length || !model.length) say = @"收到语音任务,但还没保存 API 设置:请先在 App 里点一次“开始任务”或“看图测试”";
     else if (gAgentRunning) say = @"收到语音任务,但已有任务在运行";
     if (say) { [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:say]; return YES; }
