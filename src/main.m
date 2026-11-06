@@ -574,7 +574,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.5.1", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.5.2", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -764,8 +764,8 @@ static NSString *const kAgentSystem =
 @"- long_press: 参数 x,y。长按。\n"
 @"- swipe: 参数 x,y,x2,y2。从(x,y)滑到(x2,y2)。往下看更多内容用从下往上滑(y 大,y2 小)。\n"
 @"- open_app: 参数 name(App 的中文名)。直接打开 App。\n"
-@"- input_text: 参数 x,y,text。程序会把 text 写入剪贴板、点击并长按(x,y)输入框呼出菜单；下一步必须观察并点击“粘贴”或“允许粘贴”，再确认输入框出现目标文字。这是输入文字的首选动作。\n"
-@"- set_clipboard: 参数 text。把文字放进剪贴板。输入文字的办法:set_clipboard,然后 tap 输入框,再 long_press 输入框,再 tap 弹出的\"粘贴\",若出现\"允许粘贴\"就点它。\n"
+@"- input_text: 参数 x,y,text,可选 app(当前所在 App 的名字)。程序会先临时切到 PhoneAgent 把 text 写入剪贴板(iOS 不允许后台 App 写剪贴板),再切回原来的 App,点击并长按(x,y)输入框呼出菜单;下一步必须观察并点击“粘贴”或“允许粘贴”,再确认输入框出现目标文字。这是输入文字的首选动作,text 必须是要输入的完整文字。\n"
+@"- set_clipboard: 参数 text,可选 app。只把文字放进剪贴板(同样会临时切到 PhoneAgent 再切回),不点击。一般直接用 input_text。\n"
 @"- wait: 等待 1.5 秒。\n"
 @"- done: 参数 text。任务已完成。\n"
 @"- stop: 参数 text。无法继续或需要人工处理。\n"
@@ -859,6 +859,83 @@ static BOOL paySheetVisible(NSArray *items) {
     return NO;
 }
 
+static NSString *gLastApp; // 最近一次 open_app 成功打开的 bundle id
+
+// 当前最前台 App 的 bundle id(SpringBoardServices 私有接口,失败返回 nil)。
+// 先在 NSUserDefaults 里打个"可能崩溃"的标记,万一这个接口在本系统上签名不对导致崩溃,下次启动就自动停用。
+static NSString *frontmostBundleID(void) {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    if ([d boolForKey:@"sbfront_crashed"]) return nil;
+    static void *h; static mach_port_t (*getPort)(void); static void (*getFront)(mach_port_t, char *);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        h = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_NOW);
+        if (h) {
+            getPort = dlsym(h, "SBSSpringBoardServerPort");
+            getFront = dlsym(h, "SBFrontmostApplicationDisplayIdentifier");
+        }
+    });
+    if (!getPort || !getFront) return nil;
+    [d setBool:YES forKey:@"sbfront_crashed"]; [d synchronize];
+    mach_port_t port = getPort();
+    char buf[512]; memset(buf, 0, sizeof buf);
+    if (port) getFront(port, buf);
+    [d setBool:NO forKey:@"sbfront_crashed"]; [d synchronize];
+    return buf[0] ? [NSString stringWithUTF8String:buf] : nil;
+}
+
+static UIApplicationState appStateNow(void) {
+    __block UIApplicationState st = UIApplicationStateBackground;
+    dispatch_sync(dispatch_get_main_queue(), ^{ st = UIApplication.sharedApplication.applicationState; });
+    return st;
+}
+
+static BOOL waitAppActive(double timeout) {
+    CFAbsoluteTime end = CFAbsoluteTimeGetCurrent() + timeout;
+    while (CFAbsoluteTimeGetCurrent() < end) {
+        if (appStateNow() == UIApplicationStateActive) return YES;
+        usleep(200 * 1000);
+    }
+    return NO;
+}
+
+// 写剪贴板。iOS 9 起不允许后台 App 访问剪贴板(写入也会被忽略),而 PhoneAgent 平时都在后台操作别的 App,
+// 所以这里先把 PhoneAgent 切到前台、写入并读回校验,再切回原来的 App。
+// 返回 YES 表示写入并校验成功;stranded 为 YES 表示切走后没能自动回去(需要模型用 open_app 回到目标 App)。
+static BOOL writeClipboardInForeground(NSString *text, NSString *backHint, NSString **note, BOOL *stranded) {
+    *stranded = NO;
+    NSString *selfID = NSBundle.mainBundle.bundleIdentifier;
+    BOOL switched = NO;
+    NSString *back = nil;
+    if (appStateNow() != UIApplicationStateActive) {
+        back = frontmostBundleID();
+        if (!back.length || [back isEqualToString:selfID] || [back isEqualToString:@"com.apple.springboard"])
+            back = backHint.length ? backHint : gLastApp;
+        if (!openApp(selfID) || !waitAppActive(5)) { *note = @"没能把 PhoneAgent 切到前台,无法写剪贴板"; return NO; }
+        switched = YES;
+        usleep(500 * 1000);
+    }
+    __block NSString *check = nil; __block NSInteger cc0 = 0, cc1 = 0;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        UIPasteboard *pb = UIPasteboard.generalPasteboard;
+        cc0 = pb.changeCount;
+        pb.string = text;
+        cc1 = pb.changeCount;
+        check = pb.string;
+    });
+    BOOL ok = [check isEqualToString:text];
+    if (!ok) *note = [NSString stringWithFormat:@"剪贴板写入后读回不一致(changeCount %ld→%ld)", (long)cc0, (long)cc1];
+    if (switched) {
+        if (back.length && ![back isEqualToString:selfID] && ![back isEqualToString:@"com.apple.springboard"]) {
+            openApp(back);
+            sleep(2);
+        } else {
+            *stranded = YES;
+        }
+    }
+    return ok;
+}
+
 // done 在任务结束时回调:ok=是否完成,note=结果说明,items=最后一次截屏的 OCR 结果。
 static void agentRun(NSString *task, NSString *base, NSString *key, NSString *model,
                      void (^done)(BOOL ok, NSString *note, NSArray *items)) {
@@ -937,34 +1014,39 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
             NSString *name = [act[@"name"] description] ?: @"";
             NSString *info = nil;
             NSString *bid = bundleForAppName(name, &info);
-            if (bid && openApp(bid)) result = @"已打开";
+            if (bid && openApp(bid)) { result = @"已打开"; gLastApp = bid; }
             else result = info ?: @"打开失败";
             [history addObject:[NSString stringWithFormat:@"%d. open_app(%@) → %@", step, name, result]];
             sleep(3);
-        } else if ([action isEqualToString:@"input_text"]) {
+        } else if ([action isEqualToString:@"input_text"] || [action isEqualToString:@"set_clipboard"]) {
+            BOOL typing = [action isEqualToString:@"input_text"];
             NSString *text = [act[@"text"] description] ?: @"";
-            __block NSString *clipboardCheck = nil;
-            dispatch_sync(dispatch_get_main_queue(), ^{
-                UIPasteboard *p = UIPasteboard.generalPasteboard;
-                p.string = text;
-                clipboardCheck = p.string;
-            });
-            if (![clipboardCheck isEqualToString:text]) {
-                result = @"剪贴板写入校验失败,未执行粘贴";
-                [history addObject:[NSString stringWithFormat:@"%d. input_text clipboard_failed", step]];
+            NSString *hintBid = nil;
+            NSString *appHint = [act[@"app"] description];
+            if (appHint.length) { NSString *i2 = nil; hintBid = bundleForAppName(appHint, &i2); }
+            NSString *note = nil; BOOL stranded = NO;
+            BOOL ok = writeClipboardInForeground(text, hintBid, &note, &stranded);
+            if (!ok) {
+                [history addObject:[NSString stringWithFormat:@"%d. %@ 失败:%@", step, action, note]];
+                agentSay([@"提示:" stringByAppendingString:note ?: @"剪贴板写入失败"]);
                 sleep(1);
                 continue;
             }
-            doTap(x, y);
-            usleep(800 * 1000);
-            doLongPress(x, y, 1100);
-            result = @"剪贴板已确认,已聚焦输入框并呼出粘贴菜单;下一步请点击粘贴或允许粘贴";
-            [history addObject:[NSString stringWithFormat:@"%d. input_text(%.0f,%.0f,%@)", step, x, y, text]];
-            sleep(2);
-        } else if ([action isEqualToString:@"set_clipboard"]) {
-            NSString *text = [act[@"text"] description] ?: @"";
-            dispatch_sync(dispatch_get_main_queue(), ^{ UIPasteboard.generalPasteboard.string = text; });
-            [history addObject:[NSString stringWithFormat:@"%d. set_clipboard(%@)", step, text]];
+            if (stranded) {
+                [history addObject:[NSString stringWithFormat:@"%d. %@ 已写入剪贴板,但没能回到原来的 App", step, action]];
+                agentSay(@"提示:剪贴板已写入,但没能自动回到原来的 App,请用 open_app 回到目标 App");
+                continue;
+            }
+            if (typing) {
+                doTap(x, y);
+                usleep(800 * 1000);
+                doLongPress(x, y, 1100);
+                result = @"剪贴板已确认,已回到目标 App、聚焦输入框并呼出粘贴菜单;下一步请点击粘贴或允许粘贴";
+                [history addObject:[NSString stringWithFormat:@"%d. input_text(%.0f,%.0f,%@)", step, x, y, text]];
+                sleep(2);
+            } else {
+                [history addObject:[NSString stringWithFormat:@"%d. set_clipboard(%@) 已确认", step, text]];
+            }
         } else if ([action isEqualToString:@"wait"]) {
             [history addObject:[NSString stringWithFormat:@"%d. wait", step]];
             usleep(1500 * 1000);
@@ -1060,6 +1142,7 @@ static void relayPollLoop(void) {
     }
 }
 
+
 #pragma mark - 界面
 
 @interface VC : UIViewController
@@ -1134,6 +1217,7 @@ static void relayPollLoop(void) {
         [self btn:@"3 秒后上滑一次" action:@selector(onSwipe)],
         [self btn:@"3 秒后 截屏 + OCR" action:@selector(onOCR)],
         [self btn:@"后台保活 开/关" action:@selector(onKeep)],
+        [self btn:@"3 秒后 测试写入剪贴板" action:@selector(onClip)],
         [self btn:@"诊断 IOSurface" action:@selector(onDiag)],
         brow,
         self.keyF, self.baseF, self.modelF, self.taskF,
@@ -1252,6 +1336,16 @@ static void relayPollLoop(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ relayPollLoop(); });
 }
 - (void)onDiag { [self say:diagReport()]; }
+- (void)onClip {
+    [self runLater:^{
+        NSString *note = nil; BOOL stranded = NO;
+        NSString *front = frontmostBundleID();
+        BOOL ok = writeClipboardInForeground(@"PhoneAgent剪贴板测试123", nil, &note, &stranded);
+        [self say:[NSString stringWithFormat:@"剪贴板测试:%@(切换前最前台 App:%@%@)\n请到任意输入框长按粘贴,看是不是“PhoneAgent剪贴板测试123”",
+                   ok ? @"写入并校验成功" : [@"失败:" stringByAppendingString:note ?: @"?"],
+                   front ?: @"未知", stranded ? @",没能自动切回" : @""]];
+    } name:@"剪贴板测试"];
+}
 - (void)onKeep {
     [self say:setKeepAlive(gPlayer == nil)];
 }

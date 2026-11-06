@@ -1,3 +1,18 @@
+# v0.4.2 修改说明(基于你调试好的 v4.1 版本)
+
+问题:模型让 PhoneAgent 写剪贴板时,PhoneAgent 自己在后台。iOS 9 起不允许后台 App 访问剪贴板
+(读取返回空,写入也会被忽略),所以粘贴出来是空的或旧内容。
+
+修改:
+1. 写剪贴板时,先用 open_app 把 PhoneAgent 切到前台,写入并读回校验(同时记录 changeCount),
+   再切回原来的 App(原来的 App 优先用 SpringBoardServices 查最前台 App,查不到就用最近一次 open_app 或模型给的 app 参数)。
+2. input_text 和 set_clipboard 合并成同一套流程;写入失败或回不去会明确提示模型/日志,不再悄悄循环。
+3. 新增按钮"3 秒后 测试写入剪贴板":点它后切到任意有输入框的 App,长按粘贴,应该出现"PhoneAgent剪贴板测试123"。
+4. 提示词里说明 input_text 会先切走再切回,并可带 app 参数。
+
+建议同时在系统里设置:设置 → 微信(或其他 App)→ 从其他 App 粘贴 → 允许,
+这样就不会再弹"允许粘贴"的确认框。
+
 # PhoneAgent v0.4.1:绕开 IOSurface 的 OCR + 智能体循环
 
 
