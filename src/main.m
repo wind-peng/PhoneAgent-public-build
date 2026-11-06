@@ -541,6 +541,12 @@ static NSString *setKeepAlive(BOOL on) {
 
 #pragma mark - 本地 HTTP 接口
 
+// 智能体部分在后面定义,这里先声明
+static volatile BOOL gAgentRunning;
+static void agentSay(NSString *m);
+static void agentRun(NSString *task, NSString *base, NSString *key, NSString *model);
+static NSMutableArray *gAgentLog; // 最近的任务日志,给 /status 用
+
 static NSString *gToken;
 
 static void sendResp(int c, int code, NSString *ctype, NSData *body) {
@@ -598,7 +604,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.4.4", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.5.0", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -655,6 +661,33 @@ static void handleClient(int c) {
         if (!img) { sendJSON(c, 500, @{@"ok": @NO, @"error": err ?: @"未知错误"}); return; }
         img = resizeToWidth(img, [q[@"w"] doubleValue]);
         sendResp(c, 200, @"image/jpeg", UIImageJPEGRepresentation(img, 0.6));
+    } else if ([path isEqualToString:@"/task"]) {
+        // 给快捷指令/Siri 用:GET /task?token=..&text=<URL 编码的任务>,或 POST 正文直接放任务文字
+        NSString *task = q[@"text"];
+        if (!task.length && body.length) task = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+        task = [task stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+        NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+        NSString *key = [ud stringForKey:@"llm_key"], *base = [ud stringForKey:@"llm_base"], *model = [ud stringForKey:@"llm_model2"];
+        if (!task.length) { sendJSON(c, 400, @{@"ok": @NO, @"error": @"没有任务文字"}); return; }
+        if (!key.length || !base.length || !model.length) {
+            sendJSON(c, 400, @{@"ok": @NO, @"error": @"还没保存 API 设置:请先在 App 里点一次“开始任务”或“看图测试”"});
+            return;
+        }
+        if (gAgentRunning) { sendJSON(c, 409, @{@"ok": @NO, @"error": @"已有任务在运行"}); return; }
+        if (!broadcastAlive()) { sendJSON(c, 409, @{@"ok": @NO, @"error": @"屏幕广播没开,请先在 PhoneAgent 里开启"}); return; }
+        agentSay([NSString stringWithFormat:@"收到语音任务:%@", task]);
+        [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:[NSString stringWithFormat:@"收到语音任务:%@", task]];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ agentRun(task, base, key, model); });
+        sendJSON(c, 200, @{@"ok": @YES, @"task": task});
+    } else if ([path isEqualToString:@"/stop"]) {
+        gAgentRunning = NO;
+        sendJSON(c, 200, @{@"ok": @YES});
+    } else if ([path isEqualToString:@"/status"]) {
+        NSArray *lines;
+        @synchronized (gLock) { lines = [gAgentLog copy] ?: @[]; }
+        NSUInteger n = lines.count > 15 ? lines.count - 15 : 0;
+        sendJSON(c, 200, @{@"ok": @YES, @"running": @(gAgentRunning), @"broadcast": @(broadcastAlive()),
+                           @"log": [lines subarrayWithRange:NSMakeRange(n, lines.count - n)]});
     } else if ([path isEqualToString:@"/ocr"]) {
         NSString *err = nil;
         UIImage *img = takeScreenshot(&err);
@@ -691,6 +724,9 @@ static NSString *startServer(void) {
 static volatile BOOL gAgentRunning = NO;
 
 static void agentSay(NSString *m) {
+    @synchronized (gLock) {
+        if (gAgentLog) { [gAgentLog addObject:m ?: @""]; if (gAgentLog.count > 40) [gAgentLog removeObjectAtIndex:0]; }
+    }
     [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:m];
 }
 
@@ -1417,6 +1453,7 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
 - (BOOL)application:(UIApplication *)a didFinishLaunchingWithOptions:(NSDictionary *)o {
     signal(SIGPIPE, SIG_IGN);
     gLock = [NSObject new];
+    gAgentLog = [NSMutableArray array];
     gSwipeMode = (int)[NSUserDefaults.standardUserDefaults integerForKey:@"swipe_mode"];
     gToken = [NSUserDefaults.standardUserDefaults stringForKey:@"token"];
     if (!gToken) {
