@@ -566,6 +566,12 @@ static void agentSay(NSString *m);
 static void agentRun(NSString *task, NSString *base, NSString *key, NSString *model);
 static NSMutableArray *gAgentLog; // 最近的任务日志,给 /status 用
 
+// 读已保存的设置(空字符串按没有处理)。模型名在界面里存的键是 llm_model。
+static NSString *savedSetting(NSString *k, NSString *def) {
+    NSString *v = [NSUserDefaults.standardUserDefaults stringForKey:k];
+    return v.length ? v : def;
+}
+
 static NSString *gToken;
 
 static void sendResp(int c, int code, NSString *ctype, NSData *body) {
@@ -623,7 +629,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.5.2", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.5.3", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -686,7 +692,7 @@ static void handleClient(int c) {
         if (!task.length && body.length) task = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
         task = [task stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
         NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-        NSString *key = [ud stringForKey:@"llm_key"], *base = [ud stringForKey:@"llm_base"], *model = [ud stringForKey:@"llm_model2"];
+        NSString *key = savedSetting(@"llm_key", @""), *base = savedSetting(@"llm_base", @"https://api.deepseek.com"), *model = savedSetting(@"llm_model", savedSetting(@"llm_model2", @"deepseek-flash"));
         if (!task.length) { sendJSON(c, 400, @{@"ok": @NO, @"error": @"没有任务文字"}); return; }
         if (!key.length || !base.length || !model.length) {
             sendJSON(c, 400, @{@"ok": @NO, @"error": @"还没保存 API 设置:请先在 App 里点一次“开始任务”或“看图测试”"});
@@ -1500,7 +1506,7 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     if ([task containsString:@"%"]) { NSString *d2 = [task stringByRemovingPercentEncoding]; if (d2.length) task = d2; }
     task = [task stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    NSString *key = [ud stringForKey:@"llm_key"], *base = [ud stringForKey:@"llm_base"], *model = [ud stringForKey:@"llm_model2"];
+    NSString *key = savedSetting(@"llm_key", @""), *base = savedSetting(@"llm_base", @"https://api.deepseek.com"), *model = savedSetting(@"llm_model", savedSetting(@"llm_model2", @"deepseek-flash"));
     NSString *say = nil;
     if (!task.length) say = @"收到语音任务,但文字是空的(听写可能没识别到内容,或快捷指令里的变量没接对,看上面“收到 URL”那行)";
     else if (!key.length || !base.length || !model.length) say = @"收到语音任务,但还没保存 API 设置:请先在 App 里点一次“开始任务”或“看图测试”";
