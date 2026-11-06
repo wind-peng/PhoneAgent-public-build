@@ -1112,7 +1112,7 @@ static void waitForStableFrame(double maxWait) {
 }
 
 static void agentRun(NSString *task, NSString *base, NSString *key, NSString *model) {
-    if ([model isEqualToString:@"deepseek-chat"] || !model.length) model = @"deepseek-flash";
+    if ([model isEqualToString:@"deepseek-chat"] || [model isEqualToString:@"deepseek-flash"] || !model.length) model = @"glm-4.6v-flash";
     gAgentRunning = YES;
     NSMutableArray *history = [NSMutableArray array];
     NSString *lastSig = @""; int same = 0;
@@ -1319,8 +1319,8 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     tip.numberOfLines = 0;
     tip.text = [NSString stringWithFormat:@"屏幕 %.0f x %.0f pt。按按钮后 3 秒内切到别的 App,等它自己执行。", s.width, s.height];
     self.keyF = [self tfield:@"API Key" key:@"llm_key" secure:YES def:@""];
-    self.baseF = [self tfield:@"接口地址" key:@"llm_base" secure:NO def:@"https://api.deepseek.com"];
-    self.modelF = [self tfield:@"视觉模型名" key:@"llm_model" secure:NO def:@"deepseek-flash"];
+    self.baseF = [self tfield:@"接口地址" key:@"llm_base" secure:NO def:@"https://open.bigmodel.cn/api/paas/v4"];
+    self.modelF = [self tfield:@"视觉模型名" key:@"llm_model" secure:NO def:@"glm-4.6v-flash"];
     self.taskF = [self tfield:@"任务,例如:打开淘宝,搜索 保温杯,加入购物车" key:@"llm_task" secure:NO def:@""];
     UILabel *bl = [UILabel new];
     bl.numberOfLines = 0;
@@ -1430,7 +1430,7 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
         NSString *key = [self.keyF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         NSString *base = [self.baseF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         NSString *model = [self.modelF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if ([model isEqualToString:@"deepseek-chat"] || !model.length) model = @"deepseek-flash";
+        if ([model isEqualToString:@"deepseek-chat"] || [model isEqualToString:@"deepseek-flash"] || !model.length) model = @"glm-4.6v-flash";
         if (!key.length || !base.length) { [self say:@"请先填写 API Key 和接口地址"]; return; }
         NSArray *msgs = visionMessages(@"识别当前屏幕中的文字和主要按钮，只返回 JSON，visible_text 写出识别到的关键原文，action 返回 done。", @"", img, &err);
         NSDictionary *result = msgs ? callLLM(base, key, model, msgs, &err) : nil;
