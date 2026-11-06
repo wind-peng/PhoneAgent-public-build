@@ -525,7 +525,26 @@ static NSData *silentWav(void) {
     return d;
 }
 
+static void resumeKeepAlive(void) {
+    if (!gPlayer) return;
+    [AVAudioSession.sharedInstance setActive:YES error:nil];
+    if (!gPlayer.isPlaying) [gPlayer play];
+}
+
 static NSString *setKeepAlive(BOOL on) {
+    static BOOL observing;
+    if (on && !observing) {
+        observing = YES;
+        [NSNotificationCenter.defaultCenter addObserverForName:AVAudioSessionInterruptionNotification object:nil
+                                                         queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+            if ([n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue] == AVAudioSessionInterruptionTypeEnded) resumeKeepAlive();
+        }];
+        [NSNotificationCenter.defaultCenter addObserverForName:AVAudioSessionMediaServicesWereResetNotification object:nil
+                                                         queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+            if (gPlayer) { gPlayer = nil; setKeepAlive(YES); }
+        }];
+        [NSTimer scheduledTimerWithTimeInterval:3 repeats:YES block:^(NSTimer *t) { resumeKeepAlive(); }];
+    }
     if (!on) { [gPlayer stop]; gPlayer = nil; return @"后台保活已关"; }
     AVAudioSession *s = AVAudioSession.sharedInstance;
     NSError *e = nil;
@@ -604,7 +623,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.5.0", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.5.1", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -1450,6 +1469,41 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
 @property (nonatomic, strong) UIWindow *window;
 @end
 @implementation AD
+// phoneagent://task?token=XXXXXX&text=任务文字   或   phoneagent://stop?token=XXXXXX
+// 给快捷指令用:打开 URL 会把 PhoneAgent 唤醒到前台,避免它在后台被挂起。token 不对一律忽略。
+- (BOOL)application:(UIApplication *)app openURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenURLOptionsKey, id> *)options {
+    NSURLComponents *uc = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    NSMutableDictionary *q = [NSMutableDictionary dictionary];
+    for (NSURLQueryItem *i in uc.queryItems) q[i.name] = i.value ?: @"";
+    NSString *cmd = uc.host ?: @"";
+    if (![q[@"token"] isEqualToString:gToken]) {
+        [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:@"收到 phoneagent:// 请求,但 token 不对,已忽略"];
+        return YES;
+    }
+    if ([cmd isEqualToString:@"stop"]) { gAgentRunning = NO; return YES; }
+    if (![cmd isEqualToString:@"task"]) return YES;
+    NSString *task = [q[@"text"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    NSString *key = [ud stringForKey:@"llm_key"], *base = [ud stringForKey:@"llm_base"], *model = [ud stringForKey:@"llm_model2"];
+    NSString *say = nil;
+    if (!task.length) say = @"收到语音任务,但文字是空的";
+    else if (!key.length || !base.length || !model.length) say = @"收到语音任务,但还没保存 API 设置:请先在 App 里点一次“开始任务”或“看图测试”";
+    else if (gAgentRunning) say = @"收到语音任务,但已有任务在运行";
+    if (say) { [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:say]; return YES; }
+    agentSay([NSString stringWithFormat:@"收到语音任务:%@", task]);
+    [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:[NSString stringWithFormat:@"收到语音任务:%@", task]];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        for (int i = 0; i < 30 && !broadcastAlive(); i++) usleep(200 * 1000); // 冷启动后扩展要重新连上
+        if (!broadcastAlive()) {
+            [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:@"屏幕广播没开,任务未执行:请先开启屏幕广播"];
+            return;
+        }
+        if (gAgentRunning) return;
+        agentRun(task, base, key, model);
+    });
+    return YES;
+}
+
 - (BOOL)application:(UIApplication *)a didFinishLaunchingWithOptions:(NSDictionary *)o {
     signal(SIGPIPE, SIG_IGN);
     gLock = [NSObject new];
