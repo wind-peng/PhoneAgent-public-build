@@ -61,6 +61,9 @@ static int iosurfaceWorks(void) {
     dispatch_source_t _timer;
     volatile int _inflight;
     int _isf;
+    CVPixelBufferRef _pending;
+    dispatch_queue_t _procQ;
+    dispatch_source_t _flushTimer;
 }
 
 - (void)broadcastStartedWithSetupInfo:(NSDictionary<NSString *, NSObject *> *)setupInfo {
@@ -74,19 +77,36 @@ static int iosurfaceWorks(void) {
         postToHost([NSString stringWithFormat:@"/hb?key=%s&is=%d", FRAME_KEY, self->_isf], [NSData data]);
     });
     dispatch_resume(_timer);
+    // 屏幕静止时系统不会再推新帧,所以"最后一帧"不能因为限速被丢掉:
+    // 回调里只暂存最新一帧,由这个定时器每 0.3 秒取出来编码发送(trailing-edge)。
+    _procQ = dispatch_queue_create("pa.proc", DISPATCH_QUEUE_SERIAL);
+    _flushTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _procQ);
+    dispatch_source_set_timer(_flushTimer, DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(_flushTimer, ^{ [self flushPending]; });
+    dispatch_resume(_flushTimer);
 }
 
 - (void)broadcastFinished {
     if (_timer) { dispatch_source_cancel(_timer); _timer = nil; }
+    if (_flushTimer) { dispatch_source_cancel(_flushTimer); _flushTimer = nil; }
+    @synchronized (self) { if (_pending) { CVPixelBufferRelease(_pending); _pending = NULL; } }
     postToHost(@"/bye?key=" FRAME_KEY, [NSData data]);
 }
 
 - (void)processSampleBuffer:(CMSampleBufferRef)sb withType:(RPSampleBufferType)type {
     if (type != RPSampleBufferTypeVideo) return;
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (now - _last < 0.4 || _inflight) return; // 限速,且上一帧还没发完就丢掉这帧
-    _last = now;
     CVImageBufferRef pb = CMSampleBufferGetImageBuffer(sb);
+    if (!pb) return;
+    @synchronized (self) {
+        if (_pending) CVPixelBufferRelease(_pending);
+        _pending = CVPixelBufferRetain(pb);
+    }
+}
+
+- (void)flushPending {
+    if (_inflight) return; // 上一帧还没发完,留着最新的等下一轮
+    CVPixelBufferRef pb = NULL;
+    @synchronized (self) { pb = _pending; _pending = NULL; }
     if (!pb) return;
     @autoreleasepool {
         CIImage *ci = [CIImage imageWithCVPixelBuffer:pb];
@@ -94,7 +114,7 @@ static int iosurfaceWorks(void) {
         NSData *jpg = [_ci JPEGRepresentationOfImage:ci colorSpace:cs
                                              options:@{(id)kCGImageDestinationLossyCompressionQuality: @0.85}];
         CGColorSpaceRelease(cs);
-        if (!jpg) return;
+        if (!jpg) { CVPixelBufferRelease(pb); return; }
 
         // 同时把原始 NV12 数据(去掉行尾填充)一起发过去,主 App 的 OCR 可以直接用,不必再转格式
         uint32_t w = (uint32_t)CVPixelBufferGetWidth(pb), h = (uint32_t)CVPixelBufferGetHeight(pb);
@@ -119,6 +139,7 @@ static int iosurfaceWorks(void) {
             }
             CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
         }
+        CVPixelBufferRelease(pb);
         uint32_t hdr[6] = {0x31464150 /* 'PAF1' */, w, h, (uint32_t)jpg.length, (uint32_t)nv.length, (uint32_t)fmt};
         NSMutableData *pkt = [NSMutableData dataWithCapacity:sizeof hdr + jpg.length + nv.length];
         [pkt appendBytes:hdr length:sizeof hdr];

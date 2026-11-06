@@ -574,7 +574,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.5.2", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.5.3", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -757,20 +757,21 @@ static NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSA
 }
 
 static NSString *const kAgentSystem =
-@"你是一个控制 iPhone 的视觉智能体,屏幕大小 390x844 pt。每一步都会收到当前屏幕截图、任务和最近的动作历史。请直接观察截图中的中文和界面，不要依赖本地 OCR。\n"
+@"你是一个控制 iPhone 的视觉智能体。每一步都会收到:任务、最近的动作历史、一张当前屏幕截图(780x1688 像素,图上叠加了红色网格线,每 100 像素一条,边缘标有像素数字),以及本地 OCR 识别出的带编号文字列表。\n"
+@"所有坐标(x,y,x2,y2,以及 OCR 列表里的坐标)都是这张截图的像素坐标:左上角 (0,0),右下角 (780,1688),x 向右,y 向下。请对照网格线和边缘数字估计位置,点击要落在目标元素的中心。\n"
 @"只输出一个 JSON 对象,不要输出其他内容。thought 不超过20个字；visible_text 只抄录关键文字且不超过120字；然后输出 action 和参数。\n"
 @"action 可选值:\n"
-@"- tap: 参数 x,y。点击。\n"
-@"- long_press: 参数 x,y。长按。\n"
+@"- tap: 参数 id 或 x,y。点击。目标是 OCR 列表里的文字时,优先只给 id(程序会点该文字的中心,最准);没有文字的图标或空白输入框才给 x,y。\n"
+@"- long_press: 参数 id 或 x,y。长按。\n"
 @"- swipe: 参数 x,y,x2,y2。从(x,y)滑到(x2,y2)。往下看更多内容用从下往上滑(y 大,y2 小)。\n"
 @"- open_app: 参数 name(App 的中文名)。直接打开 App。\n"
-@"- input_text: 参数 x,y,text,可选 app(当前所在 App 的名字)。程序会先临时切到 PhoneAgent 把 text 写入剪贴板(iOS 不允许后台 App 写剪贴板),再切回原来的 App,点击并长按(x,y)输入框呼出菜单;下一步必须观察并点击“粘贴”或“允许粘贴”,再确认输入框出现目标文字。这是输入文字的首选动作,text 必须是要输入的完整文字。\n"
+@"- input_text: 参数 id 或 x,y,text,可选 app(当前所在 App 的名字)。程序会先临时切到 PhoneAgent 把 text 写入剪贴板(iOS 不允许后台 App 写剪贴板),再切回原来的 App,点击并长按输入框呼出菜单;下一步必须观察并点击“粘贴”或“允许粘贴”,再确认输入框出现目标文字。这是输入文字的首选动作,text 必须是要输入的完整文字。\n"
 @"- set_clipboard: 参数 text,可选 app。只把文字放进剪贴板(同样会临时切到 PhoneAgent 再切回),不点击。一般直接用 input_text。\n"
 @"- wait: 等待 1.5 秒。\n"
 @"- done: 参数 text。任务已完成。\n"
 @"- stop: 参数 text。无法继续或需要人工处理。\n"
 @"规则:\n"
-@"1. 坐标使用屏幕 pt 坐标,只能取自截图中的文字/控件位置,或根据版面合理推断。\n"
+@"1. 有文字的目标一律用 id;只有没有文字的图标/输入框才给 x,y,并对照网格线估计。\n"
 @"2. 只做到\"加入购物车\"为止。绝不点击结算、支付、提交订单、立即购买、确认付款;遇到这些步骤立即 stop。\n"
 @"3. 每步只做一个动作。\n"
 @"4. 屏幕连续没变化就换一种办法,仍不行就 stop。\n"
@@ -812,25 +813,60 @@ static NSArray *textMessages(NSString *task, NSString *history, NSArray *items) 
               @{ @"role": @"user", @"content": user } ];
 }
 
+#define MODEL_W 780
+#define MODEL_H 1688
+
+// 把截图缩放到固定的 780x1688(正好是屏幕 pt 尺寸的 2 倍),并叠加每 100 像素一条的红色网格和边缘数字,
+// 帮助视觉模型把"看到的位置"换算成坐标。
+static UIImage *renderForModel(UIImage *src) {
+    UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat];
+    f.scale = 1; f.opaque = YES;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(MODEL_W, MODEL_H) format:f];
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [src drawInRect:CGRectMake(0, 0, MODEL_W, MODEL_H)];
+        CGContextRef c = ctx.CGContext;
+        CGContextSetLineWidth(c, 1);
+        CGContextSetStrokeColorWithColor(c, [UIColor colorWithRed:1 green:0 blue:0 alpha:0.35].CGColor);
+        NSDictionary *attrs = @{NSFontAttributeName: [UIFont boldSystemFontOfSize:16],
+                                NSForegroundColorAttributeName: UIColor.redColor,
+                                NSBackgroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.75]};
+        for (int x = 100; x < MODEL_W; x += 100) {
+            CGContextMoveToPoint(c, x, 0); CGContextAddLineToPoint(c, x, MODEL_H); CGContextStrokePath(c);
+            NSString *t = [NSString stringWithFormat:@"%d", x];
+            [t drawAtPoint:CGPointMake(x + 2, 2) withAttributes:attrs];
+            [t drawAtPoint:CGPointMake(x + 2, MODEL_H - 22) withAttributes:attrs];
+        }
+        for (int y = 100; y < MODEL_H; y += 100) {
+            CGContextMoveToPoint(c, 0, y); CGContextAddLineToPoint(c, MODEL_W, y); CGContextStrokePath(c);
+            NSString *t = [NSString stringWithFormat:@"%d", y];
+            [t drawAtPoint:CGPointMake(2, y + 2) withAttributes:attrs];
+            [t drawAtPoint:CGPointMake(MODEL_W - 46, y + 2) withAttributes:attrs];
+        }
+    }];
+}
+
 static NSArray *hybridMessages(NSString *task, NSString *history, UIImage *img, NSArray *items, NSString **err) {
-    UIImage *scaled = resizeToWidth(img, 1100);
-    NSData *jpg = UIImageJPEGRepresentation(scaled, 0.68);
-    if (!jpg.length) { if (err) *err = @"缩略截图 JPEG 编码失败"; return nil; }
+    UIImage *scaled = renderForModel(img);
+    NSData *jpg = UIImageJPEGRepresentation(scaled, 0.8);
+    if (!jpg.length) { if (err) *err = @"截图 JPEG 编码失败"; return nil; }
+    CGSize sc = screenSize();
+    double k = MODEL_W / sc.width;
     NSMutableString *ocr = [NSMutableString string];
     int n = 0;
     for (NSDictionary *it in items) {
-        if (n++ >= 120) break;
+        if (n >= 80) break;
+        n++;
         NSString *t = it[@"text"];
-        if (t.length > 60) t = [t substringToIndex:60];
-        [ocr appendFormat:@"(%@,%@) %@\n", it[@"x"], it[@"y"], t];
+        if (t.length > 40) t = [t substringToIndex:40];
+        [ocr appendFormat:@"[%d] (%d,%d) %@\n", n, (int)round([it[@"x"] doubleValue] * k), (int)round([it[@"y"] doubleValue] * k), t];
     }
     if (!ocr.length) [ocr appendString:@"(本地 OCR 没有识别到文字)\n"];
     NSString *text = [NSString stringWithFormat:
-                      @"任务:%@\n\n最近的动作:\n%@\n本地 OCR 文字和中心坐标(仅作参考):\n%@\n请同时观察这张当前屏幕截图，结合实际布局决定一个 JSON 动作。",
+                      @"任务:%@\n\n最近的动作:\n%@\n本地 OCR 文字列表(格式 [编号] (中心x,中心y) 文字,坐标是截图像素):\n%@\n请观察截图,决定一个 JSON 动作。",
                       task, history.length ? history : @"(还没有)", ocr];
     NSDictionary *image = @{ @"type": @"image_url",
                              @"image_url": @{ @"url": [@"data:image/jpeg;base64," stringByAppendingString:[jpg base64EncodedStringWithOptions:0]],
-                                               @"detail": @"low" }};
+                                               @"detail": @"original" }};
     return @[ @{ @"role": @"system", @"content": kAgentSystem },
               @{ @"role": @"user", @"content": @[ @{ @"type": @"text", @"text": text }, image ] } ];
 }
@@ -936,6 +972,17 @@ static BOOL writeClipboardInForeground(NSString *text, NSString *backHint, NSStr
     return ok;
 }
 
+// 等广播画面静止:最近 0.8 秒内没有新帧,说明动画/转场结束了(最多等 maxWait 秒)
+static void waitForStableFrame(double maxWait) {
+    CFAbsoluteTime end = CFAbsoluteTimeGetCurrent() + maxWait;
+    while (CFAbsoluteTimeGetCurrent() < end) {
+        CFAbsoluteTime ft;
+        @synchronized (gLock) { ft = gFrameT; }
+        if (ft > 0 && CFAbsoluteTimeGetCurrent() - ft >= 0.8) return;
+        usleep(150 * 1000);
+    }
+}
+
 // done 在任务结束时回调:ok=是否完成,note=结果说明,items=最后一次截屏的 OCR 结果。
 static void agentRun(NSString *task, NSString *base, NSString *key, NSString *model,
                      void (^done)(BOOL ok, NSString *note, NSArray *items)) {
@@ -949,10 +996,16 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     CGSize sc = screenSize();
     agentSay([NSString stringWithFormat:@"任务开始:%@", task]);
     for (int step = 1; step <= 25 && gAgentRunning; step++) {
+        waitForStableFrame(3.0);
         NSString *err = nil;
         UIImage *img = takeScreenshot(&err);
         if (!img) { note = [@"截屏失败,任务停止:" stringByAppendingString:err ?: @"?"]; agentSay(note); break; }
         NSArray *items = ocrImage(img, &err);
+        if (items.count) items = [items sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            int ya = [a[@"y"] intValue] / 12, yb = [b[@"y"] intValue] / 12;
+            if (ya != yb) return ya < yb ? NSOrderedAscending : NSOrderedDescending;
+            return [(NSNumber *)a[@"x"] compare:(NSNumber *)b[@"x"]];
+        }];
         if (items) lastItems = items;
         NSString *localText = @"";
         for (NSDictionary *it in items) localText = [localText stringByAppendingFormat:@"%@", it[@"text"] ?: @""];
@@ -986,11 +1039,32 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
 
         NSString *action = [[act[@"action"] description] lowercaseString] ?: @"";
         NSString *thought = [act[@"thought"] description] ?: @"";
-        double x = [act[@"x"] doubleValue], y = [act[@"y"] doubleValue];
-        double x2 = [act[@"x2"] doubleValue], y2 = [act[@"y2"] doubleValue];
+        // 模型给的是 780x1688 截图的像素坐标,换算成屏幕 pt;有 id 就直接用 OCR 文字的中心(已经是 pt)
+        double kx = sc.width / MODEL_W, ky = sc.height / MODEL_H;
+        double rx = [act[@"x"] doubleValue], ry = [act[@"y"] doubleValue];
+        double x = rx * kx, y = ry * ky;
+        double x2 = [act[@"x2"] doubleValue] * kx, y2 = [act[@"y2"] doubleValue] * ky;
+        NSInteger oid = 0; id idv = act[@"id"];
+        if ([idv respondsToSelector:@selector(integerValue)]) oid = [idv integerValue];
+        BOOL usedID = NO; NSString *idText = @"";
+        if (oid >= 1 && oid <= (NSInteger)MIN(items.count, 80)) {
+            NSDictionary *it = items[oid - 1];
+            x = [it[@"x"] doubleValue]; y = [it[@"y"] doubleValue];
+            usedID = YES; idText = [it[@"text"] description] ?: @"";
+        }
+        BOOL outOfRange = (!usedID && (rx > MODEL_W + 20 || ry > MODEL_H + 20 || [act[@"x2"] doubleValue] > MODEL_W + 20 || [act[@"y2"] doubleValue] > MODEL_H + 20));
         x = MAX(0, MIN(sc.width - 1, x)); y = MAX(0, MIN(sc.height - 1, y));
         x2 = MAX(0, MIN(sc.width - 1, x2)); y2 = MAX(0, MIN(sc.height - 1, y2));
-        agentSay([NSString stringWithFormat:@"第%d步:%@ → %@", step, thought, action]);
+        double xpx = x / kx, ypx = y / ky;
+        agentSay([NSString stringWithFormat:@"第%d步:%@ → %@ %@(%.0f,%.0f)pt", step, thought, action,
+                  usedID ? [NSString stringWithFormat:@"id=%ld「%@」 ", (long)oid, idText] : @"", x, y]);
+        BOOL needsXY = [action isEqualToString:@"tap"] || [action isEqualToString:@"long_press"] ||
+                       [action isEqualToString:@"swipe"] || [action isEqualToString:@"input_text"];
+        if (needsXY && outOfRange) {
+            agentSay(@"提示:模型给的坐标超出截图范围(应为 0~780 x 0~1688),已忽略这一步");
+            [history addObject:[NSString stringWithFormat:@"%d. %@ 的坐标超出范围,未执行;坐标必须是 780x1688 截图的像素坐标", step, action]];
+            continue;
+        }
 
         if ([action isEqualToString:@"done"] || [action isEqualToString:@"stop"]) {
             NSString *t = [act[@"text"] description] ?: @"";
@@ -1004,11 +1078,11 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
             NSString *danger = localOK ? dangerNear(items, x, y) : nil;
             if (danger) { note = [NSString stringWithFormat:@"拦截:要点击的位置是「%@」,属于支付/结算,已停止,请手动操作", danger]; agentSay(note); break; }
             if ([action isEqualToString:@"tap"]) doTap(x, y); else doLongPress(x, y, 900);
-            [history addObject:[NSString stringWithFormat:@"%d. %@(%.0f,%.0f)", step, action, x, y]];
+            [history addObject:usedID ? [NSString stringWithFormat:@"%d. %@ id=%ld「%@」", step, action, (long)oid, idText] : [NSString stringWithFormat:@"%d. %@(%.0f,%.0f)", step, action, xpx, ypx]];
             sleep(2);
         } else if ([action isEqualToString:@"swipe"]) {
             doSwipe(x, y, x2, y2, 20, 350);
-            [history addObject:[NSString stringWithFormat:@"%d. swipe(%.0f,%.0f → %.0f,%.0f)", step, x, y, x2, y2]];
+            [history addObject:[NSString stringWithFormat:@"%d. swipe(%.0f,%.0f → %.0f,%.0f)", step, xpx, ypx, x2 / kx, y2 / ky]];
             sleep(2);
         } else if ([action isEqualToString:@"open_app"]) {
             NSString *name = [act[@"name"] description] ?: @"";
@@ -1042,7 +1116,7 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
                 usleep(800 * 1000);
                 doLongPress(x, y, 1100);
                 result = @"剪贴板已确认,已回到目标 App、聚焦输入框并呼出粘贴菜单;下一步请点击粘贴或允许粘贴";
-                [history addObject:[NSString stringWithFormat:@"%d. input_text(%.0f,%.0f,%@)", step, x, y, text]];
+                [history addObject:[NSString stringWithFormat:@"%d. input_text(%@,%@)", step, usedID ? [NSString stringWithFormat:@"id=%ld", (long)oid] : [NSString stringWithFormat:@"%.0f,%.0f", xpx, ypx], text]];
                 sleep(2);
             } else {
                 [history addObject:[NSString stringWithFormat:@"%d. set_clipboard(%@) 已确认", step, text]];
