@@ -37,7 +37,10 @@ static IOHIDEventRef (*pCreateFinger)(CFAllocatorRef, uint64_t, uint32_t, uint32
 static void (*pAppend)(IOHIDEventRef, IOHIDEventRef, uint32_t);
 static void (*pSetInt)(IOHIDEventRef, uint32_t, int64_t);
 static void (*pSetSender)(IOHIDEventRef, uint64_t);
+static void (*pSetFloat)(IOHIDEventRef, uint32_t, double);
+static IOHIDEventRef (*pCreateKeyboard)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, Boolean, uint32_t);
 static IOHIDEventSystemClientRef gClient;
+static int gSwipeMode = 0; // 0 基础;1 +触点半径;2 +半径且移动事件带 Touch;3 +半径、慢速并在起止停顿;4 = 3 + 移动事件带 Range|Touch
 
 static NSString *loadHID(void) {
     void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
@@ -50,6 +53,8 @@ static NSString *loadHID(void) {
     LOAD(pAppend, "IOHIDEventAppendEvent")
     LOAD(pSetInt, "IOHIDEventSetIntegerValue")
     LOAD(pSetSender, "IOHIDEventSetSenderID")
+    pSetFloat = dlsym(h, "IOHIDEventSetFloatValue");           // 可选
+    pCreateKeyboard = dlsym(h, "IOHIDEventCreateKeyboardEvent"); // 可选(Home 键用)
     gClient = pClientCreate(kCFAllocatorDefault);
     if (!gClient) return @"IOHIDEventSystemClientCreate 返回空";
     return nil;
@@ -60,11 +65,13 @@ static void sendFinger(double nx, double ny, int phase) {
     uint64_t t = mach_absolute_time();
     BOOL touching = (phase != 2);
     uint32_t mask = (phase == 1) ? 0x4 : 0x3;
+    if (phase == 1) { if (gSwipeMode == 2) mask = 0x6; else if (gSwipeMode == 4) mask = 0x7; }
     IOHIDEventRef hand = pCreateDigitizer(kCFAllocatorDefault, t, 3, 0, 0, mask, 0,
                                           nx, ny, 0, 0, 0, touching, touching, 0);
     pSetInt(hand, 0xb0019, 1);
     IOHIDEventRef finger = pCreateFinger(kCFAllocatorDefault, t, 1, 2, mask, nx, ny, 0,
                                          touching ? 1.0 : 0.0, 0, touching, touching, 0);
+    if (gSwipeMode >= 1 && pSetFloat) { pSetFloat(finger, 0xb0014, 0.04); pSetFloat(finger, 0xb0015, 0.04); } // 触点半径
     pAppend(hand, finger, 0);
     CFRelease(finger);
     pSetSender(hand, 0x8000000817319372ULL);
@@ -83,14 +90,31 @@ static void doTap(double x, double y) {
 
 static void doSwipe(double x1, double y1, double x2, double y2, int steps, int ms) {
     CGSize s = screenSize();
+    if (gSwipeMode >= 3) { if (steps < 40) steps = 40; if (ms < 700) ms = 700; }
     if (steps < 2) steps = 2;
     sendFinger(x1 / s.width, y1 / s.height, 0);
+    if (gSwipeMode >= 3) usleep(80 * 1000);
     for (int i = 1; i <= steps; i++) {
         double k = (double)i / steps;
         usleep(ms * 1000 / steps);
         sendFinger((x1 + (x2 - x1) * k) / s.width, (y1 + (y2 - y1) * k) / s.height, 1);
     }
+    if (gSwipeMode >= 3) usleep(80 * 1000);
     sendFinger(x2 / s.width, y2 / s.height, 2);
+}
+
+// 用 HID 的"Home 键"(消费者页 Menu)回主屏幕;返回是否发出了事件
+static BOOL doHomeKey(void) {
+    if (!pCreateKeyboard || !gClient) return NO;
+    for (int down = 1; down >= 0; down--) {
+        IOHIDEventRef e = pCreateKeyboard(kCFAllocatorDefault, mach_absolute_time(), 0x0C, 0x40, down ? true : false, 0);
+        if (!e) return NO;
+        pSetSender(e, 0x8000000817319372ULL);
+        pDispatch(gClient, e);
+        CFRelease(e);
+        usleep(80 * 1000);
+    }
+    return YES;
 }
 
 #pragma mark - 截屏(多种方法依次尝试,并记录每种的结果)
@@ -574,7 +598,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.5.3", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.4.4", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -685,17 +709,41 @@ static NSString *bundleForAppName(NSString *name, NSString **info) {
     SEL sel = NSSelectorFromString(@"allInstalledApplications");
     if (!ws || ![ws respondsToSelector:sel]) { *info = @"无法列出已安装 App"; return nil; }
     NSArray *apps = ((id (*)(id, SEL))objc_msgSend)(ws, sel);
-    NSString *exact = nil, *partial = nil;
+    NSMutableArray *names = [NSMutableArray array], *bids = [NSMutableArray array], *userNames = [NSMutableArray array];
     for (id a in apps) {
-        NSString *n = nil, *bid = nil;
-        @try { n = [a valueForKey:@"localizedName"]; bid = [a valueForKey:@"applicationIdentifier"]; }
+        NSString *n = nil, *bid = nil, *type = nil;
+        @try { n = [a valueForKey:@"localizedName"]; bid = [a valueForKey:@"applicationIdentifier"]; type = [a valueForKey:@"applicationType"]; }
         @catch (NSException *ex) { continue; }
         if (![n isKindOfClass:NSString.class] || ![bid isKindOfClass:NSString.class] || !n.length) continue;
-        if ([n isEqualToString:name]) exact = bid;
-        else if (!partial && [n localizedCaseInsensitiveContainsString:name]) partial = bid;
+        [names addObject:n]; [bids addObject:bid];
+        if ([type isKindOfClass:NSString.class] && [type isEqualToString:@"User"]) [userNames addObject:n];
+    }
+    NSString *q = [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *exact = nil, *partial = nil;
+    for (NSUInteger i = 0; i < names.count; i++) {
+        NSString *n = names[i];
+        if ([n caseInsensitiveCompare:q] == NSOrderedSame) { exact = bids[i]; break; }
+        if (!partial && q.length >= 2 && ([n localizedCaseInsensitiveContainsString:q] || (n.length >= 2 && [q localizedCaseInsensitiveContainsString:n]))) partial = bids[i];
     }
     NSString *r = exact ?: partial;
-    if (!r) *info = [NSString stringWithFormat:@"没找到名为「%@」的 App", name];
+    if (!r) { // 常见 App 别名(只有确实装了才会命中);长的关键词放前面
+        NSArray *alias = @[@[@"网易云音乐", @"com.netease.cloudmusic"], @[@"哔哩哔哩", @"tv.danmaku.bilianime"],
+            @[@"百度地图", @"com.baidu.map"], @[@"腾讯地图", @"com.tencent.sosomap"], @[@"小红书", @"com.xingin.discover"],
+            @[@"拼多多", @"com.xunmeng.pinduoduo"], @[@"支付宝", @"com.alipay.iphoneclient"], @[@"高德", @"com.autonavi.amap"],
+            @[@"微信", @"com.tencent.xin"], @[@"淘宝", @"com.taobao.taobao4iphone"], @[@"京东", @"com.360buy.jdmobile"],
+            @[@"美团", @"com.meituan.imeituan"], @[@"抖音", @"com.ss.iphone.ugc.Aweme"], @[@"微博", @"com.sina.weibo"],
+            @[@"钉钉", @"com.laiwang.DingTalk"], @[@"饿了么", @"me.ele.ios.eleme"], @[@"滴滴", @"com.xiaojukeji.didi"],
+            @[@"备忘录", @"com.apple.mobilenotes"], @[@"设置", @"com.apple.Preferences"], @[@"相机", @"com.apple.camera"],
+            @[@"照片", @"com.apple.mobileslideshow"], @[@"电话", @"com.apple.mobilephone"], @[@"信息", @"com.apple.MobileSMS"],
+            @[@"Safari", @"com.apple.mobilesafari"], @[@"QQ", @"com.tencent.mqq"], @[@"地图", @"com.apple.Maps"]];
+        for (NSArray *pair in alias)
+            if ([q localizedCaseInsensitiveContainsString:pair[0]] && [bids containsObject:pair[1]]) { r = pair[1]; break; }
+    }
+    if (!r) {
+        NSArray *shown = userNames.count > 60 ? [userNames subarrayWithRange:NSMakeRange(0, 60)] : userNames;
+        *info = [NSString stringWithFormat:@"没找到名为「%@」的 App。已安装的第三方 App:%@。请改用其中的准确名称重试 open_app;如果目标 App 不在列表里,说明没装,请 stop 告诉用户。不要用滑动去主屏幕里找。",
+                 name, [shown componentsJoinedByString:@"、"]];
+    }
     return r;
 }
 
@@ -763,7 +811,8 @@ static NSString *const kAgentSystem =
 @"action 可选值:\n"
 @"- tap: 参数 id 或 x,y。点击。目标是 OCR 列表里的文字时,优先只给 id(程序会点该文字的中心,最准);没有文字的图标或空白输入框才给 x,y。\n"
 @"- long_press: 参数 id 或 x,y。长按。\n"
-@"- swipe: 参数 x,y,x2,y2。从(x,y)滑到(x2,y2)。往下看更多内容用从下往上滑(y 大,y2 小)。\n"
+@"- swipe: 参数 x,y,x2,y2,或只给 direction(up/down/left/right,表示手指滑动的方向)。往下看更多内容用 up。本设备上滑动可能不稳定,能用别的办法就别滑。\n"
+@"- home: 回到主屏幕。需要回主屏幕时只用这个动作,不要用 swipe。\n"
 @"- open_app: 参数 name(App 的中文名)。直接打开 App。\n"
 @"- input_text: 参数 id 或 x,y,text,可选 app(当前所在 App 的名字)。程序会先临时切到 PhoneAgent 把 text 写入剪贴板(iOS 不允许后台 App 写剪贴板),再切回原来的 App,点击并长按输入框呼出菜单;下一步必须观察并点击“粘贴”或“允许粘贴”,再确认输入框出现目标文字。这是输入文字的首选动作,text 必须是要输入的完整文字。\n"
 @"- set_clipboard: 参数 text,可选 app。只把文字放进剪贴板(同样会临时切到 PhoneAgent 再切回),不点击。一般直接用 input_text。\n"
@@ -777,7 +826,8 @@ static NSString *const kAgentSystem =
 @"4. 屏幕连续没变化就换一种办法,仍不行就 stop。\n"
 @"5. 看不到想要的内容时,先上滑或换搜索词,不要重复无效动作。\n"
 @"6. visible_text 必须如实抄录截图中的关键文字,如果看到支付密码、付款、结算、提交订单等内容,action 必须为 stop。\n"
-@"7. input_text 后如果看到“粘贴”或“允许粘贴”，必须点击对应菜单；如果输入框仍为空，重新使用 input_text，不要只重复 tap。";
+@"7. 找不到 App 时,按 open_app 返回的已安装 App 列表换准确名称重试;列表里没有就 stop。不要靠滑动去主屏幕里翻找 App。\n"
+@"8. input_text 后如果看到“粘贴”或“允许粘贴”，必须点击对应菜单；如果输入框仍为空，重新使用 input_text，不要只重复 tap。";
 
 static NSArray *visionMessages(NSString *task, NSString *history, UIImage *img, NSString **err) {
     UIImage *scaled = resizeToWidth(img, 1400);
@@ -972,6 +1022,22 @@ static BOOL writeClipboardInForeground(NSString *text, NSString *backHint, NSStr
     return ok;
 }
 
+// 回主屏幕:先发 Home 键事件;如果还能查到最前台 App 并且不是主屏,再尝试从底部上滑
+static BOOL goHome(NSString **note) {
+    BOOL sent = doHomeKey();
+    sleep(1);
+    NSString *f = frontmostBundleID();
+    if ([f isEqualToString:@"com.apple.springboard"]) { *note = @"Home 键事件有效"; return YES; }
+    if (!f.length) { *note = sent ? @"已发送 Home 键事件(无法确认结果)" : @"没有 Home 键接口,也无法确认结果"; return sent; }
+    CGSize sc = screenSize();
+    doSwipe(sc.width / 2, sc.height - 2, sc.width / 2, sc.height * 0.55, 12, 180);
+    sleep(1);
+    f = frontmostBundleID();
+    BOOL ok = [f isEqualToString:@"com.apple.springboard"];
+    *note = ok ? @"底部上滑有效" : [NSString stringWithFormat:@"Home 键和上滑都没能回到主屏(当前 %@)", f ?: @"未知"];
+    return ok;
+}
+
 // 等广播画面静止:最近 0.8 秒内没有新帧,说明动画/转场结束了(最多等 maxWait 秒)
 static void waitForStableFrame(double maxWait) {
     CFAbsoluteTime end = CFAbsoluteTimeGetCurrent() + maxWait;
@@ -983,14 +1049,9 @@ static void waitForStableFrame(double maxWait) {
     }
 }
 
-// done 在任务结束时回调:ok=是否完成,note=结果说明,items=最后一次截屏的 OCR 结果。
-static void agentRun(NSString *task, NSString *base, NSString *key, NSString *model,
-                     void (^done)(BOOL ok, NSString *note, NSArray *items)) {
+static void agentRun(NSString *task, NSString *base, NSString *key, NSString *model) {
     if ([model isEqualToString:@"deepseek-chat"] || !model.length) model = @"deepseek-flash";
     gAgentRunning = YES;
-    BOOL ok = NO;
-    NSString *note = @"任务结束";
-    NSArray *lastItems = nil;
     NSMutableArray *history = [NSMutableArray array];
     NSString *lastSig = @""; int same = 0;
     CGSize sc = screenSize();
@@ -999,14 +1060,13 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
         waitForStableFrame(3.0);
         NSString *err = nil;
         UIImage *img = takeScreenshot(&err);
-        if (!img) { note = [@"截屏失败,任务停止:" stringByAppendingString:err ?: @"?"]; agentSay(note); break; }
+        if (!img) { agentSay([@"截屏失败,任务停止:" stringByAppendingString:err ?: @"?"]); break; }
         NSArray *items = ocrImage(img, &err);
         if (items.count) items = [items sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
             int ya = [a[@"y"] intValue] / 12, yb = [b[@"y"] intValue] / 12;
             if (ya != yb) return ya < yb ? NSOrderedAscending : NSOrderedDescending;
             return [(NSNumber *)a[@"x"] compare:(NSNumber *)b[@"x"]];
         }];
-        if (items) lastItems = items;
         NSString *localText = @"";
         for (NSDictionary *it in items) localText = [localText stringByAppendingFormat:@"%@", it[@"text"] ?: @""];
         BOOL localOK = items.count >= 2 && localText.length >= 6;
@@ -1014,14 +1074,14 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
                             (unsigned long)UIImageJPEGRepresentation(img, 0.15).length];
         if ([screen isEqualToString:lastSig]) same++; else same = 0;
         lastSig = [screen copy];
-        if (same >= 4) { note = @"屏幕连续多步没变化,已停止"; agentSay(note); break; }
-        if (localOK && paySheetVisible(items)) { note = @"本地 OCR 看到支付/密码界面,已停止,请手动处理"; agentSay(note); break; }
+        if (same >= 4) { agentSay(@"屏幕连续多步没变化,已停止"); break; }
+        if (localOK && paySheetVisible(items)) { agentSay(@"本地 OCR 看到支付/密码界面,已停止,请手动处理"); break; }
 
         NSMutableString *hist = [NSMutableString string];
         NSUInteger from = history.count > 8 ? history.count - 8 : 0;
         for (NSUInteger i = from; i < history.count; i++) [hist appendFormat:@"%@\n", history[i]];
         NSArray *msgs = hybridMessages(task, hist, img, items, &err);
-        if (!msgs) { note = [@"截图视觉请求失败:" stringByAppendingString:err ?: @"?"]; agentSay(note); break; }
+        if (!msgs) { agentSay([@"截图视觉请求失败:" stringByAppendingString:err ?: @"?"]); break; }
         NSDictionary *act = callLLM(base, key, model, msgs, &err);
         if (!act && localOK) agentSay(@"OCR+截图请求失败,稍后自动重试");
         if (!act) {
@@ -1030,12 +1090,12 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
             act = callLLM(base, key, model, msgs, &err);
         }
         if (!gAgentRunning) break;
-        if (!act) { note = [@"调用模型失败,任务停止:" stringByAppendingString:err ?: @"?"]; agentSay(note); break; }
+        if (!act) { agentSay([@"调用模型失败,任务停止:" stringByAppendingString:err ?: @"?"]); break; }
 
         NSString *visible = [act[@"visible_text"] description] ?: @"";
         BOOL dangerous = NO;
         for (NSString *word in kDangerWords()) if ([visible containsString:word]) { dangerous = YES; break; }
-        if (dangerous) { note = @"视觉模型识别到支付/付款相关内容,任务已停止"; agentSay(note); break; }
+        if (dangerous) { agentSay(@"视觉模型识别到支付/付款相关内容,任务已停止"); break; }
 
         NSString *action = [[act[@"action"] description] lowercaseString] ?: @"";
         NSString *thought = [act[@"thought"] description] ?: @"";
@@ -1052,6 +1112,21 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
             x = [it[@"x"] doubleValue]; y = [it[@"y"] doubleValue];
             usedID = YES; idText = [it[@"text"] description] ?: @"";
         }
+        if ([action isEqualToString:@"swipe"] && !(act[@"x"] && act[@"y"] && act[@"x2"] && act[@"y2"])) {
+            NSString *dir = [[act[@"direction"] description] lowercaseString] ?: @"";
+            double sx = 390, sy = 900, ex = 390, ey = 900; BOOL okDir = YES;
+            if ([dir isEqualToString:@"up"]) { sy = 1250; ey = 500; }
+            else if ([dir isEqualToString:@"down"]) { sy = 500; ey = 1250; }
+            else if ([dir isEqualToString:@"left"]) { sx = 650; ex = 130; }
+            else if ([dir isEqualToString:@"right"]) { sx = 130; ex = 650; }
+            else okDir = NO;
+            if (!okDir) {
+                agentSay(@"提示:swipe 缺少坐标或方向,已忽略这一步");
+                [history addObject:[NSString stringWithFormat:@"%d. swipe 缺少坐标/direction,未执行", step]];
+                continue;
+            }
+            rx = sx; ry = sy; x = sx * kx; y = sy * ky; x2 = ex * kx; y2 = ey * ky;
+        }
         BOOL outOfRange = (!usedID && (rx > MODEL_W + 20 || ry > MODEL_H + 20 || [act[@"x2"] doubleValue] > MODEL_W + 20 || [act[@"y2"] doubleValue] > MODEL_H + 20));
         x = MAX(0, MIN(sc.width - 1, x)); y = MAX(0, MIN(sc.height - 1, y));
         x2 = MAX(0, MIN(sc.width - 1, x2)); y2 = MAX(0, MIN(sc.height - 1, y2));
@@ -1067,16 +1142,13 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
         }
 
         if ([action isEqualToString:@"done"] || [action isEqualToString:@"stop"]) {
-            NSString *t = [act[@"text"] description] ?: @"";
-            agentSay([NSString stringWithFormat:@"%@:%@", [action isEqualToString:@"done"] ? @"任务完成" : @"任务停止", t]);
-            if ([action isEqualToString:@"done"]) { ok = YES; note = t.length ? t : @"任务完成"; }
-            else note = t.length ? [@"任务停止:" stringByAppendingString:t] : @"任务停止";
+            agentSay([NSString stringWithFormat:@"%@:%@", [action isEqualToString:@"done"] ? @"任务完成" : @"任务停止", [act[@"text"] description] ?: @""]);
             break;
         }
         NSString *result = @"已执行";
         if ([action isEqualToString:@"tap"] || [action isEqualToString:@"long_press"]) {
             NSString *danger = localOK ? dangerNear(items, x, y) : nil;
-            if (danger) { note = [NSString stringWithFormat:@"拦截:要点击的位置是「%@」,属于支付/结算,已停止,请手动操作", danger]; agentSay(note); break; }
+            if (danger) { agentSay([NSString stringWithFormat:@"拦截:要点击的位置是「%@」,属于支付/结算,已停止,请手动操作", danger]); break; }
             if ([action isEqualToString:@"tap"]) doTap(x, y); else doLongPress(x, y, 900);
             [history addObject:usedID ? [NSString stringWithFormat:@"%d. %@ id=%ld「%@」", step, action, (long)oid, idText] : [NSString stringWithFormat:@"%d. %@(%.0f,%.0f)", step, action, xpx, ypx]];
             sleep(2);
@@ -1121,6 +1193,12 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
             } else {
                 [history addObject:[NSString stringWithFormat:@"%d. set_clipboard(%@) 已确认", step, text]];
             }
+        } else if ([action isEqualToString:@"home"]) {
+            NSString *hn = nil;
+            BOOL hok = goHome(&hn);
+            result = hok ? @"已回到主屏幕" : [@"回主屏幕可能失败:" stringByAppendingString:hn ?: @""];
+            [history addObject:[NSString stringWithFormat:@"%d. home → %@", step, result]];
+            sleep(1);
         } else if ([action isEqualToString:@"wait"]) {
             [history addObject:[NSString stringWithFormat:@"%d. wait", step]];
             usleep(1500 * 1000);
@@ -1129,98 +1207,15 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
         }
         if (![result isEqualToString:@"已执行"] && ![result isEqualToString:@"已打开"]) agentSay([@"提示:" stringByAppendingString:result]);
     }
-    if (!ok && gAgentRunning && [note isEqualToString:@"任务结束"]) note = @"25 步还没完成,已停止";
-    if (!ok && !gAgentRunning && [note isEqualToString:@"任务结束"]) note = @"任务已被手动停止";
     if (gAgentRunning) agentSay(@"任务结束");
     else agentSay(@"任务已被停止");
     gAgentRunning = NO;
-    if (done) done(ok, note, lastItems);
 }
-
-#pragma mark - 中转站 (微信 → Muse → 中转站 → 手机)
-
-static BOOL gRelayOn = NO;
-static BOOL gRelayBusy = NO;
-
-// 同步调中转站接口,返回 JSON 字典;失败返回 nil 并在 err 里写原因。
-static NSDictionary *relayJSON(NSString *method, NSString *path, NSDictionary *body, NSString **err) {
-    NSString *base = [NSUserDefaults.standardUserDefaults stringForKey:@"relay_base"] ?: @"https://dapeng.pythonanywhere.com";
-    while ([base hasSuffix:@"/"]) base = [base substringToIndex:base.length - 1];
-    NSURL *url = [NSURL URLWithString:[base stringByAppendingString:path]];
-    if (!url) { if (err) *err = @"中转站地址格式不对"; return nil; }
-    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:url];
-    r.HTTPMethod = method; r.timeoutInterval = 15;
-    [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    if (body) r.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
-    __block NSData *data = nil; __block NSError *e = nil; __block NSInteger code = 0;
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *er) {
-        data = d; e = er; code = [(NSHTTPURLResponse *)resp statusCode];
-        dispatch_semaphore_signal(sem);
-    }] resume];
-    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-    if (e || !data) { if (err) *err = [NSString stringWithFormat:@"网络错误:%@", e.localizedDescription ?: @"无数据"]; return nil; }
-    if (code != 200) { if (err) *err = [NSString stringWithFormat:@"中转站返回 %ld", (long)code]; return nil; }
-    NSDictionary *j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-    if (![j isKindOfClass:NSDictionary.class]) { if (err) *err = @"中转站返回格式不认识"; return nil; }
-    return j;
-}
-
-// 后台循环:每 2 秒问一次中转站有没有新任务;领到就跑,跑完把结果发回去。
-// 在后台队列跑,agentRun 本身是同步的,一次只跑一个任务。
-static void relayPollLoop(void) {
-    NSString *lastErr = nil;
-    while (gRelayOn) {
-        if (gRelayBusy) { sleep(1); continue; }
-        NSString *token = [NSUserDefaults.standardUserDefaults stringForKey:@"relay_token"] ?: @"";
-        NSString *err = nil;
-        NSDictionary *j = relayJSON(@"GET", [NSString stringWithFormat:@"/pa/poll?token=%@", token], nil, &err);
-        if (!j) {
-            if (![err isEqualToString:lastErr]) { agentSay([@"中转站连接失败:" stringByAppendingString:err]); lastErr = err; }
-            sleep(2); continue;
-        }
-        lastErr = nil;
-        NSDictionary *job = j[@"job"];
-        if (![job isKindOfClass:NSDictionary.class]) { sleep(2); continue; }
-        NSString *jobId = [job[@"id"] description] ?: @"";
-        NSString *goal = [job[@"goal"] description] ?: @"";
-        if (!jobId.length || !goal.length) { sleep(2); continue; }
-        gRelayBusy = YES;
-        agentSay([NSString stringWithFormat:@"中转站领到任务:%@", goal]);
-        NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-        NSString *key = [d stringForKey:@"llm_key"] ?: @"";
-        NSString *base = [d stringForKey:@"llm_base"] ?: @"";
-        NSString *model = [d stringForKey:@"llm_model"] ?: @"";
-        if (!key.length || !base.length || !model.length) {
-            agentSay(@"API Key、接口地址、模型名没填,任务做不了");
-            NSString *e2 = nil;
-            relayJSON(@"POST", @"/pa/result", @{@"token": token, @"job_id": jobId, @"status": @"failed",
-                                                @"note": @"手机里没填 API Key、接口地址、模型名", @"ocr": @[]}, &e2);
-            gRelayBusy = NO;
-            continue;
-        }
-        agentRun(goal, base, key, model, ^(BOOL ok, NSString *note, NSArray *items) {
-            NSMutableArray *ocr = [NSMutableArray array];
-            for (NSDictionary *it in items ?: @[]) {
-                if (ocr.count >= 40) break;
-                [ocr addObject:@{@"text": it[@"text"] ?: @"", @"x": it[@"x"] ?: @0, @"y": it[@"y"] ?: @0}];
-            }
-            NSString *e3 = nil;
-            NSDictionary *r = relayJSON(@"POST", @"/pa/result",
-                @{@"token": token, @"job_id": jobId, @"status": ok ? @"done" : @"failed",
-                  @"note": note ?: @"", @"ocr": ocr}, &e3);
-            if (r) agentSay([NSString stringWithFormat:@"任务结果已发回中转站:%@", ok ? @"完成" : @"失败"]);
-            else agentSay([@"任务结果发回失败:" stringByAppendingString:e3 ?: @"?"]);
-            gRelayBusy = NO;
-        });
-    }
-}
-
 
 #pragma mark - 界面
 
 @interface VC : UIViewController
-@property (nonatomic, strong) UITextField *xf, *yf, *keyF, *baseF, *modelF, *taskF, *relayBaseF, *relayTokenF;
+@property (nonatomic, strong) UITextField *xf, *yf, *keyF, *baseF, *modelF, *taskF;
 @property (nonatomic, strong) UILabel *log;
 @end
 
@@ -1265,11 +1260,6 @@ static void relayPollLoop(void) {
     self.baseF = [self tfield:@"接口地址" key:@"llm_base" secure:NO def:@"https://api.deepseek.com"];
     self.modelF = [self tfield:@"视觉模型名" key:@"llm_model" secure:NO def:@"deepseek-flash"];
     self.taskF = [self tfield:@"任务,例如:打开淘宝,搜索 保温杯,加入购物车" key:@"llm_task" secure:NO def:@""];
-    UILabel *rl = [UILabel new];
-    rl.numberOfLines = 0;
-    rl.text = @"中转站(微信控制用):填好下面的地址和密钥,点「中转站 开」,手机每 2 秒问一次有没有新任务。";
-    self.relayBaseF = [self tfield:@"中转站地址" key:@"relay_base" secure:NO def:@"https://dapeng.pythonanywhere.com"];
-    self.relayTokenF = [self tfield:@"中转站密钥" key:@"relay_token" secure:YES def:@""];
     UILabel *bl = [UILabel new];
     bl.numberOfLines = 0;
     bl.text = @"屏幕广播(截屏用):点右边按钮 → 选 PhoneAgent → 开始直播";
@@ -1289,6 +1279,8 @@ static void relayPollLoop(void) {
         tip, self.xf, self.yf,
         [self btn:@"3 秒后点击 (x,y)" action:@selector(onTap)],
         [self btn:@"3 秒后上滑一次" action:@selector(onSwipe)],
+        [self btn:@"切换滑动模式(0~4)" action:@selector(onSwipeMode)],
+        [self btn:@"3 秒后 回主屏(Home键)" action:@selector(onHome)],
         [self btn:@"3 秒后 截屏 + OCR" action:@selector(onOCR)],
         [self btn:@"后台保活 开/关" action:@selector(onKeep)],
         [self btn:@"3 秒后 测试写入剪贴板" action:@selector(onClip)],
@@ -1297,8 +1289,6 @@ static void relayPollLoop(void) {
         self.keyF, self.baseF, self.modelF, self.taskF,
         [self btn:@"开始任务" action:@selector(onStartAgent)],
         [self btn:@"停止任务" action:@selector(onStopAgent)],
-        rl, self.relayBaseF, self.relayTokenF,
-        [self btn:@"中转站 开/关" action:@selector(onRelay)],
         self.log]];
     st.axis = UILayoutConstraintAxisVertical;
     st.spacing = 10;
@@ -1352,6 +1342,19 @@ static void relayPollLoop(void) {
     double x = self.xf.text.doubleValue, y = self.yf.text.doubleValue;
     [self runLater:^{ doTap(x, y); [self say:@"点击已发送"]; } name:[NSString stringWithFormat:@"点击(%.0f,%.0f)", x, y]];
 }
+- (void)onSwipeMode {
+    gSwipeMode = (gSwipeMode + 1) % 5;
+    [NSUserDefaults.standardUserDefaults setInteger:gSwipeMode forKey:@"swipe_mode"];
+    NSArray *d = @[@"基础", @"+触点半径", @"+半径,移动事件带 Touch", @"+半径,慢速,起止停顿", @"+半径,慢速,移动事件带 Range|Touch"];
+    [self say:[NSString stringWithFormat:@"滑动模式 %d(%@)已保存。点“3 秒后上滑一次”在设置等可滚动页面测试", gSwipeMode, d[gSwipeMode]]];
+}
+- (void)onHome {
+    [self runLater:^{
+        NSString *hn = nil;
+        BOOL ok = goHome(&hn);
+        [self say:[NSString stringWithFormat:@"回主屏:%@(%@)", ok ? @"成功" : @"可能失败", hn ?: @""]];
+    } name:@"回主屏"];
+}
 - (void)onSwipe {
     if (!gClient) { [self say:@"触摸没初始化"]; return; }
     CGSize s = screenSize();
@@ -1388,27 +1391,9 @@ static void relayPollLoop(void) {
     [d setObject:model forKey:@"llm_model"]; [d setObject:task forKey:@"llm_task"];
     if (!gPlayer) [self say:setKeepAlive(YES)];
     if (!broadcastAlive()) [self say:@"提醒:屏幕广播还没开,没有广播会截屏失败"];
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ agentRun(task, base, key, model, nil); });
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ agentRun(task, base, key, model); });
 }
 - (void)onStopAgent { gAgentRunning = NO; [self say:@"正在停止任务..."]; }
-- (void)onRelay {
-    if (gRelayOn) { gRelayOn = NO; [self say:@"中转站已关闭"]; return; }
-    [self.view endEditing:YES];
-    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-    NSString *key = [self.keyF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    NSString *llmBase = [self.baseF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    NSString *model = [self.modelF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    NSString *base = [self.relayBaseF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    NSString *token = [self.relayTokenF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    if (!key.length || !llmBase.length || !model.length) { [self say:@"先填好 API Key、接口地址、模型名再开中转站"]; return; }
-    if (!token.length) { [self say:@"中转站密钥还没填"]; return; }
-    [d setObject:key forKey:@"llm_key"]; [d setObject:llmBase forKey:@"llm_base"]; [d setObject:model forKey:@"llm_model"];
-    [d setObject:base.length ? base : @"https://dapeng.pythonanywhere.com" forKey:@"relay_base"];
-    [d setObject:token forKey:@"relay_token"];
-    gRelayOn = YES;
-    [self say:@"中转站已开启,每 2 秒问一次有没有新任务"];
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ relayPollLoop(); });
-}
 - (void)onDiag { [self say:diagReport()]; }
 - (void)onClip {
     [self runLater:^{
@@ -1432,6 +1417,7 @@ static void relayPollLoop(void) {
 - (BOOL)application:(UIApplication *)a didFinishLaunchingWithOptions:(NSDictionary *)o {
     signal(SIGPIPE, SIG_IGN);
     gLock = [NSObject new];
+    gSwipeMode = (int)[NSUserDefaults.standardUserDefaults integerForKey:@"swipe_mode"];
     gToken = [NSUserDefaults.standardUserDefaults stringForKey:@"token"];
     if (!gToken) {
         gToken = [NSString stringWithFormat:@"%06u", arc4random_uniform(1000000)];
