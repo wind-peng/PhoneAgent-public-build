@@ -618,19 +618,12 @@ static void handleClient(int c) {
     if (parts.count < 2) { close(c); return; }
     NSURLComponents *uc = [NSURLComponents componentsWithString:[@"http://h" stringByAppendingString:parts[1]]];
     NSMutableDictionary *q = [NSMutableDictionary dictionary];
-    // 手动解析 query:queryItems 在自定义协议下对中文解码不稳,直接拆原始 query 再解码
-    for (NSString *pair in [(uc.query ?: @"") componentsSeparatedByString:@"&"]) {
-        NSRange eq = [pair rangeOfString:@"="];
-        if (eq.location == NSNotFound) continue;
-        NSString *k = [pair substringToIndex:eq.location];
-        NSString *v = [[pair substringFromIndex:eq.location + 1] stringByReplacingOccurrencesOfString:@"+" withString:@" "];
-        q[k] = [v stringByRemovingPercentEncoding] ?: v;
-    }
+    for (NSURLQueryItem *i in uc.queryItems) q[i.name] = i.value ?: @"";
     NSString *path = uc.path ?: @"/";
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.5.1", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.5.2", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -837,7 +830,7 @@ static NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSA
     [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     [r setValue:[@"Bearer " stringByAppendingString:key] forHTTPHeaderField:@"Authorization"];
     NSDictionary *body = @{@"model": model, @"messages": messages, @"temperature": @0.1,
-                           @"max_tokens": @2000};
+                           @"max_tokens": @700, @"response_format": @{@"type": @"json_object"}};
     r.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
     __block NSData *data = nil; __block NSError *e = nil; __block NSInteger code = 0;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
@@ -855,14 +848,7 @@ static NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSA
     NSDictionary *j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
     NSString *content = nil;
     @try { content = j[@"choices"][0][@"message"][@"content"]; } @catch (NSException *ex) {}
-    if (![content isKindOfClass:NSString.class] || !content.length) {
-        @try { content = j[@"choices"][0][@"message"][@"reasoning_content"]; } @catch (NSException *ex) {}
-    }
-    if (![content isKindOfClass:NSString.class] || !content.length) {
-        NSString *raw = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
-        *err = [NSString stringWithFormat:@"接口返回格式不认识: %@", raw.length > 300 ? [raw substringToIndex:300] : raw];
-        return nil;
-    }
+    if (![content isKindOfClass:NSString.class]) { *err = @"接口返回格式不认识"; return nil; }
     content = [[content stringByReplacingOccurrencesOfString:@"```json" withString:@""]
                stringByReplacingOccurrencesOfString:@"```" withString:@""];
     NSDictionary *act = parseModelJSON(content);
@@ -1119,7 +1105,7 @@ static void waitForStableFrame(double maxWait) {
 }
 
 static void agentRun(NSString *task, NSString *base, NSString *key, NSString *model) {
-    if ([model isEqualToString:@"deepseek-chat"] || [model isEqualToString:@"deepseek-flash"] || !model.length) model = @"glm-4.6v-flash";
+    if ([model isEqualToString:@"deepseek-chat"] || !model.length) model = @"deepseek-flash";
     gAgentRunning = YES;
     NSMutableArray *history = [NSMutableArray array];
     NSString *lastSig = @""; int same = 0;
@@ -1325,14 +1311,9 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     UILabel *tip = [UILabel new];
     tip.numberOfLines = 0;
     tip.text = [NSString stringWithFormat:@"屏幕 %.0f x %.0f pt。按按钮后 3 秒内切到别的 App,等它自己执行。", s.width, s.height];
-    // 迁移:旧版存的 DeepSeek 地址/模型一律换成智谱默认值
-    NSUserDefaults *ud0 = NSUserDefaults.standardUserDefaults;
-    if ([[ud0 stringForKey:@"llm_base"] containsString:@"deepseek"]) [ud0 setObject:@"https://open.bigmodel.cn/api/paas/v4" forKey:@"llm_base"];
-    if ([[ud0 stringForKey:@"llm_model"] containsString:@"deepseek"]) [ud0 setObject:@"glm-4.6v-flash" forKey:@"llm_model"];
-    if ([[ud0 stringForKey:@"llm_model2"] containsString:@"deepseek"]) [ud0 setObject:@"glm-4.6v-flash" forKey:@"llm_model2"];
     self.keyF = [self tfield:@"API Key" key:@"llm_key" secure:YES def:@""];
-    self.baseF = [self tfield:@"接口地址" key:@"llm_base" secure:NO def:@"https://open.bigmodel.cn/api/paas/v4"];
-    self.modelF = [self tfield:@"视觉模型名" key:@"llm_model" secure:NO def:@"glm-4.6v-flash"];
+    self.baseF = [self tfield:@"接口地址" key:@"llm_base" secure:NO def:@"https://api.deepseek.com"];
+    self.modelF = [self tfield:@"视觉模型名" key:@"llm_model" secure:NO def:@"deepseek-flash"];
     self.taskF = [self tfield:@"任务,例如:打开淘宝,搜索 保温杯,加入购物车" key:@"llm_task" secure:NO def:@""];
     UILabel *bl = [UILabel new];
     bl.numberOfLines = 0;
@@ -1442,7 +1423,7 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
         NSString *key = [self.keyF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         NSString *base = [self.baseF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         NSString *model = [self.modelF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if ([model isEqualToString:@"deepseek-chat"] || [model isEqualToString:@"deepseek-flash"] || !model.length) model = @"glm-4.6v-flash";
+        if ([model isEqualToString:@"deepseek-chat"] || !model.length) model = @"deepseek-flash";
         if (!key.length || !base.length) { [self say:@"请先填写 API Key 和接口地址"]; return; }
         NSArray *msgs = visionMessages(@"识别当前屏幕中的文字和主要按钮，只返回 JSON，visible_text 写出识别到的关键原文，action 返回 done。", @"", img, &err);
         NSDictionary *result = msgs ? callLLM(base, key, model, msgs, &err) : nil;
@@ -1493,14 +1474,7 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
 - (BOOL)application:(UIApplication *)app openURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenURLOptionsKey, id> *)options {
     NSURLComponents *uc = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
     NSMutableDictionary *q = [NSMutableDictionary dictionary];
-    // 手动解析 query:queryItems 在自定义协议下对中文解码不稳,直接拆原始 query 再解码
-    for (NSString *pair in [(uc.query ?: @"") componentsSeparatedByString:@"&"]) {
-        NSRange eq = [pair rangeOfString:@"="];
-        if (eq.location == NSNotFound) continue;
-        NSString *k = [pair substringToIndex:eq.location];
-        NSString *v = [[pair substringFromIndex:eq.location + 1] stringByReplacingOccurrencesOfString:@"+" withString:@" "];
-        q[k] = [v stringByRemovingPercentEncoding] ?: v;
-    }
+    for (NSURLQueryItem *i in uc.queryItems) q[i.name] = i.value ?: @"";
     NSString *cmd = uc.host ?: @"";
     if (![q[@"token"] isEqualToString:gToken]) {
         [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:@"收到 phoneagent:// 请求,但 token 不对,已忽略"];
@@ -1508,11 +1482,27 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     }
     if ([cmd isEqualToString:@"stop"]) { gAgentRunning = NO; return YES; }
     if (![cmd isEqualToString:@"task"]) return YES;
-    NSString *task = [q[@"text"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+    // 把收到的 URL 原样记到日志里(token 打码),方便排查快捷指令到底传了什么
+    NSString *raw = url.absoluteString ?: @"";
+    NSString *tok = q[@"token"];
+    if (tok.length) raw = [raw stringByReplacingOccurrencesOfString:tok withString:@"***"];
+    [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say"
+        object:[NSString stringWithFormat:@"收到 URL:%@\n参数名:%@", raw.length > 300 ? [raw substringToIndex:300] : raw, [q.allKeys componentsJoinedByString:@","]]];
+    // 兼容几种参数名;都没有时取除 token 外最长的那个参数值
+    NSString *task = q[@"text"] ?: q[@"t"] ?: q[@"task"] ?: q[@"q"] ?: @"";
+    if (!task.length) {
+        for (NSString *k in q) {
+            if ([k isEqualToString:@"token"]) continue;
+            if ([q[k] length] > task.length) task = q[k];
+        }
+    }
+    // 快捷指令有时会把已经编码过的文字再编码一次,这里再解一层
+    if ([task containsString:@"%"]) { NSString *d2 = [task stringByRemovingPercentEncoding]; if (d2.length) task = d2; }
+    task = [task stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     NSString *key = [ud stringForKey:@"llm_key"], *base = [ud stringForKey:@"llm_base"], *model = [ud stringForKey:@"llm_model2"];
     NSString *say = nil;
-    if (!task.length) say = [NSString stringWithFormat:@"收到语音任务,但文字是空的|url=%@|query=%@|qkeys=%@", url.absoluteString ?: @"(nil)", uc.query ?: @"(nil)", [[q allKeys] componentsJoinedByString:@","]];
+    if (!task.length) say = @"收到语音任务,但文字是空的(听写可能没识别到内容,或快捷指令里的变量没接对,看上面“收到 URL”那行)";
     else if (!key.length || !base.length || !model.length) say = @"收到语音任务,但还没保存 API 设置:请先在 App 里点一次“开始任务”或“看图测试”";
     else if (gAgentRunning) say = @"收到语音任务,但已有任务在运行";
     if (say) { [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:say]; return YES; }
