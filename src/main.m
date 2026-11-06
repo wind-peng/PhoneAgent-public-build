@@ -618,7 +618,14 @@ static void handleClient(int c) {
     if (parts.count < 2) { close(c); return; }
     NSURLComponents *uc = [NSURLComponents componentsWithString:[@"http://h" stringByAppendingString:parts[1]]];
     NSMutableDictionary *q = [NSMutableDictionary dictionary];
-    for (NSURLQueryItem *i in uc.queryItems) q[i.name] = i.value ?: @"";
+    // 手动解析 query:queryItems 在自定义协议下对中文解码不稳,直接拆原始 query 再解码
+    for (NSString *pair in [(uc.query ?: @"") componentsSeparatedByString:@"&"]) {
+        NSRange eq = [pair rangeOfString:@"="];
+        if (eq.location == NSNotFound) continue;
+        NSString *k = [pair substringToIndex:eq.location];
+        NSString *v = [[pair substringFromIndex:eq.location + 1] stringByReplacingOccurrencesOfString:@"+" withString:@" "];
+        q[k] = [v stringByRemovingPercentEncoding] ?: v;
+    }
     NSString *path = uc.path ?: @"/";
     CGSize s = screenSize();
 
@@ -1474,7 +1481,14 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
 - (BOOL)application:(UIApplication *)app openURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenURLOptionsKey, id> *)options {
     NSURLComponents *uc = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
     NSMutableDictionary *q = [NSMutableDictionary dictionary];
-    for (NSURLQueryItem *i in uc.queryItems) q[i.name] = i.value ?: @"";
+    // 手动解析 query:queryItems 在自定义协议下对中文解码不稳,直接拆原始 query 再解码
+    for (NSString *pair in [(uc.query ?: @"") componentsSeparatedByString:@"&"]) {
+        NSRange eq = [pair rangeOfString:@"="];
+        if (eq.location == NSNotFound) continue;
+        NSString *k = [pair substringToIndex:eq.location];
+        NSString *v = [[pair substringFromIndex:eq.location + 1] stringByReplacingOccurrencesOfString:@"+" withString:@" "];
+        q[k] = [v stringByRemovingPercentEncoding] ?: v;
+    }
     NSString *cmd = uc.host ?: @"";
     if (![q[@"token"] isEqualToString:gToken]) {
         [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:@"收到 phoneagent:// 请求,但 token 不对,已忽略"];
