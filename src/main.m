@@ -837,7 +837,7 @@ static NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSA
     [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     [r setValue:[@"Bearer " stringByAppendingString:key] forHTTPHeaderField:@"Authorization"];
     NSDictionary *body = @{@"model": model, @"messages": messages, @"temperature": @0.1,
-                           @"max_tokens": @2000, @"thinking": @{@"type": @"disabled"}};
+                           @"max_tokens": @2000};
     r.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
     __block NSData *data = nil; __block NSError *e = nil; __block NSInteger code = 0;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
@@ -858,7 +858,11 @@ static NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSA
     if (![content isKindOfClass:NSString.class] || !content.length) {
         @try { content = j[@"choices"][0][@"message"][@"reasoning_content"]; } @catch (NSException *ex) {}
     }
-    if (![content isKindOfClass:NSString.class]) { *err = @"接口返回格式不认识"; return nil; }
+    if (![content isKindOfClass:NSString.class] || !content.length) {
+        NSString *raw = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+        *err = [NSString stringWithFormat:@"接口返回格式不认识: %@", raw.length > 300 ? [raw substringToIndex:300] : raw];
+        return nil;
+    }
     content = [[content stringByReplacingOccurrencesOfString:@"```json" withString:@""]
                stringByReplacingOccurrencesOfString:@"```" withString:@""];
     NSDictionary *act = parseModelJSON(content);
