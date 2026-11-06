@@ -837,7 +837,7 @@ static NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSA
     [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     [r setValue:[@"Bearer " stringByAppendingString:key] forHTTPHeaderField:@"Authorization"];
     NSDictionary *body = @{@"model": model, @"messages": messages, @"temperature": @0.1,
-                           @"max_tokens": @700, @"response_format": @{@"type": @"json_object"}};
+                           @"max_tokens": @700};
     r.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
     __block NSData *data = nil; __block NSError *e = nil; __block NSInteger code = 0;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
