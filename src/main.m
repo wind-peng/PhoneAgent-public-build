@@ -1318,6 +1318,11 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     UILabel *tip = [UILabel new];
     tip.numberOfLines = 0;
     tip.text = [NSString stringWithFormat:@"屏幕 %.0f x %.0f pt。按按钮后 3 秒内切到别的 App,等它自己执行。", s.width, s.height];
+    // 迁移:旧版存的 DeepSeek 地址/模型一律换成智谱默认值
+    NSUserDefaults *ud0 = NSUserDefaults.standardUserDefaults;
+    if ([[ud0 stringForKey:@"llm_base"] containsString:@"deepseek"]) [ud0 setObject:@"https://open.bigmodel.cn/api/paas/v4" forKey:@"llm_base"];
+    if ([[ud0 stringForKey:@"llm_model"] containsString:@"deepseek"]) [ud0 setObject:@"glm-4.6v-flash" forKey:@"llm_model"];
+    if ([[ud0 stringForKey:@"llm_model2"] containsString:@"deepseek"]) [ud0 setObject:@"glm-4.6v-flash" forKey:@"llm_model2"];
     self.keyF = [self tfield:@"API Key" key:@"llm_key" secure:YES def:@""];
     self.baseF = [self tfield:@"接口地址" key:@"llm_base" secure:NO def:@"https://open.bigmodel.cn/api/paas/v4"];
     self.modelF = [self tfield:@"视觉模型名" key:@"llm_model" secure:NO def:@"glm-4.6v-flash"];
