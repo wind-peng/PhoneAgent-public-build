@@ -629,7 +629,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.6.0", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.6.1", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -692,7 +692,7 @@ static void handleClient(int c) {
         if (!task.length && body.length) task = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
         task = [task stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
         NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-        NSString *key = savedSetting(@"llm_key", @""), *base = savedSetting(@"llm_base", @"https://api.deepseek.com"), *model = savedSetting(@"llm_model", savedSetting(@"llm_model2", @"deepseek-flash"));
+        NSString *key = savedSetting(@"llm_key", @""), *base = savedSetting(@"llm_base", @"https://open.bigmodel.cn/api/paas/v4"), *model = savedSetting(@"llm_model", savedSetting(@"llm_model2", @"glm-4.1v-thinking-flashx"));
         if (!task.length) { sendJSON(c, 400, @{@"ok": @NO, @"error": @"没有任务文字"}); return; }
         if (!key.length || !base.length || !model.length) {
             sendJSON(c, 400, @{@"ok": @NO, @"error": @"还没保存 API 设置:请先在 App 里点一次“开始任务”或“看图测试”"});
@@ -835,8 +835,11 @@ static NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSA
     r.timeoutInterval = 90;
     [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     [r setValue:[@"Bearer " stringByAppendingString:key] forHTTPHeaderField:@"Authorization"];
-    NSDictionary *body = @{@"model": model, @"messages": messages, @"temperature": @0.1,
-                           @"max_tokens": @700, @"response_format": @{@"type": @"json_object"}};
+    // 智谱 V4 多模态兼容 OpenAI Chat Completions。标准模式采用提示词约束 JSON，
+    // 不发送 response_format，避免视觉模型因 JSON Schema/思考输出差异而返回空内容。
+    NSDictionary *body = @{@"model": model, @"messages": messages,
+                           @"temperature": @0.10,
+                           @"max_tokens": @1200, @"stream": @NO};
     r.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
     __block NSData *data = nil; __block NSError *e = nil; __block NSInteger code = 0;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
@@ -853,8 +856,23 @@ static NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSA
     }
     NSDictionary *j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
     NSString *content = nil;
-    @try { content = j[@"choices"][0][@"message"][@"content"]; } @catch (NSException *ex) {}
-    if (![content isKindOfClass:NSString.class]) { *err = @"接口返回格式不认识"; return nil; }
+    @try {
+        id msg = j[@"choices"][0][@"message"];
+        id c = [msg isKindOfClass:NSDictionary.class] ? msg[@"content"] : nil;
+        if ([c isKindOfClass:NSString.class]) content = c;
+        else if ([c isKindOfClass:NSArray.class]) {
+            NSMutableString *joined = [NSMutableString string];
+            for (id part in (NSArray *)c) {
+                if ([part isKindOfClass:NSString.class]) [joined appendString:part];
+                else if ([part isKindOfClass:NSDictionary.class] && [part[@"text"] isKindOfClass:NSString.class])
+                    [joined appendString:part[@"text"]];
+            }
+            content = joined;
+        }
+    } @catch (NSException *ex) {}
+    if (![content isKindOfClass:NSString.class] || !content.length) {
+        *err = @"接口返回格式不认识(模型可能只返回了思考内容)"; return nil;
+    }
     content = [[content stringByReplacingOccurrencesOfString:@"```json" withString:@""]
                stringByReplacingOccurrencesOfString:@"```" withString:@""];
     NSDictionary *act = parseModelJSON(content);
@@ -866,29 +884,14 @@ static NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSA
 }
 
 static NSString *const kAgentSystem =
-@"你是一个控制 iPhone 的视觉智能体。每一步都会收到:任务、最近的动作历史、一张当前屏幕截图(780x1688 像素,图上叠加了红色网格线,每 100 像素一条,边缘标有像素数字),以及本地 OCR 识别出的带编号文字列表。\n"
-@"所有坐标(x,y,x2,y2,以及 OCR 列表里的坐标)都是这张截图的像素坐标:左上角 (0,0),右下角 (780,1688),x 向右,y 向下。请对照网格线和边缘数字估计位置,点击要落在目标元素的中心。\n"
-@"只输出一个 JSON 对象,不要输出其他内容。thought 不超过20个字；visible_text 只抄录关键文字且不超过120字；然后输出 action 和参数。\n"
-@"action 可选值:\n"
-@"- tap: 参数 id 或 x,y。点击。目标是 OCR 列表里的文字时,优先只给 id(程序会点该文字的中心,最准);没有文字的图标或空白输入框才给 x,y。\n"
-@"- long_press: 参数 id 或 x,y。长按。\n"
-@"- swipe: 参数 x,y,x2,y2,或只给 direction(up/down/left/right,表示手指滑动的方向)。往下看更多内容用 up。本设备上滑动可能不稳定,能用别的办法就别滑。\n"
-@"- home: 回到主屏幕。需要回主屏幕时只用这个动作,不要用 swipe。\n"
-@"- open_app: 参数 name(App 的中文名)。直接打开 App。\n"
-@"- input_text: 参数 id 或 x,y,text,可选 app(当前所在 App 的名字)。程序会先临时切到 PhoneAgent 把 text 写入剪贴板(iOS 不允许后台 App 写剪贴板),再切回原来的 App,点击并长按输入框呼出菜单;下一步必须观察并点击“粘贴”或“允许粘贴”,再确认输入框出现目标文字。这是输入文字的首选动作,text 必须是要输入的完整文字。\n"
-@"- set_clipboard: 参数 text,可选 app。只把文字放进剪贴板(同样会临时切到 PhoneAgent 再切回),不点击。一般直接用 input_text。\n"
-@"- wait: 等待 1.5 秒。\n"
-@"- done: 参数 text。任务已完成。\n"
-@"- stop: 参数 text。无法继续或需要人工处理。\n"
-@"规则:\n"
-@"1. 有文字的目标一律用 id;只有没有文字的图标/输入框才给 x,y,并对照网格线估计。\n"
-@"2. 只做到\"加入购物车\"为止。绝不点击结算、支付、提交订单、立即购买、确认付款;遇到这些步骤立即 stop。\n"
-@"3. 每步只做一个动作。\n"
-@"4. 屏幕连续没变化就换一种办法,仍不行就 stop。\n"
-@"5. 看不到想要的内容时,先上滑或换搜索词,不要重复无效动作。\n"
-@"6. visible_text 必须如实抄录截图中的关键文字,如果看到支付密码、付款、结算、提交订单等内容,action 必须为 stop。\n"
-@"7. 找不到 App 时,按 open_app 返回的已安装 App 列表换准确名称重试;列表里没有就 stop。不要靠滑动去主屏幕里翻找 App。\n"
-@"8. input_text 后如果看到“粘贴”或“允许粘贴”，必须点击对应菜单；如果输入框仍为空，重新使用 input_text，不要只重复 tap。";
+@"你是 iPhone 手机界面操作专用视觉智能体。你必须同时理解截图、OCR 文字和任务目标，像一个谨慎的 GUI Agent 一样逐步完成任务。每一步只返回一个 JSON 对象，不要输出 Markdown、解释或第二个对象。\n"
+@"截图固定为 780x1688 像素，左上角是(0,0)，右下角是(780,1688)，x 向右、y 向下；红色网格每100像素一格。坐标必须是截图像素，不是 iPhone pt；优先使用 OCR 编号 id，只有无文字图标才估计 x,y。\n"
+@"JSON 字段必须包括 action 和 thought；可选字段包括 id、x、y、x2、y2、direction、name、text、app、visible_text、confidence。thought 不超过20个字，visible_text 只抄录当前屏幕关键原文且不超过120字。\n"
+@"action 只能是 tap、long_press、swipe、home、open_app、input_text、set_clipboard、wait、done、stop。每次只做一个动作。\n"
+@"tap/long_press/input_text：有文字目标必须只给 OCR 的 id；无文字图标或输入框才给 x,y。swipe 优先给 direction(up/down/left/right)，或给完整 x,y,x2,y2。向下看更多内容用 up。home 只能用 home，不能用 swipe 回桌面。open_app 给 App 中文名。input_text 给完整 text，可选 app；输入后下一步观察并点击“粘贴”或“允许粘贴”。wait 等待页面加载或动画完成。\n"
+@"决策流程：先确认当前 App 和页面，再找与任务最匹配的控件；点击后必须等待并重新观察；页面没变化时不要重复同一动作，换入口、关闭弹窗或等待加载；搜索任务要确认搜索框已聚焦并看到结果；完成任务要以页面出现明确成功状态为准。看不清、被登录/验证码/权限弹窗阻挡时 stop，不要猜坐标。\n"
+@"安全规则：只做到加入购物车/查看信息等非支付阶段。绝不点击支付、付款、结算、提交订单、立即购买、确认付款、支付密码、免密支付等；只要截图或 OCR 出现这些词，立即 stop。不得删除内容、发送消息、发布评论、下单或确认不可逆操作；仍有疑问时 stop。\n"
+@"open_app 找不到目标时，根据程序返回的已安装 App 列表换准确名称，不要靠滑动主屏幕找 App。连续两次动作无效就 stop 或换策略。";
 
 static NSArray *visionMessages(NSString *task, NSString *history, UIImage *img, NSString **err) {
     UIImage *scaled = resizeToWidth(img, 1400);
@@ -1486,7 +1489,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
 
 static void agentRun(NSString *task, NSString *base, NSString *key, NSString *model) {
     if ([model.lowercaseString containsString:@"autoglm"]) { agentRunAutoGLM(task, base, key, model); return; }
-    if ([model isEqualToString:@"deepseek-chat"] || !model.length) model = @"deepseek-flash";
+    if ([model isEqualToString:@"glm-4.1v-thinking-flash"] || !model.length) model = @"glm-4.1v-thinking-flashx";
     gAgentRunning = YES;
     NSMutableArray *history = [NSMutableArray array];
     NSString *lastSig = @""; int same = 0;
@@ -1693,8 +1696,8 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     tip.numberOfLines = 0;
     tip.text = [NSString stringWithFormat:@"屏幕 %.0f x %.0f pt。按按钮后 3 秒内切到别的 App,等它自己执行。", s.width, s.height];
     self.keyF = [self tfield:@"API Key" key:@"llm_key" secure:YES def:@""];
-    self.baseF = [self tfield:@"接口地址" key:@"llm_base" secure:NO def:@"https://api.deepseek.com"];
-    self.modelF = [self tfield:@"视觉模型名(DeepSeek: deepseek-flash;智谱: autoglm-phone)" key:@"llm_model" secure:NO def:@"deepseek-flash"];
+    self.baseF = [self tfield:@"接口地址" key:@"llm_base" secure:NO def:@"https://open.bigmodel.cn/api/paas/v4"];
+    self.modelF = [self tfield:@"视觉模型名(DeepSeek: glm-4.1v-thinking-flashx;智谱: autoglm-phone)" key:@"llm_model" secure:NO def:@"glm-4.1v-thinking-flashx"];
     self.taskF = [self tfield:@"任务,例如:打开淘宝,搜索 保温杯,加入购物车" key:@"llm_task" secure:NO def:@""];
     UILabel *bl = [UILabel new];
     bl.numberOfLines = 0;
@@ -1804,7 +1807,7 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
         NSString *key = [self.keyF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         NSString *base = [self.baseF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         NSString *model = [self.modelF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if ([model isEqualToString:@"deepseek-chat"] || !model.length) model = @"deepseek-flash";
+        if ([model isEqualToString:@"glm-4.1v-thinking-flash"] || !model.length) model = @"glm-4.1v-thinking-flashx";
         if (!key.length || !base.length) { [self say:@"请先填写 API Key 和接口地址"]; return; }
         NSArray *msgs = visionMessages(@"识别当前屏幕中的文字和主要按钮，只返回 JSON，visible_text 写出识别到的关键原文，action 返回 done。", @"", img, &err);
         NSDictionary *result = msgs ? callLLM(base, key, model, msgs, &err) : nil;
@@ -1881,7 +1884,7 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     if ([task containsString:@"%"]) { NSString *d2 = [task stringByRemovingPercentEncoding]; if (d2.length) task = d2; }
     task = [task stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    NSString *key = savedSetting(@"llm_key", @""), *base = savedSetting(@"llm_base", @"https://api.deepseek.com"), *model = savedSetting(@"llm_model", savedSetting(@"llm_model2", @"deepseek-flash"));
+    NSString *key = savedSetting(@"llm_key", @""), *base = savedSetting(@"llm_base", @"https://open.bigmodel.cn/api/paas/v4"), *model = savedSetting(@"llm_model", savedSetting(@"llm_model2", @"glm-4.1v-thinking-flashx"));
     NSString *say = nil;
     if (!task.length) say = @"收到语音任务,但文字是空的(听写可能没识别到内容,或快捷指令里的变量没接对,看上面“收到 URL”那行)";
     else if (!key.length || !base.length || !model.length) say = @"收到语音任务,但还没保存 API 设置:请先在 App 里点一次“开始任务”或“看图测试”";
@@ -1903,6 +1906,14 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
 
 - (BOOL)application:(UIApplication *)a didFinishLaunchingWithOptions:(NSDictionary *)o {
     signal(SIGPIPE, SIG_IGN);
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    // 从旧版自动迁移，避免已保存的 DeepSeek 配置覆盖新的智谱默认值。
+    NSString *savedBase = [ud stringForKey:@"llm_base"];
+    NSString *savedModel = [ud stringForKey:@"llm_model"];
+    if ([savedBase containsString:@"deepseek.com"] || [savedModel.lowercaseString hasPrefix:@"deepseek-"]) {
+        [ud setObject:@"https://open.bigmodel.cn/api/paas/v4" forKey:@"llm_base"];
+        [ud setObject:@"glm-4.1v-thinking-flashx" forKey:@"llm_model"];
+    }
     gLock = [NSObject new];
     gAgentLog = [NSMutableArray array];
     gSwipeMode = (int)[NSUserDefaults.standardUserDefaults integerForKey:@"swipe_mode"];
