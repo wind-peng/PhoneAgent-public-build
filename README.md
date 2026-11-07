@@ -64,7 +64,7 @@
 ## 使用
 1. 先开屏幕广播(App 里"屏幕广播"那行点右边图标 → 选 PhoneAgent → 开始直播)。
 2. 先点"3 秒后 截屏 + OCR",切到有文字的 App,确认日志显示"方法R"并列出识别的文字。
-3. 填 API Key、接口地址(默认 https://open.bigmodel.cn/api/paas/v4)、模型名(默认 glm-4.1v-thinking-flashx)、任务,点"开始任务"。
+3. 填 API Key、接口地址(默认 https://api.deepseek.com)、模型名(默认 deepseek-chat)、任务,点"开始任务"。
    API Key 保存在手机本地(NSUserDefaults),不会写进代码。
 4. 随时可点"停止任务"。
 
@@ -78,8 +78,3 @@
 - 模型只"看到"文字,看不到没有文字的图标(比如只有图案的购物车按钮)。
 - 输入文字靠"剪贴板 + 长按 + 粘贴",iOS 16 可能弹"允许粘贴",模型需要点它。
 - 动作之后画面有约 1 秒延迟,程序里已经等待。
-
-
-## v0.6.1 合并版
-
-默认使用智谱 `glm-4.1v-thinking-flashx` 稳定视觉模式；如果模型名填写 `autoglm-phone`，会自动启用 AutoGLM-Phone 专用手机操作协议，支持 Launch、Back、Double Tap、Type、Take_over、60 步循环和自动粘贴。
