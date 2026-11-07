@@ -9,7 +9,7 @@
   <key>CFBundleName</key><string>PhoneAgent</string>
   <key>CFBundleDisplayName</key><string>PhoneAgent</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.6.1</string>
+  <key>CFBundleShortVersionString</key><string>0.7.0</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>MinimumOSVersion</key><string>15.0</string>
   <key>LSRequiresIPhoneOS</key><true/>
@@ -25,5 +25,8 @@
       <key>CFBundleURLSchemes</key><array><string>phoneagent</string></array>
     </dict>
   </array>
+  <key>NSMicrophoneUsageDescription</key><string>用于在任务输入框里语音输入任务内容</string>
+  <key>NSSpeechRecognitionUsageDescription</key><string>用于把你说的话转成文字,作为任务内容</string>
+  <key>NSPhotoLibraryUsageDescription</key><string>用于选择要随任务发给模型的图片</string>
 </dict>
 </plist>

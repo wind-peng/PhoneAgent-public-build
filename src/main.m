@@ -19,6 +19,10 @@
 #import <mach/mach.h>
 
 #import <ReplayKit/ReplayKit.h>
+#import <Speech/Speech.h>
+#import <PhotosUI/PhotosUI.h>
+#import <PDFKit/PDFKit.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import "shared.h"
 
 #pragma mark - 触摸注入 (IOHID)
@@ -101,6 +105,19 @@ static void doSwipe(double x1, double y1, double x2, double y2, int steps, int m
     }
     if (gSwipeMode >= 3) usleep(80 * 1000);
     sendFinger(x2 / s.width, y2 / s.height, 2);
+}
+
+// 发一个无害的 Shift 键事件:对系统来说算"用户活动",可以重置自动锁屏计时
+static void doShiftKey(void) {
+    if (!pCreateKeyboard || !gClient) return;
+    for (int down = 1; down >= 0; down--) {
+        IOHIDEventRef e = pCreateKeyboard(kCFAllocatorDefault, mach_absolute_time(), 0x07, 0xE1, down ? true : false, 0);
+        if (!e) return;
+        pSetSender(e, 0x8000000817319372ULL);
+        pDispatch(gClient, e);
+        CFRelease(e);
+        usleep(40 * 1000);
+    }
 }
 
 // 用 HID 的"Home 键"(消费者页 Menu)回主屏幕;返回是否发出了事件
@@ -565,11 +582,39 @@ static volatile BOOL gAgentRunning;
 static void agentSay(NSString *m);
 static void agentRun(NSString *task, NSString *base, NSString *key, NSString *model);
 static NSMutableArray *gAgentLog; // 最近的任务日志,给 /status 用
+static NSMutableArray *gRunLog;          // 本次任务的完整日志(结果窗口用)
+static NSString *gTaskStatus, *gTaskResultText, *gLastResultText, *gTaskDisplay;
+static NSArray *gRunImages;              // 本次任务附带的图片(JPEG 数据)
+static NSMutableArray *gAttachImages, *gAttachNames; // 界面里已选的附件
+static NSMutableString *gAttachText;     // 界面里已选文件的文字内容
 
 // 读已保存的设置(空字符串按没有处理)。模型名在界面里存的键是 llm_model。
 static NSString *savedSetting(NSString *k, NSString *def) {
     NSString *v = [NSUserDefaults.standardUserDefaults stringForKey:k];
     return v.length ? v : def;
+}
+
+// ---- 模型提供商:每个提供商各自保存 API Key / 接口地址 / 模型名 ----
+static NSArray *providerList(void) {
+    return @[
+        @{@"id": @"deepseek", @"name": @"DeepSeek", @"base": @"https://api.deepseek.com", @"model": @"deepseek-flash"},
+        @{@"id": @"glm", @"name": @"智谱 GLM-5.3", @"base": @"https://open.bigmodel.cn/api/paas/v4", @"model": @"glm-5.3-flash"},
+        @{@"id": @"autoglm", @"name": @"智谱 AutoGLM-Phone", @"base": @"https://open.bigmodel.cn/api/paas/v4", @"model": @"autoglm-phone"},
+        @{@"id": @"custom", @"name": @"自定义(OpenAI 兼容接口)", @"base": @"", @"model": @""}];
+}
+static NSString *selectedProviderID(void) { return savedSetting(@"provider", @"deepseek"); }
+static NSString *providerDefault(NSString *pid, NSString *field) {
+    for (NSDictionary *p in providerList()) if ([p[@"id"] isEqualToString:pid]) return p[field] ?: @"";
+    return @"";
+}
+static NSString *provValue(NSString *pid, NSString *field) {
+    NSString *v = [NSUserDefaults.standardUserDefaults stringForKey:[NSString stringWithFormat:@"p_%@_%@", pid, field]];
+    if (v.length) return v;
+    return [field isEqualToString:@"key"] ? @"" : providerDefault(pid, field);
+}
+static void loadLLMConfig(NSString **key, NSString **base, NSString **model) {
+    NSString *pid = selectedProviderID();
+    *key = provValue(pid, @"key"); *base = provValue(pid, @"base"); *model = provValue(pid, @"model");
 }
 
 static NSString *gToken;
@@ -629,7 +674,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.6.1", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.7.0", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -692,7 +737,7 @@ static void handleClient(int c) {
         if (!task.length && body.length) task = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
         task = [task stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
         NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-        NSString *key = savedSetting(@"llm_key", @""), *base = savedSetting(@"llm_base", @"https://api.deepseek.com"), *model = savedSetting(@"llm_model", savedSetting(@"llm_model2", @"deepseek-flash"));
+        NSString *key = nil, *base = nil, *model = nil; loadLLMConfig(&key, &base, &model);
         if (!task.length) { sendJSON(c, 400, @{@"ok": @NO, @"error": @"没有任务文字"}); return; }
         if (!key.length || !base.length || !model.length) {
             sendJSON(c, 400, @{@"ok": @NO, @"error": @"还没保存 API 设置:请先在 App 里点一次“开始任务”或“看图测试”"});
@@ -702,6 +747,7 @@ static void handleClient(int c) {
         if (!broadcastAlive()) { sendJSON(c, 409, @{@"ok": @NO, @"error": @"屏幕广播没开,请先在 PhoneAgent 里开启"}); return; }
         agentSay([NSString stringWithFormat:@"收到语音任务:%@", task]);
         [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:[NSString stringWithFormat:@"收到语音任务:%@", task]];
+        gRunImages = nil; gTaskDisplay = task;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ agentRun(task, base, key, model); });
         sendJSON(c, 200, @{@"ok": @YES, @"task": task});
     } else if ([path isEqualToString:@"/stop"]) {
@@ -751,6 +797,15 @@ static volatile BOOL gAgentRunning = NO;
 static void agentSay(NSString *m) {
     @synchronized (gLock) {
         if (gAgentLog) { [gAgentLog addObject:m ?: @""]; if (gAgentLog.count > 40) [gAgentLog removeObjectAtIndex:0]; }
+        if (gRunLog) { [gRunLog addObject:m ?: @""]; if (gRunLog.count > 500) [gRunLog removeObjectAtIndex:0]; }
+        // 根据日志文字判断任务结果(完成 / 停止),结果窗口会用到
+        if ([m hasPrefix:@"任务完成:"]) { gTaskStatus = @"已完成"; gTaskResultText = [m substringFromIndex:5]; }
+        else if ([m hasPrefix:@"任务停止:"]) { gTaskStatus = @"已停止"; gTaskResultText = [m substringFromIndex:5]; }
+        else if ([m isEqualToString:@"任务已被停止"]) { gTaskStatus = @"已被手动停止"; }
+        else if ([m containsString:@"任务停止"] || [m hasPrefix:@"拦截:"] || [m hasPrefix:@"需要你来处理:"] ||
+                 [m containsString:@"已停止,请"] || [m containsString:@"任务未执行"] || [m hasSuffix:@"已停止"]) {
+            gTaskStatus = @"已停止"; gTaskResultText = m;
+        }
     }
     [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:m];
 }
@@ -802,7 +857,7 @@ static NSString *bundleForAppName(NSString *name, NSString **info) {
     }
     if (!r) {
         NSArray *shown = userNames.count > 60 ? [userNames subarrayWithRange:NSMakeRange(0, 60)] : userNames;
-        *info = [NSString stringWithFormat:@"没找到名为「%@」的 App。已安装的第三方 App:%@。请改用其中的准确名称重试 open_app;如果目标 App 不在列表里,说明没装,请 stop 告诉用户。不要用滑动去主屏幕里找。",
+        *info = [NSString stringWithFormat:@"没找到名为「%@」的 App。已安装的第三方 App:%@。请改用其中的准确名称重试 open_app;如果目标 App 不在列表里,可能没装,程序会自动回主屏幕并左滑到 App 资源库再找一次。",
                  name, [shown componentsJoinedByString:@"、"]];
     }
     return r;
@@ -826,7 +881,7 @@ static NSDictionary *parseModelJSON(NSString *raw) {
     return [obj isKindOfClass:NSDictionary.class] ? obj : nil;
 }
 
-static NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSArray *messages, NSString **err) {
+static NSDictionary *callLLMOnce(NSString *base, NSString *key, NSString *model, NSArray *messages, NSString **err) {
     while ([base hasSuffix:@"/"]) base = [base substringToIndex:base.length - 1];
     NSURL *url = [NSURL URLWithString:[base stringByAppendingString:@"/chat/completions"]];
     if (!url) { *err = @"接口地址格式不对"; return nil; }
@@ -878,6 +933,33 @@ static NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSA
     return act;
 }
 
+// 临时性错误(网络、限流、服务端 5xx、模型没给答案/没给 JSON)才重试;密钥错误、参数错误等不重试
+static BOOL llmErrRetryable(NSString *err) {
+    if (!err.length) return NO;
+    if ([err hasPrefix:@"网络错误"]) return YES;
+    if ([err hasPrefix:@"接口返回 "]) {
+        NSInteger code = [[err substringFromIndex:5] integerValue];
+        return code == 408 || code == 409 || code == 425 || code == 429 || code >= 500;
+    }
+    return [err containsString:@"模型没有输出答案"] || [err containsString:@"模型没返回 JSON"] || [err containsString:@"接口返回格式不认识"];
+}
+
+// 请求失败最多试 5 次(间隔 1、2、3、4 秒)
+static NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSArray *messages, NSString **err) {
+    NSString *last = nil;
+    for (int attempt = 1; attempt <= 5; attempt++) {
+        NSString *e = nil;
+        NSDictionary *r = callLLMOnce(base, key, model, messages, &e);
+        if (r) return r;
+        last = e;
+        if (!gAgentRunning || attempt == 5 || !llmErrRetryable(e)) break;
+        agentSay([NSString stringWithFormat:@"请求失败(%@),%d 秒后重试(第 %d/5 次)", e.length > 80 ? [e substringToIndex:80] : e, attempt, attempt + 1]);
+        sleep(attempt);
+    }
+    if (err) *err = last;
+    return nil;
+}
+
 static NSString *const kAgentSystem =
 @"你是一个控制 iPhone 的视觉智能体。每一步都会收到:任务、最近的动作历史、一张当前屏幕截图(780x1688 像素,图上叠加了红色网格线,每 100 像素一条,边缘标有像素数字),以及本地 OCR 识别出的带编号文字列表。\n"
 @"所有坐标(x,y,x2,y2,以及 OCR 列表里的坐标)都是这张截图的像素坐标:左上角 (0,0),右下角 (780,1688),x 向右,y 向下。请对照网格线和边缘数字估计位置,点击要落在目标元素的中心。\n"
@@ -891,17 +973,26 @@ static NSString *const kAgentSystem =
 @"- input_text: 参数 id 或 x,y,text,可选 app(当前所在 App 的名字)。程序会先临时切到 PhoneAgent 把 text 写入剪贴板(iOS 不允许后台 App 写剪贴板),再切回原来的 App,点击并长按输入框呼出菜单;下一步必须观察并点击“粘贴”或“允许粘贴”,再确认输入框出现目标文字。这是输入文字的首选动作,text 必须是要输入的完整文字。\n"
 @"- set_clipboard: 参数 text,可选 app。只把文字放进剪贴板(同样会临时切到 PhoneAgent 再切回),不点击。一般直接用 input_text。\n"
 @"- wait: 等待 1.5 秒。\n"
-@"- done: 参数 text。任务已完成。\n"
+@"- done: 参数 text。任务已完成;text 是写给用户看的完整结果(如果任务是查询、总结、比较信息,把得到的信息完整清楚地写在这里)。\n"
 @"- stop: 参数 text。无法继续或需要人工处理。\n"
 @"规则:\n"
 @"1. 有文字的目标一律用 id;只有没有文字的图标/输入框才给 x,y,并对照网格线估计。\n"
-@"2. 只做到\"加入购物车\"为止。绝不点击结算、支付、提交订单、立即购买、确认付款;遇到这些步骤立即 stop。\n"
+@"2. 涉及花钱或不可逆的操作(结算、支付、提交订单、立即购买、确认付款、转账、删除重要数据)绝不自己点击,立即 stop 并说明;其余任务按要求完成。\n"
 @"3. 每步只做一个动作。\n"
 @"4. 屏幕连续没变化就换一种办法,仍不行就 stop。\n"
 @"5. 看不到想要的内容时,先上滑或换搜索词,不要重复无效动作。\n"
 @"6. visible_text 必须如实抄录截图中的关键文字,如果看到支付密码、付款、结算、提交订单等内容,action 必须为 stop。\n"
-@"7. 找不到 App 时,按 open_app 返回的已安装 App 列表换准确名称重试;列表里没有就 stop。不要靠滑动去主屏幕里翻找 App。\n"
+@"7. 找不到 App 时,先按 open_app 返回的已安装 App 列表换准确名称重试;仍找不到时程序会自动回主屏幕并左滑进入 App 资源库,这时点顶部搜索框,用 input_text 输入 App 名称搜索,再点搜索结果打开。\n"
 @"8. input_text 后如果看到“粘贴”或“允许粘贴”，必须点击对应菜单；如果输入框仍为空，重新使用 input_text，不要只重复 tap。";
+
+static NSString *memoryText(void) { return [NSUserDefaults.standardUserDefaults stringForKey:@"memory_text"] ?: @""; }
+
+// 把用户的"记忆/偏好"附在系统提示词后面
+static NSString *systemPromptWithMemory(void) {
+    NSString *m = [memoryText() stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!m.length) return kAgentSystem;
+    return [kAgentSystem stringByAppendingFormat:@"\n\n用户的偏好与记忆(执行任务时请参考;如果和本次任务的明确要求冲突,以本次任务为准):\n%@", m];
+}
 
 static NSArray *visionMessages(NSString *task, NSString *history, UIImage *img, NSString **err) {
     UIImage *scaled = resizeToWidth(img, 1400);
@@ -997,13 +1088,18 @@ static NSArray *hybridMessages(NSString *task, NSString *history, UIImage *img, 
     NSData *prev = gPrevModelJPEG;
     gPrevModelJPEG = jpg;
     NSMutableArray *content = [NSMutableArray arrayWithObject:@{ @"type": @"text", @"text": text }];
+    NSArray *atts = gRunImages; // 用户随任务附带的图片(参考资料)
+    for (NSUInteger ai = 0; ai < atts.count; ai++) {
+        [content addObject:@{ @"type": @"text", @"text": [NSString stringWithFormat:@"任务附带图片 %lu/%lu(用户提供的参考资料,不是手机屏幕):", (unsigned long)ai + 1, (unsigned long)atts.count] }];
+        [content addObject:@{ @"type": @"image_url", @"image_url": @{ @"url": [@"data:image/jpeg;base64," stringByAppendingString:[atts[ai] base64EncodedStringWithOptions:0]] } }];
+    }
     if (glm && prev.length) { // 原生多模态模型可以同时看两张图:上一步之前的屏幕 + 当前屏幕,用来判断动作有没有生效
         [content addObject:@{ @"type": @"text", @"text": @"图1:上一步动作执行之前的屏幕(仅供对照):" }];
         [content addObject:@{ @"type": @"image_url", @"image_url": @{ @"url": [@"data:image/jpeg;base64," stringByAppendingString:[prev base64EncodedStringWithOptions:0]] } }];
         [content addObject:@{ @"type": @"text", @"text": @"图2:当前屏幕(据此决定下一步;先和图1对比,判断上一步有没有生效、页面有没有跳转):" }];
     }
     [content addObject:image];
-    return @[ @{ @"role": @"system", @"content": kAgentSystem },
+    return @[ @{ @"role": @"system", @"content": systemPromptWithMemory() },
               @{ @"role": @"user", @"content": content } ];
 }
 
@@ -1124,6 +1220,32 @@ static BOOL goHome(NSString **note) {
     return ok;
 }
 
+static void waitForStableFrame(double maxWait); // 定义在下面
+
+// 找不到 App 时的兜底:回主屏幕,向左滑到最后一页进入"App 资源库"(检测到"资源库"字样即成功)
+static BOOL enterAppLibrary(NSString **note) {
+    NSString *hn = nil;
+    goHome(&hn);
+    CGSize sc = screenSize();
+    for (int i = 0; i < 9 && gAgentRunning; i++) {
+        NSString *e = nil;
+        waitForStableFrame(2.0);
+        UIImage *img = takeScreenshot(&e);
+        NSArray *items = img ? ocrImage(img, &e) : nil;
+        for (NSDictionary *it in items) {
+            NSString *t = it[@"text"];
+            if ([t containsString:@"资源库"] || [t localizedCaseInsensitiveContainsString:@"App Library"]) {
+                *note = @"已进入 App 资源库";
+                return YES;
+            }
+        }
+        doSwipe(sc.width * 0.88, sc.height * 0.5, sc.width * 0.12, sc.height * 0.5, 20, 320);
+        sleep(1);
+    }
+    *note = @"左滑多次仍没有进入 App 资源库(滑动可能没生效)";
+    return NO;
+}
+
 // 等广播画面静止:最近 0.8 秒内没有新帧,说明动画/转场结束了(最多等 maxWait 秒)
 static void waitForStableFrame(double maxWait) {
     CFAbsoluteTime end = CFAbsoluteTimeGetCurrent() + maxWait;
@@ -1203,7 +1325,8 @@ static NSString *const kAGPrompt =
 @"\n"
 @"补充说明（当前设备是 iPhone）：\n"
 @"- iPhone 没有系统返回键，Back 会由程序点击左上角返回按钮来实现；Type 由程序通过剪贴板粘贴来实现，无需关心键盘。\n"
-@"- 严禁点击结算、支付、提交订单、确认付款；任务做到加入购物车即可，到达这些步骤时请 finish 并说明已到达。";
+@"- 涉及支付、转账、提交订单等花钱操作，不要自己点击，请 finish 并说明已到达该步骤；其余任务正常完成。\n"
+@"- finish 的 message 请写成给用户看的完整结果（如果任务是查询或总结信息，把信息完整写在 message 里）。";
 
 // 已安装 App 的 bundle id -> 显示名(只查一次)
 static NSString *agAppName(NSString *bid) {
@@ -1232,7 +1355,9 @@ static NSString *agSystemPrompt(void) {
     f.locale = [NSLocale localeWithLocaleIdentifier:@"zh_CN"];
     f.calendar = [NSCalendar calendarWithIdentifier:NSCalendarIdentifierGregorian];
     f.dateFormat = @"yyyy年MM月dd日 EEEE";
-    return [NSString stringWithFormat:@"今天的日期是: %@\n%@", [f stringFromDate:[NSDate date]], kAGPrompt];
+    NSString *mem = [memoryText() stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *memPart = mem.length ? [NSString stringWithFormat:@"\n\n用户的偏好与记忆（执行任务时请参考；与本次任务冲突时以本次任务为准）：\n%@", mem] : @"";
+    return [NSString stringWithFormat:@"今天的日期是: %@\n%@%@", [f stringFromDate:[NSDate date]], kAGPrompt, memPart];
 }
 
 // 从 do(action="Tap", text="xxx") 这样的文本里取字符串参数
@@ -1301,7 +1426,7 @@ static NSString *agFrameSig(NSData *d) {
 }
 
 // 直接把一个完整请求体发给 /chat/completions,返回第一条回复的文字
-static NSString *agPost(NSString *base, NSString *key, NSDictionary *body, NSString **err) {
+static NSString *agPostOnce(NSString *base, NSString *key, NSDictionary *body, NSString **err) {
     while ([base hasSuffix:@"/"]) base = [base substringToIndex:base.length - 1];
     NSURL *url = [NSURL URLWithString:[base stringByAppendingString:@"/chat/completions"]];
     if (!url) { *err = @"接口地址格式不对"; return nil; }
@@ -1329,6 +1454,23 @@ static NSString *agPost(NSString *base, NSString *key, NSDictionary *body, NSStr
     @try { content = j[@"choices"][0][@"message"][@"content"]; } @catch (NSException *ex) {}
     if (![content isKindOfClass:NSString.class]) { *err = @"接口返回格式不认识"; return nil; }
     return content;
+}
+
+// 请求失败最多试 5 次;honorStop=YES 时用户点了停止就不再重试
+static NSString *agPostRetry(NSString *base, NSString *key, NSDictionary *body, BOOL honorStop, NSString **err) {
+    NSString *last = nil;
+    for (int attempt = 1; attempt <= 5; attempt++) {
+        NSString *e = nil;
+        NSString *r = agPostOnce(base, key, body, &e);
+        if (r.length) return r;
+        if (r && !r.length) e = @"模型没有输出答案";
+        last = e;
+        if ((honorStop && !gAgentRunning) || attempt == 5 || !llmErrRetryable(e)) break;
+        agentSay([NSString stringWithFormat:@"请求失败(%@),%d 秒后重试(第 %d/5 次)", e.length > 80 ? [e substringToIndex:80] : e, attempt, attempt + 1]);
+        sleep(attempt);
+    }
+    if (err) *err = last;
+    return nil;
 }
 
 // 截一次图并做本地 OCR,在其中找包含 words 之一、且不含 excludes 的文字
@@ -1389,6 +1531,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
         agentSay(@"提示:AutoGLM-Phone 模型用智谱 BigModel 接口,已自动改用 https://open.bigmodel.cn/api/paas/v4(API Key 要填智谱的)");
     }
     CGSize sc = screenSize();
+    if (gRunImages.count) agentSay(@"提示:AutoGLM 模式暂不支持任务附带图片,图片已忽略(文件里的文字仍然有效)");
     NSMutableArray *ctx = [NSMutableArray arrayWithObject:@{@"role": @"system", @"content": agSystemPrompt()}];
     NSString *pendingNote = nil, *lastSig = @"";
     int same = 0, parseFails = 0;
@@ -1423,8 +1566,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
         [msgs addObject:userMsg];
         NSDictionary *body = @{@"model": model, @"messages": msgs, @"max_tokens": @3000,
                                @"temperature": @0.0, @"top_p": @0.85, @"frequency_penalty": @0.2};
-        NSString *content = agPost(base, key, body, &err);
-        if (!content) { agentSay(@"模型请求失败,1秒后重试"); sleep(1); content = agPost(base, key, body, &err); }
+        NSString *content = agPostRetry(base, key, body, YES, &err);
         if (!gAgentRunning) break;
         if (!content) { agentSay([@"调用模型失败,任务停止:" stringByAppendingString:err ?: @"?"]); break; }
         NSString *think = nil, *action = nil;
@@ -1481,7 +1623,12 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
             NSString *i2 = nil;
             NSString *bid = bundleForAppName(name, &i2);
             if (bid && openApp(bid)) { gLastApp = bid; lastX = lastY = -1; }
-            else { agentSay([@"提示:" stringByAppendingString:i2 ?: @"打开失败"]); pendingNote = [NSString stringWithFormat:@"(系统提示:%@)", i2 ?: @"打开失败"]; }
+            else {
+                agentSay([@"提示:" stringByAppendingString:i2 ?: @"打开失败"]);
+                NSString *ln = nil;
+                BOOL inLib = enterAppLibrary(&ln);
+                pendingNote = [NSString stringWithFormat:@"(系统提示:%@ 程序已自动尝试进入 App 资源库:%@。%@)", i2 ?: @"打开失败", ln ?: @"", inLib ? @"请点击顶部搜索框,用 Type 输入 App 名称搜索,再点搜索结果打开。" : @"如果仍不在资源库界面,请先 Home 再试,或 finish 说明。"];
+            }
             sleep(3);
         } else if ([act isEqualToString:@"back"]) {
             agentSay([@"返回:" stringByAppendingString:agGoBack(items)]);
@@ -1509,7 +1656,97 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
     gAgentRunning = NO;
 }
 
-static void agentRun(NSString *task, NSString *base, NSString *key, NSString *model) {
+#pragma mark - 任务收尾:防锁屏、结果、记忆
+
+static uint32_t gPMA;
+static dispatch_source_t gAwakeTimer;
+
+// 任务期间保持亮屏:idleTimerDisabled(只在前台有效)+ IOPM 断言(私有,可能无效)+ 每 8 秒一个无害的 Shift 键事件重置锁屏计时
+static void taskAwakeStart(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{ UIApplication.sharedApplication.idleTimerDisabled = YES; });
+    void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+    int (*create)(CFStringRef, uint32_t, CFStringRef, uint32_t *) = h ? dlsym(h, "IOPMAssertionCreateWithName") : NULL;
+    if (create && !gPMA) create(CFSTR("PreventUserIdleDisplaySleep"), 255, CFSTR("PhoneAgent task"), &gPMA);
+    if (!gAwakeTimer) {
+        gAwakeTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        dispatch_source_set_timer(gAwakeTimer, DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
+        dispatch_source_set_event_handler(gAwakeTimer, ^{ doShiftKey(); });
+        dispatch_resume(gAwakeTimer);
+    }
+}
+
+static void taskAwakeStop(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{ UIApplication.sharedApplication.idleTimerDisabled = NO; });
+    if (gAwakeTimer) { dispatch_source_cancel(gAwakeTimer); gAwakeTimer = nil; }
+    void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+    int (*rel)(uint32_t) = h ? dlsym(h, "IOPMAssertionRelease") : NULL;
+    if (rel && gPMA) { rel(gPMA); gPMA = 0; }
+}
+
+// 任务结束后让当前模型从任务和结果里提炼值得长期记住的偏好,追加进"记忆"(可以在记忆窗口里改)
+static void memoryLearn(NSString *task, NSString *result) {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    if ([d objectForKey:@"memory_auto"] && ![d boolForKey:@"memory_auto"]) return;
+    NSString *key = nil, *base = nil, *model = nil;
+    loadLLMConfig(&key, &base, &model);
+    if (!key.length || !base.length || !model.length) return;
+    NSString *lm = model.lowercaseString;
+    if ([lm containsString:@"autoglm"]) return; // 手机专用模型不适合做文字提炼
+    NSString *mem = memoryText();
+    NSString *prompt = [NSString stringWithFormat:
+        @"你是用户个人助手的记忆模块。下面是已有记忆、用户刚刚下达的手机任务和执行结果。请只提取值得长期记住的用户偏好或稳定事实(例如常用的 App、喜欢的品牌/口味/尺码、常去的地点、说话习惯、对结果格式的要求)。"
+        @"不要记录一次性的事情;不要记录密码、验证码、银行卡号、身份证号、手机号、支付信息等敏感内容;不要重复已有记忆。"
+        @"每条一行,以“- ”开头,每条不超过 40 个字;没有新内容就只输出“无”。\n\n已有记忆:\n%@\n\n任务:%@\n\n结果:%@",
+        mem.length ? mem : @"(空)", task ?: @"", result ?: @""];
+    BOOL glm = [lm hasPrefix:@"glm"];
+    NSDictionary *body = @{@"model": model, @"messages": @[@{@"role": @"user", @"content": prompt}],
+                           @"temperature": glm ? @1.0 : @0.2, @"max_tokens": glm ? @4096 : @300};
+    NSString *err = nil;
+    NSString *c = agPostRetry(base, key, body, NO, &err);
+    if (!c.length) return;
+    NSMutableArray *add = [NSMutableArray array];
+    for (NSString *ln in [c componentsSeparatedByString:@"\n"]) {
+        NSString *t = [ln stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (!([t hasPrefix:@"-"] || [t hasPrefix:@"•"])) continue;
+        if (t.length < 3 || t.length > 90 || [mem containsString:t]) continue;
+        [add addObject:t];
+        if (add.count >= 5) break;
+    }
+    if (!add.count) return;
+    NSString *joined = [add componentsJoinedByString:@"\n"];
+    NSString *newMem = mem.length ? [mem stringByAppendingFormat:@"\n%@", joined] : joined;
+    if (newMem.length > 3000) newMem = [newMem substringFromIndex:newMem.length - 3000];
+    [d setObject:newMem forKey:@"memory_text"];
+    [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:[NSString stringWithFormat:@"已记住新偏好:\n%@", joined]];
+}
+
+static void taskRunBegin(NSString *task) {
+    @synchronized (gLock) { [gRunLog removeAllObjects]; gTaskStatus = @""; gTaskResultText = @""; }
+    taskAwakeStart();
+}
+
+// 任务结束:停止防锁屏 -> 回到 PhoneAgent -> 弹出结果窗口 -> 后台提炼记忆
+static void taskRunEnd(NSString *task) {
+    taskAwakeStop();
+    NSString *status, *result; NSArray *lines;
+    @synchronized (gLock) { status = gTaskStatus; result = gTaskResultText; lines = [gRunLog copy]; }
+    if (!status.length) status = @"已结束";
+    if (!result.length) result = @"(模型没有给出结果文字,详见下面的执行记录)";
+    NSString *shown = gTaskDisplay.length ? gTaskDisplay : task;
+    NSString *text = [NSString stringWithFormat:@"【任务】\n%@\n\n【状态】%@\n\n【结果】\n%@\n\n【执行记录】\n%@",
+                      shown, status, result, [lines componentsJoinedByString:@"\n"]];
+    gLastResultText = text;
+    if (appStateNow() != UIApplicationStateActive) {
+        openApp(NSBundle.mainBundle.bundleIdentifier);
+        waitAppActive(6);
+        usleep(500 * 1000);
+    }
+    [NSNotificationCenter.defaultCenter postNotificationName:@"pa.showResult" object:text];
+    NSString *shownCopy = [shown copy], *resultCopy = [result copy];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ memoryLearn(shownCopy, resultCopy); });
+}
+
+static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString *model) {
     if ([model.lowercaseString containsString:@"autoglm"]) { agentRunAutoGLM(task, base, key, model); return; }
     gCurrentModel = model;
     gPrevModelJPEG = nil;
@@ -1628,7 +1865,12 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
             NSString *info = nil;
             NSString *bid = bundleForAppName(name, &info);
             if (bid && openApp(bid)) { result = @"已打开"; gLastApp = bid; }
-            else result = info ?: @"打开失败";
+            else {
+                result = info ?: @"打开失败";
+                NSString *ln = nil;
+                BOOL inLib = enterAppLibrary(&ln);
+                result = [result stringByAppendingFormat:@"\n程序已自动尝试进入 App 资源库:%@。%@", ln ?: @"", inLib ? @"请点击顶部搜索框,用 input_text 输入 App 名称搜索,再点搜索结果打开。" : @"如果仍不在资源库界面,请用 home 动作回主屏幕后再试,或 stop。"];
+            }
             [history addObject:[NSString stringWithFormat:@"%d. open_app(%@) → %@", step, name, result]];
             sleep(3);
         } else if ([action isEqualToString:@"input_text"] || [action isEqualToString:@"set_clipboard"]) {
@@ -1679,31 +1921,199 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     gAgentRunning = NO;
 }
 
+// 对外的入口:开始/收尾都在这里处理,中间走原来的逻辑
+static void agentRun(NSString *task, NSString *base, NSString *key, NSString *model) {
+    taskRunBegin(task);
+    agentRunCore(task, base, key, model);
+    taskRunEnd(task);
+}
+
 #pragma mark - 界面
 
-@interface VC : UIViewController
-@property (nonatomic, strong) UITextField *xf, *yf, *keyF, *baseF, *modelF, *taskF;
-@property (nonatomic, strong) UILabel *log;
+// ---- 语音输入(在 App 里按麦克风按钮;识别由系统的语音识别完成) ----
+@interface PAVoice : NSObject
+@property (nonatomic, copy) void (^onText)(NSString *text);
+@property (nonatomic, copy) void (^onState)(BOOL listening, NSString *msg);
+@property (nonatomic, readonly) BOOL listening;
+- (void)toggle;
+- (void)stop;
+@end
+
+@implementation PAVoice {
+    AVAudioEngine *_engine;
+    SFSpeechRecognizer *_rec;
+    SFSpeechAudioBufferRecognitionRequest *_req;
+    SFSpeechRecognitionTask *_task;
+    BOOL _listening;
+}
+- (BOOL)listening { return _listening; }
+- (void)notify:(BOOL)on msg:(NSString *)m { if (self.onState) self.onState(on, m); }
+- (void)toggle { if (_listening) [self stop]; else [self requestAndStart]; }
+- (void)requestAndStart {
+    [SFSpeechRecognizer requestAuthorization:^(SFSpeechRecognizerAuthorizationStatus st) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (st != SFSpeechRecognizerAuthorizationStatusAuthorized) {
+                [self notify:NO msg:@"没有语音识别权限:请在 设置 → PhoneAgent 里打开“语音识别”"];
+                return;
+            }
+            [AVAudioSession.sharedInstance requestRecordPermission:^(BOOL granted) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (!granted) { [self notify:NO msg:@"没有麦克风权限:请在 设置 → PhoneAgent 里打开“麦克风”"]; return; }
+                    [self begin];
+                });
+            }];
+        });
+    }];
+}
+- (void)begin {
+    _rec = [[SFSpeechRecognizer alloc] initWithLocale:[NSLocale localeWithLocaleIdentifier:@"zh-CN"]];
+    if (!_rec || !_rec.isAvailable) { [self notify:NO msg:@"语音识别暂时不可用(需要联网)"]; return; }
+    NSError *e = nil;
+    AVAudioSession *s = AVAudioSession.sharedInstance;
+    [s setCategory:AVAudioSessionCategoryPlayAndRecord mode:AVAudioSessionModeDefault
+           options:(AVAudioSessionCategoryOptionDefaultToSpeaker | AVAudioSessionCategoryOptionMixWithOthers | AVAudioSessionCategoryOptionAllowBluetooth)
+             error:&e];
+    [s setActive:YES error:&e];
+    _engine = [AVAudioEngine new];
+    _req = [SFSpeechAudioBufferRecognitionRequest new];
+    _req.shouldReportPartialResults = YES;
+    SFSpeechAudioBufferRecognitionRequest *req = _req;
+    AVAudioInputNode *input = _engine.inputNode;
+    AVAudioFormat *fmt = [input outputFormatForBus:0];
+    [input installTapOnBus:0 bufferSize:1024 format:fmt block:^(AVAudioPCMBuffer *buf, AVAudioTime *when) { [req appendAudioPCMBuffer:buf]; }];
+    [_engine prepare];
+    if (![_engine startAndReturnError:&e]) {
+        [self notify:NO msg:[NSString stringWithFormat:@"无法启动录音:%@", e.localizedDescription]];
+        [self teardown];
+        return;
+    }
+    _listening = YES;
+    [self notify:YES msg:@"正在听……说完再点一次结束"];
+    __weak PAVoice *w = self;
+    _task = [_rec recognitionTaskWithRequest:_req resultHandler:^(SFSpeechRecognitionResult *r, NSError *err) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            PAVoice *me = w;
+            if (!me) return;
+            if (r && me.onText) me.onText(r.bestTranscription.formattedString);
+            if (err || r.isFinal) { [me stop]; [me finishTask]; }
+        });
+    }];
+}
+- (void)teardown {
+    if (_engine.isRunning) [_engine stop];
+    [_engine.inputNode removeTapOnBus:0];
+    _engine = nil;
+}
+- (void)stop {
+    if (!_listening) return;
+    _listening = NO;
+    [_req endAudio];
+    [self teardown];
+    AVAudioSession *s = AVAudioSession.sharedInstance;
+    [s setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
+    [s setActive:YES error:nil];
+    resumeKeepAlive();
+    [self notify:NO msg:@"语音输入结束"];
+}
+- (void)finishTask { [_task cancel]; _task = nil; _req = nil; }
+@end
+
+// ---- 结果窗口:可以选中文字、一键复制 ----
+@interface ResultVC : UIViewController
+@property (nonatomic, copy) NSString *text;
+@end
+@implementation ResultVC
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"任务结果";
+    self.view.backgroundColor = UIColor.systemBackgroundColor;
+    UITextView *tv = [[UITextView alloc] initWithFrame:self.view.bounds];
+    tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    tv.editable = NO; tv.selectable = YES; tv.alwaysBounceVertical = YES;
+    tv.font = [UIFont systemFontOfSize:16];
+    tv.textContainerInset = UIEdgeInsetsMake(14, 12, 14, 12);
+    tv.text = self.text;
+    [self.view addSubview:tv];
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain target:self action:@selector(close)];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"复制全部" style:UIBarButtonItemStylePlain target:self action:@selector(copyAll)];
+}
+- (void)close { [self dismissViewControllerAnimated:YES completion:nil]; }
+- (void)copyAll {
+    UIPasteboard.generalPasteboard.string = self.text;
+    self.navigationItem.rightBarButtonItem.title = @"已复制";
+}
+@end
+
+// ---- 记忆窗口:可以自己增删改,也可以让它任务后自动记 ----
+@interface MemoryVC : UIViewController
+@property (nonatomic, strong) UITextView *tv;
+@property (nonatomic, strong) UISwitch *sw;
+@end
+@implementation MemoryVC
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"记忆";
+    self.view.backgroundColor = UIColor.systemBackgroundColor;
+    UILabel *hint = [UILabel new];
+    hint.numberOfLines = 0; hint.font = [UIFont systemFontOfSize:13]; hint.textColor = UIColor.secondaryLabelColor;
+    hint.text = @"每行一条,可以手动增删改。执行任务时会作为偏好提供给模型,例如:“买东西优先选京东”“我的收货地址默认用公司”“回答请简短”。请不要写密码、银行卡号等敏感信息。";
+    UILabel *swl = [UILabel new]; swl.text = @"任务结束后自动记住新的偏好";
+    swl.font = [UIFont systemFontOfSize:15];
+    self.sw = [UISwitch new];
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    self.sw.on = [d objectForKey:@"memory_auto"] ? [d boolForKey:@"memory_auto"] : YES;
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[swl, self.sw]];
+    row.axis = UILayoutConstraintAxisHorizontal; row.distribution = UIStackViewDistributionEqualSpacing;
+    self.tv = [UITextView new];
+    self.tv.font = [UIFont systemFontOfSize:16];
+    self.tv.layer.borderWidth = 1; self.tv.layer.borderColor = UIColor.separatorColor.CGColor; self.tv.layer.cornerRadius = 8;
+    self.tv.text = memoryText();
+    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[hint, row, self.tv]];
+    st.axis = UILayoutConstraintAxisVertical; st.spacing = 12;
+    st.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:st];
+    UILayoutGuide *g = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [st.topAnchor constraintEqualToAnchor:g.topAnchor constant:12],
+        [st.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:16],
+        [st.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-16],
+        [st.bottomAnchor constraintEqualToAnchor:g.bottomAnchor constant:-12]]];
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"完成" style:UIBarButtonItemStyleDone target:self action:@selector(done)];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"清空" style:UIBarButtonItemStylePlain target:self action:@selector(clearAll)];
+}
+- (void)save {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    [d setObject:self.tv.text ?: @"" forKey:@"memory_text"];
+    [d setBool:self.sw.on forKey:@"memory_auto"];
+}
+- (void)done { [self save]; [self dismissViewControllerAnimated:YES completion:nil]; }
+- (void)clearAll { self.tv.text = @""; }
+- (void)viewWillDisappear:(BOOL)animated { [super viewWillDisappear:animated]; [self save]; }
+@end
+
+// ---- 主界面 ----
+static NSData *attachJPEG(UIImage *img) {
+    CGSize sz = img.size;
+    CGFloat k = MIN(1.0, 1600.0 / MAX(sz.width, sz.height));
+    CGSize ns = CGSizeMake(floor(sz.width * k), floor(sz.height * k));
+    UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat];
+    f.scale = 1; f.opaque = YES;
+    UIImage *out = [[[UIGraphicsImageRenderer alloc] initWithSize:ns format:f] imageWithActions:^(UIGraphicsImageRendererContext *c) {
+        [img drawInRect:CGRectMake(0, 0, ns.width, ns.height)];
+    }];
+    return UIImageJPEGRepresentation(out, 0.85);
+}
+
+@interface VC : UIViewController <UITextViewDelegate, PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
+@property (nonatomic, strong) UIButton *provBtn, *micBtn;
+@property (nonatomic, strong) UITextField *keyF, *baseF, *modelF;
+@property (nonatomic, strong) UITextView *taskTV;
+@property (nonatomic, strong) UILabel *phLabel, *attLabel, *log;
+@property (nonatomic, strong) PAVoice *voice;
+@property (nonatomic, copy) NSString *voiceBase;
 @end
 
 @implementation VC
-- (UITextField *)field:(NSString *)ph text:(NSString *)t {
-    UITextField *f = [UITextField new];
-    f.placeholder = ph; f.text = t;
-    f.borderStyle = UITextBorderStyleRoundedRect;
-    f.keyboardType = UIKeyboardTypeDecimalPad;
-    return f;
-}
-- (UITextField *)tfield:(NSString *)ph key:(NSString *)k secure:(BOOL)sec def:(NSString *)def {
-    UITextField *f = [UITextField new];
-    f.placeholder = ph;
-    f.text = [NSUserDefaults.standardUserDefaults stringForKey:k] ?: def;
-    f.borderStyle = UITextBorderStyleRoundedRect;
-    f.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    f.autocorrectionType = UITextAutocorrectionTypeNo;
-    f.secureTextEntry = sec;
-    return f;
-}
 - (UIButton *)btn:(NSString *)title action:(SEL)a {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     [b setTitle:title forState:UIControlStateNormal];
@@ -1711,57 +2121,93 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     [b addTarget:self action:a forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
+- (UITextField *)tf:(NSString *)ph secure:(BOOL)sec {
+    UITextField *f = [UITextField new];
+    f.placeholder = ph;
+    f.borderStyle = UITextBorderStyleRoundedRect;
+    f.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    f.autocorrectionType = UITextAutocorrectionTypeNo;
+    f.secureTextEntry = sec;
+    return f;
+}
+- (UIStackView *)row:(NSArray *)views {
+    UIStackView *r = [[UIStackView alloc] initWithArrangedSubviews:views];
+    r.axis = UILayoutConstraintAxisHorizontal; r.distribution = UIStackViewDistributionFillEqually; r.spacing = 8;
+    return r;
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.systemBackgroundColor;
-    CGSize s = screenSize();
-    self.xf = [self field:@"x (pt)" text:[NSString stringWithFormat:@"%d", (int)(s.width / 2)]];
-    self.yf = [self field:@"y (pt)" text:[NSString stringWithFormat:@"%d", (int)(s.height / 2)]];
-    self.log = [UILabel new];
-    self.log.numberOfLines = 0;
-    self.log.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
-    UILabel *tip = [UILabel new];
-    tip.numberOfLines = 0;
-    tip.text = [NSString stringWithFormat:@"屏幕 %.0f x %.0f pt。按按钮后 3 秒内切到别的 App,等它自己执行。", s.width, s.height];
-    self.keyF = [self tfield:@"API Key" key:@"llm_key" secure:YES def:@""];
-    self.baseF = [self tfield:@"接口地址" key:@"llm_base" secure:NO def:@"https://api.deepseek.com"];
-    self.modelF = [self tfield:@"视觉模型名(DeepSeek: deepseek-flash;智谱: autoglm-phone)" key:@"llm_model" secure:NO def:@"deepseek-flash"];
-    self.taskF = [self tfield:@"任务,例如:打开淘宝,搜索 保温杯,加入购物车" key:@"llm_task" secure:NO def:@""];
+    __weak VC *wself = self;
+
+    // 模型选择 + 各自的 API 设置
+    self.provBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.provBtn.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+    self.provBtn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
+    self.keyF = [self tf:@"API Key" secure:YES];
+    self.baseF = [self tf:@"接口地址" secure:NO];
+    self.modelF = [self tf:@"模型名" secure:NO];
+
+    // 任务输入:多行文字 + 语音 + 附件
+    self.taskTV = [UITextView new];
+    self.taskTV.font = [UIFont systemFontOfSize:16];
+    self.taskTV.layer.borderWidth = 1; self.taskTV.layer.borderColor = UIColor.separatorColor.CGColor; self.taskTV.layer.cornerRadius = 8;
+    self.taskTV.delegate = self;
+    self.taskTV.text = @"";
+    self.phLabel = [UILabel new];
+    self.phLabel.text = @"输入任务,例如:打开淘宝,搜索保温杯,加入购物车。也可以点下面的麦克风说,或附上图片/文件让模型处理。";
+    self.phLabel.numberOfLines = 0; self.phLabel.font = [UIFont systemFontOfSize:15]; self.phLabel.textColor = UIColor.placeholderTextColor;
+    self.phLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.taskTV addSubview:self.phLabel];
+    [NSLayoutConstraint activateConstraints:@[
+        [self.phLabel.topAnchor constraintEqualToAnchor:self.taskTV.topAnchor constant:8],
+        [self.phLabel.leadingAnchor constraintEqualToAnchor:self.taskTV.leadingAnchor constant:8],
+        [self.phLabel.widthAnchor constraintEqualToAnchor:self.taskTV.widthAnchor constant:-16],
+        [self.taskTV.heightAnchor constraintEqualToConstant:120]]];
+    self.micBtn = [self btn:@"🎤 语音输入" action:@selector(onMic)];
+    UIButton *attBtn = [self btn:@"📎 图片/文件" action:@selector(onAttach)];
+    self.attLabel = [UILabel new];
+    self.attLabel.numberOfLines = 0; self.attLabel.font = [UIFont systemFontOfSize:13]; self.attLabel.textColor = UIColor.secondaryLabelColor;
+    self.attLabel.hidden = YES;
+
+    UIButton *startBtn = [self btn:@"开始任务" action:@selector(onStart)];
+    UIButton *stopBtn = [self btn:@"停止任务" action:@selector(onStop)];
+    UIButton *memBtn = [self btn:@"记忆" action:@selector(onMemory)];
+    UIButton *resBtn = [self btn:@"上次结果" action:@selector(onLastResult)];
+    UIButton *keepBtn = [self btn:@"后台保活 开/关" action:@selector(onKeep)];
+    UIButton *diagBtn = [self btn:@"诊断" action:@selector(onDiag)];
+
+    // 屏幕广播(截屏必需)
     UILabel *bl = [UILabel new];
-    bl.numberOfLines = 0;
-    bl.text = @"屏幕广播(截屏用):点右边按钮 → 选 PhoneAgent → 开始直播";
+    bl.numberOfLines = 0; bl.font = [UIFont systemFontOfSize:14];
+    bl.text = @"屏幕广播(截屏必需):点右边按钮 → 选 PhoneAgent → 开始直播";
     RPSystemBroadcastPickerView *pv = [[RPSystemBroadcastPickerView alloc] initWithFrame:CGRectMake(0, 0, 56, 56)];
     pv.preferredExtension = @"com.example.phoneagent.broadcast";
     pv.showsMicrophoneButton = NO;
     [pv.widthAnchor constraintEqualToConstant:56].active = YES;
     [pv.heightAnchor constraintEqualToConstant:56].active = YES;
     UIStackView *brow = [[UIStackView alloc] initWithArrangedSubviews:@[bl, pv]];
-    brow.axis = UILayoutConstraintAxisHorizontal;
-    brow.spacing = 10;
-    brow.alignment = UIStackViewAlignmentCenter;
-    __weak VC *wself = self;
-    [NSNotificationCenter.defaultCenter addObserverForName:@"pa.say" object:nil queue:nil
-                                                usingBlock:^(NSNotification *n) { [wself say:[n.object description]]; }];
+    brow.axis = UILayoutConstraintAxisHorizontal; brow.spacing = 10; brow.alignment = UIStackViewAlignmentCenter;
+
+    UILabel *tokenL = [UILabel new];
+    tokenL.font = [UIFont systemFontOfSize:12]; tokenL.textColor = UIColor.tertiaryLabelColor;
+    tokenL.text = [NSString stringWithFormat:@"快捷指令 token:%@", gToken];
+    self.log = [UILabel new];
+    self.log.numberOfLines = 0;
+    self.log.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
-        tip, self.xf, self.yf,
-        [self btn:@"3 秒后点击 (x,y)" action:@selector(onTap)],
-        [self btn:@"3 秒后上滑一次" action:@selector(onSwipe)],
-        [self btn:@"切换滑动模式(0~4)" action:@selector(onSwipeMode)],
-        [self btn:@"3 秒后 回主屏(Home键)" action:@selector(onHome)],
-        [self btn:@"3 秒后 截屏 + OCR" action:@selector(onOCR)],
-        [self btn:@"后台保活 开/关" action:@selector(onKeep)],
-        [self btn:@"3 秒后 测试写入剪贴板" action:@selector(onClip)],
-        [self btn:@"诊断 IOSurface" action:@selector(onDiag)],
-        brow,
-        self.keyF, self.baseF, self.modelF, self.taskF,
-        [self btn:@"开始任务" action:@selector(onStartAgent)],
-        [self btn:@"停止任务" action:@selector(onStopAgent)],
-        self.log]];
+        self.provBtn, self.keyF, self.baseF, self.modelF,
+        self.taskTV, [self row:@[self.micBtn, attBtn]], self.attLabel,
+        [self row:@[startBtn, stopBtn]], [self row:@[memBtn, resBtn]],
+        brow, [self row:@[keepBtn, diagBtn]], tokenL, self.log]];
     st.axis = UILayoutConstraintAxisVertical;
     st.spacing = 10;
     st.translatesAutoresizingMaskIntoConstraints = NO;
     UIScrollView *sv = [UIScrollView new];
     sv.translatesAutoresizingMaskIntoConstraints = NO;
+    sv.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
     [self.view addSubview:sv];
     [sv addSubview:st];
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
@@ -1774,106 +2220,219 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
         [st.bottomAnchor constraintEqualToAnchor:sv.contentLayoutGuide.bottomAnchor constant:-16],
         [st.leadingAnchor constraintEqualToAnchor:sv.frameLayoutGuide.leadingAnchor constant:20],
         [st.trailingAnchor constraintEqualToAnchor:sv.frameLayoutGuide.trailingAnchor constant:-20]]];
-    [self.view addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self.view action:@selector(endEditing:)]];
+
+    // 通知:日志、结果窗口
+    [NSNotificationCenter.defaultCenter addObserverForName:@"pa.say" object:nil queue:nil
+                                                usingBlock:^(NSNotification *n) { [wself say:[n.object description]]; }];
+    [NSNotificationCenter.defaultCenter addObserverForName:@"pa.showResult" object:nil queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(NSNotification *n) { [wself showResult:[n.object description]]; }];
+
+    // 语音输入
+    self.voice = [PAVoice new];
+    self.voice.onText = ^(NSString *text) {
+        wself.taskTV.text = [(wself.voiceBase ?: @"") stringByAppendingString:text ?: @""];
+        wself.phLabel.hidden = wself.taskTV.text.length > 0;
+    };
+    self.voice.onState = ^(BOOL listening, NSString *msg) {
+        [wself.micBtn setTitle:listening ? @"⏹ 点击结束" : @"🎤 语音输入" forState:UIControlStateNormal];
+        if (msg.length && !listening) [wself say:msg];
+    };
+
+    [self loadFields];
+    [self buildProviderMenu];
+    [self refreshAttachLabel];
 
     NSString *e1 = loadHID();
-    [self say:e1 ? [@"触摸初始化失败: " stringByAppendingString:e1] : @"触摸: 初始化成功"];
+    if (e1) [self say:[@"触摸初始化失败: " stringByAppendingString:e1]];
     NSString *e2 = loadShot();
-    [self say:e2 ? [@"截屏初始化失败: " stringByAppendingString:e2] : @"截屏: 符号加载成功"];
+    if (e2) [self say:[@"截屏初始化失败: " stringByAppendingString:e2]];
     NSString *e3 = startServer();
-    [self say:e3 ? [@"HTTP 服务失败: " stringByAppendingString:e3]
-                 : [NSString stringWithFormat:@"HTTP 服务: 127.0.0.1:%d\ntoken: %@\n在 Safari 打开:\nhttp://127.0.0.1:%d/ping", PORT, gToken, PORT]];
-    [self say:setKeepAlive(YES)];
-    [self say:diagReport()];
+    if (e3) [self say:[@"本地服务启动失败: " stringByAppendingString:e3]];
+    setKeepAlive(YES);
 }
+
+// ---- 提供商 / 设置 ----
+- (void)saveFields {
+    NSString *pid = selectedProviderID();
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    NSCharacterSet *ws = NSCharacterSet.whitespaceAndNewlineCharacterSet;
+    [d setObject:[self.keyF.text stringByTrimmingCharactersInSet:ws] ?: @"" forKey:[NSString stringWithFormat:@"p_%@_key", pid]];
+    [d setObject:[self.baseF.text stringByTrimmingCharactersInSet:ws] ?: @"" forKey:[NSString stringWithFormat:@"p_%@_base", pid]];
+    [d setObject:[self.modelF.text stringByTrimmingCharactersInSet:ws] ?: @"" forKey:[NSString stringWithFormat:@"p_%@_model", pid]];
+}
+- (void)loadFields {
+    NSString *pid = selectedProviderID();
+    self.keyF.text = provValue(pid, @"key");
+    self.baseF.text = provValue(pid, @"base");
+    self.modelF.text = provValue(pid, @"model");
+    self.baseF.placeholder = [providerDefault(pid, @"base") length] ? providerDefault(pid, @"base") : @"接口地址(OpenAI 兼容,例如 https://xxx/v1)";
+    self.modelF.placeholder = [providerDefault(pid, @"model") length] ? providerDefault(pid, @"model") : @"模型名";
+}
+- (void)buildProviderMenu {
+    NSString *cur = selectedProviderID();
+    NSMutableArray *acts = [NSMutableArray array];
+    NSString *curName = @"DeepSeek";
+    __weak VC *wself = self;
+    for (NSDictionary *p in providerList()) {
+        NSString *pid = p[@"id"];
+        UIAction *a = [UIAction actionWithTitle:p[@"name"] image:nil identifier:nil handler:^(UIAction *act) { [wself switchProvider:pid]; }];
+        if ([pid isEqualToString:cur]) { a.state = UIMenuElementStateOn; curName = p[@"name"]; }
+        [acts addObject:a];
+    }
+    self.provBtn.menu = [UIMenu menuWithTitle:@"选择模型" children:acts];
+    self.provBtn.showsMenuAsPrimaryAction = YES;
+    [self.provBtn setTitle:[NSString stringWithFormat:@"模型:%@  ▾", curName] forState:UIControlStateNormal];
+}
+- (void)switchProvider:(NSString *)pid {
+    [self saveFields];
+    [NSUserDefaults.standardUserDefaults setObject:pid forKey:@"provider"];
+    [self loadFields];
+    [self buildProviderMenu];
+}
+
+// ---- 日志 / 结果 ----
 - (void)say:(NSString *)m {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSString *t = [NSString stringWithFormat:@"%@\n%@", m, self.log.text ?: @""];
-        if (t.length > 8000) t = [t substringToIndex:8000];
+        if (t.length > 6000) t = [t substringToIndex:6000];
         self.log.text = t;
     });
 }
-- (void)runLater:(void (^)(void))block name:(NSString *)name {
+- (void)showResult:(NSString *)text {
+    gLastResultText = text;
+    void (^present)(void) = ^{
+        ResultVC *r = [ResultVC new];
+        r.text = text;
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:r];
+        [self presentViewController:nav animated:YES completion:nil];
+    };
+    if (self.presentedViewController) [self dismissViewControllerAnimated:NO completion:present];
+    else present();
+}
+- (void)onLastResult {
+    if (!gLastResultText.length) { [self say:@"还没有任务结果"]; return; }
+    [self showResult:gLastResultText];
+}
+- (void)onMemory {
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[MemoryVC new]];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+// ---- 开始 / 停止 ----
+- (void)onStart {
     [self.view endEditing:YES];
-    __block UIBackgroundTaskIdentifier bg = [UIApplication.sharedApplication
-        beginBackgroundTaskWithExpirationHandler:^{ [UIApplication.sharedApplication endBackgroundTask:bg]; }];
-    [self say:[name stringByAppendingString:@": 3 秒后执行"]];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
-                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        block();
-        dispatch_async(dispatch_get_main_queue(), ^{ [UIApplication.sharedApplication endBackgroundTask:bg]; });
-    });
-}
-- (void)onTap {
-    if (!gClient) { [self say:@"触摸没初始化"]; return; }
-    double x = self.xf.text.doubleValue, y = self.yf.text.doubleValue;
-    [self runLater:^{ doTap(x, y); [self say:@"点击已发送"]; } name:[NSString stringWithFormat:@"点击(%.0f,%.0f)", x, y]];
-}
-- (void)onSwipeMode {
-    gSwipeMode = (gSwipeMode + 1) % 5;
-    [NSUserDefaults.standardUserDefaults setInteger:gSwipeMode forKey:@"swipe_mode"];
-    NSArray *d = @[@"基础", @"+触点半径", @"+半径,移动事件带 Touch", @"+半径,慢速,起止停顿", @"+半径,慢速,移动事件带 Range|Touch"];
-    [self say:[NSString stringWithFormat:@"滑动模式 %d(%@)已保存。点“3 秒后上滑一次”在设置等可滚动页面测试", gSwipeMode, d[gSwipeMode]]];
-}
-- (void)onHome {
-    [self runLater:^{
-        NSString *hn = nil;
-        BOOL ok = goHome(&hn);
-        [self say:[NSString stringWithFormat:@"回主屏:%@(%@)", ok ? @"成功" : @"可能失败", hn ?: @""]];
-    } name:@"回主屏"];
-}
-- (void)onSwipe {
-    if (!gClient) { [self say:@"触摸没初始化"]; return; }
-    CGSize s = screenSize();
-    [self runLater:^{ doSwipe(s.width / 2, s.height * 0.75, s.width / 2, s.height * 0.3, 20, 300); [self say:@"上滑已发送"]; } name:@"上滑"];
-}
-- (void)onOCR {
-    [self runLater:^{
-        NSString *err = nil;
-        UIImage *img = takeScreenshot(&err);
-        if (!img) { [self say:[@"截屏失败: " stringByAppendingString:err ?: @"?"]]; return; }
-        NSString *key = [self.keyF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        NSString *base = [self.baseF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        NSString *model = [self.modelF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if ([model isEqualToString:@"deepseek-chat"] || !model.length) model = @"deepseek-flash";
-        if (!key.length || !base.length) { [self say:@"请先填写 API Key 和接口地址"]; return; }
-        NSArray *msgs = visionMessages(@"识别当前屏幕中的文字和主要按钮，只返回 JSON，visible_text 写出识别到的关键原文，action 返回 done。", @"", img, &err);
-        NSDictionary *result = msgs ? callLLM(base, key, model, msgs, &err) : nil;
-        if (!result) { [self say:[@"视觉模型失败: " stringByAppendingString:err ?: @"?"]]; return; }
-        [self say:[NSString stringWithFormat:@"视觉识别(方法%@) %.0fx%.0f\n%@",
-                   gShotMethod, img.size.width, img.size.height,
-                   [result[@"visible_text"] description] ?: @"(模型未返回文字)"]];
-    } name:@"截图+视觉识别"];
-}
-- (void)onStartAgent {
-    [self.view endEditing:YES];
-    if (gAgentRunning) { [self say:@"任务正在运行"]; return; }
-    NSString *key = [self.keyF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    NSString *base = [self.baseF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    NSString *model = [self.modelF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    NSString *task = [self.taskF.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    if (!key.length || !base.length || !model.length || !task.length) { [self say:@"API Key、接口地址、模型名、任务都要填"]; return; }
-    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-    [d setObject:key forKey:@"llm_key"]; [d setObject:base forKey:@"llm_base"];
-    [d setObject:model forKey:@"llm_model"]; [d setObject:task forKey:@"llm_task"];
-    if (!gPlayer) [self say:setKeepAlive(YES)];
+    [self saveFields];
+    if (self.voice.listening) [self.voice stop];
+    if (gAgentRunning) { [self say:@"已有任务在运行"]; return; }
+    NSString *key = nil, *base = nil, *model = nil;
+    loadLLMConfig(&key, &base, &model);
+    NSString *task = [self.taskTV.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!task.length) { [self say:@"请先输入任务(可以用麦克风说)"]; return; }
+    if (!key.length) { [self say:@"请先填写当前所选模型的 API Key"]; return; }
+    if (!base.length || !model.length) { [self say:@"接口地址和模型名都要填"]; return; }
+    NSString *full = gAttachText.length ? [task stringByAppendingFormat:@"\n\n【用户附带的文件内容】\n%@", gAttachText] : task;
+    gTaskDisplay = task;
+    gRunImages = [gAttachImages copy];
+    if (!gPlayer) setKeepAlive(YES);
     if (!broadcastAlive()) [self say:@"提醒:屏幕广播还没开,没有广播会截屏失败"];
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ agentRun(task, base, key, model); });
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ agentRun(full, base, key, model); });
 }
-- (void)onStopAgent { gAgentRunning = NO; [self say:@"正在停止任务..."]; }
+- (void)onStop { gAgentRunning = NO; [self say:@"正在停止任务……"]; }
+- (void)onKeep { [self say:setKeepAlive(gPlayer == nil)]; }
 - (void)onDiag { [self say:diagReport()]; }
-- (void)onClip {
-    [self runLater:^{
-        NSString *note = nil; BOOL stranded = NO;
-        NSString *front = frontmostBundleID();
-        BOOL ok = writeClipboardInForeground(@"PhoneAgent剪贴板测试123", nil, &note, &stranded);
-        [self say:[NSString stringWithFormat:@"剪贴板测试:%@(切换前最前台 App:%@%@)\n请到任意输入框长按粘贴,看是不是“PhoneAgent剪贴板测试123”",
-                   ok ? @"写入并校验成功" : [@"失败:" stringByAppendingString:note ?: @"?"],
-                   front ?: @"未知", stranded ? @",没能自动切回" : @""]];
-    } name:@"剪贴板测试"];
+
+// ---- 语音 ----
+- (void)onMic {
+    if (!self.voice.listening) self.voiceBase = self.taskTV.text.length ? [self.taskTV.text stringByAppendingString:@" "] : @"";
+    [self.voice toggle];
 }
-- (void)onKeep {
-    [self say:setKeepAlive(gPlayer == nil)];
+- (void)textViewDidChange:(UITextView *)tv { self.phLabel.hidden = tv.text.length > 0; }
+
+// ---- 附件(图片 / 文件) ----
+- (void)refreshAttachLabel {
+    NSUInteger ni = gAttachImages.count;
+    BOOL hasText = gAttachText.length > 0;
+    if (!ni && !hasText) { self.attLabel.hidden = YES; return; }
+    self.attLabel.hidden = NO;
+    self.attLabel.text = [NSString stringWithFormat:@"已附带:%@%@%@(随任务一起发给模型;点“图片/文件”可清除)",
+                          ni ? [NSString stringWithFormat:@"%lu 张图片", (unsigned long)ni] : @"",
+                          (ni && hasText) ? @"、" : @"",
+                          hasText ? [NSString stringWithFormat:@"文件文字 %lu 字", (unsigned long)gAttachText.length] : @""];
+}
+- (void)onAttach {
+    [self.view endEditing:YES];
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"附件" message:@"图片会随任务发给模型(需要所选模型支持看图);文件会把文字内容放进任务里(支持 txt/md/csv/json/pdf 等文本类文件,也可以选图片文件)" preferredStyle:UIAlertControllerStyleActionSheet];
+    [ac addAction:[UIAlertAction actionWithTitle:@"从相册选图片" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
+        cfg.selectionLimit = 5;
+        cfg.filter = [PHPickerFilter imagesFilter];
+        PHPickerViewController *pk = [[PHPickerViewController alloc] initWithConfiguration:cfg];
+        pk.delegate = self;
+        [self presentViewController:pk animated:YES completion:nil];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"选择文件" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        UIDocumentPickerViewController *dp = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeItem] asCopy:YES];
+        dp.delegate = self;
+        dp.allowsMultipleSelection = YES;
+        [self presentViewController:dp animated:YES completion:nil];
+    }]];
+    if (gAttachImages.count || gAttachText.length) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"清除所有附件" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+            [gAttachImages removeAllObjects]; [gAttachNames removeAllObjects]; [gAttachText setString:@""];
+            [self refreshAttachLabel];
+        }]];
+    }
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    ac.popoverPresentationController.sourceView = self.view;
+    ac.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2, self.view.bounds.size.height / 2, 1, 1);
+    [self presentViewController:ac animated:YES completion:nil];
+}
+- (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
+    [picker dismissViewControllerAnimated:YES completion:nil];
+    for (PHPickerResult *r in results) {
+        if (![r.itemProvider canLoadObjectOfClass:UIImage.class]) continue;
+        [r.itemProvider loadObjectOfClass:UIImage.class completionHandler:^(id obj, NSError *err) {
+            if (![obj isKindOfClass:UIImage.class]) return;
+            NSData *jpg = attachJPEG((UIImage *)obj);
+            if (!jpg.length) return;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [gAttachImages addObject:jpg];
+                [gAttachNames addObject:@"相册图片"];
+                [self refreshAttachLabel];
+            });
+        }];
+    }
+}
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    NSArray *imgExt = @[@"jpg", @"jpeg", @"png", @"heic", @"gif", @"bmp", @"tiff"];
+    for (NSURL *url in urls) {
+        NSString *ext = url.pathExtension.lowercaseString, *name = url.lastPathComponent;
+        if ([imgExt containsObject:ext]) {
+            UIImage *im = [UIImage imageWithContentsOfFile:url.path];
+            NSData *jpg = im ? attachJPEG(im) : nil;
+            if (jpg.length) { [gAttachImages addObject:jpg]; [gAttachNames addObject:name]; }
+            else [self say:[NSString stringWithFormat:@"无法读取图片:%@", name]];
+            continue;
+        }
+        NSString *text = nil;
+        if ([ext isEqualToString:@"pdf"]) {
+            PDFDocument *doc = [[PDFDocument alloc] initWithURL:url];
+            text = doc.string;
+            if (!text.length) { [self say:[NSString stringWithFormat:@"PDF 里没有可提取的文字(可能是扫描件,请改成图片附上):%@", name]]; continue; }
+        } else {
+            text = [NSString stringWithContentsOfURL:url encoding:NSUTF8StringEncoding error:nil];
+            if (!text) {
+                NSStringEncoding gb = CFStringConvertEncodingToNSStringEncoding(kCFStringEncodingGB_18030_2000);
+                text = [NSString stringWithContentsOfURL:url encoding:gb error:nil];
+            }
+            if (!text) { [self say:[NSString stringWithFormat:@"暂不支持这种文件(docx、xlsx 等请先转成 txt 或 pdf):%@", name]]; continue; }
+        }
+        if (text.length > 30000) text = [[text substringToIndex:30000] stringByAppendingString:@"\n……(内容过长,已截断)"];
+        [gAttachText appendFormat:@"--- 文件:%@ ---\n%@\n\n", name, text];
+        [gAttachNames addObject:name];
+    }
+    if (gAttachText.length > 80000) [gAttachText setString:[gAttachText substringToIndex:80000]];
+    [self refreshAttachLabel];
 }
 @end
 
@@ -1912,7 +2471,7 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     if ([task containsString:@"%"]) { NSString *d2 = [task stringByRemovingPercentEncoding]; if (d2.length) task = d2; }
     task = [task stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    NSString *key = savedSetting(@"llm_key", @""), *base = savedSetting(@"llm_base", @"https://api.deepseek.com"), *model = savedSetting(@"llm_model", savedSetting(@"llm_model2", @"deepseek-flash"));
+    NSString *key = nil, *base = nil, *model = nil; loadLLMConfig(&key, &base, &model);
     NSString *say = nil;
     if (!task.length) say = @"收到语音任务,但文字是空的(听写可能没识别到内容,或快捷指令里的变量没接对,看上面“收到 URL”那行)";
     else if (!key.length || !base.length || !model.length) say = @"收到语音任务,但还没保存 API 设置:请先在 App 里点一次“开始任务”或“看图测试”";
@@ -1927,6 +2486,7 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
             return;
         }
         if (gAgentRunning) return;
+        gRunImages = nil; gTaskDisplay = task;
         agentRun(task, base, key, model);
     });
     return YES;
@@ -1936,6 +2496,27 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     signal(SIGPIPE, SIG_IGN);
     gLock = [NSObject new];
     gAgentLog = [NSMutableArray array];
+    gRunLog = [NSMutableArray array];
+    gAttachImages = [NSMutableArray array];
+    gAttachNames = [NSMutableArray array];
+    gAttachText = [NSMutableString string];
+    {   // 旧版本只有一套 API 设置:迁移到对应的提供商名下
+        NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+        if (![d boolForKey:@"migrated_v7"]) {
+            NSString *k = [d stringForKey:@"llm_key"], *b = [d stringForKey:@"llm_base"], *m = [d stringForKey:@"llm_model"] ?: [d stringForKey:@"llm_model2"];
+            if (k.length) {
+                NSString *lm = m.lowercaseString, *pid = @"deepseek";
+                if ([lm containsString:@"autoglm"]) pid = @"autoglm";
+                else if ([lm hasPrefix:@"glm"]) pid = @"glm";
+                else if (b.length && ![b.lowercaseString containsString:@"deepseek"]) pid = @"custom";
+                [d setObject:k forKey:[NSString stringWithFormat:@"p_%@_key", pid]];
+                if (b.length) [d setObject:b forKey:[NSString stringWithFormat:@"p_%@_base", pid]];
+                if (m.length) [d setObject:m forKey:[NSString stringWithFormat:@"p_%@_model", pid]];
+                [d setObject:pid forKey:@"provider"];
+            }
+            [d setBool:YES forKey:@"migrated_v7"];
+        }
+    }
     gSwipeMode = (int)[NSUserDefaults.standardUserDefaults integerForKey:@"swipe_mode"];
     gToken = [NSUserDefaults.standardUserDefaults stringForKey:@"token"];
     if (!gToken) {
