@@ -584,6 +584,7 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
 static NSMutableArray *gAgentLog; // 最近的任务日志,给 /status 用
 static NSMutableArray *gRunLog;          // 本次任务的完整日志(结果窗口用)
 static NSString *gTaskStatus, *gTaskResultText, *gLastResultText, *gTaskDisplay;
+static NSArray *gRelayLastOCR; // 最近一次截屏的 OCR,中转站回传结果时带上
 static NSArray *gRunImages;              // 本次任务附带的图片(JPEG 数据)
 static NSMutableArray *gAttachImages, *gAttachNames; // 界面里已选的附件
 static NSMutableString *gAttachText;     // 界面里已选文件的文字内容
@@ -674,7 +675,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.7.0", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.7.1", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -1545,6 +1546,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
         // 本地 OCR 不发给模型,只用来做支付拦截和辅助动作
         UIImage *img = takeScreenshot(&err);
         NSArray *items = img ? ocrImage(img, &err) : nil;
+        @synchronized (gLock) { gRelayLastOCR = [items copy]; }
         if (items.count && paySheetVisible(items)) { agentSay(@"本地 OCR 看到支付/密码界面,已停止,请手动处理"); break; }
         NSString *sig = agFrameSig(jpg);
         if ([sig isEqualToString:lastSig]) same++; else same = 0;
@@ -1771,6 +1773,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             if (ya != yb) return ya < yb ? NSOrderedAscending : NSOrderedDescending;
             return [(NSNumber *)a[@"x"] compare:(NSNumber *)b[@"x"]];
         }];
+        @synchronized (gLock) { gRelayLastOCR = [items copy]; }
         NSString *localText = @"";
         for (NSDictionary *it in items) localText = [localText stringByAppendingFormat:@"%@", it[@"text"] ?: @""];
         BOOL localOK = items.count >= 2 && localText.length >= 6;
@@ -1926,6 +1929,92 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     taskRunBegin(task);
     agentRunCore(task, base, key, model);
     taskRunEnd(task);
+}
+
+#pragma mark - 中转站 (微信 → Muse → 中转站 → 手机)
+
+static BOOL gRelayOn = NO;
+static BOOL gRelayBusy = NO;
+static NSString *const kRelayDefaultBase = @"https://pcagent-relay.dapeng0910.workers.dev";
+
+// 同步调中转站接口,返回 JSON 字典;失败返回 nil 并在 err 里写原因。
+static NSDictionary *relayJSON(NSString *method, NSString *path, NSDictionary *body, NSString **err) {
+    NSString *base = [NSUserDefaults.standardUserDefaults stringForKey:@"relay_base"];
+    if (!base.length) base = kRelayDefaultBase;
+    while ([base hasSuffix:@"/"]) base = [base substringToIndex:base.length - 1];
+    NSURL *url = [NSURL URLWithString:[base stringByAppendingString:path]];
+    if (!url) { if (err) *err = @"中转站地址格式不对"; return nil; }
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:url];
+    r.HTTPMethod = method; r.timeoutInterval = 15;
+    [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    if (body) r.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    __block NSData *data = nil; __block NSError *e = nil; __block NSInteger code = 0;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *er) {
+        data = d; e = er; code = [(NSHTTPURLResponse *)resp statusCode];
+        dispatch_semaphore_signal(sem);
+    }] resume];
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    if (e || !data) { if (err) *err = [NSString stringWithFormat:@"网络错误:%@", e.localizedDescription ?: @"无数据"]; return nil; }
+    if (code != 200) { if (err) *err = [NSString stringWithFormat:@"中转站返回 %ld", (long)code]; return nil; }
+    NSDictionary *j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![j isKindOfClass:NSDictionary.class]) { if (err) *err = @"中转站返回格式不认识"; return nil; }
+    return j;
+}
+
+// 后台循环:每 2 秒问一次中转站有没有新任务;领到就用当前选中的模型跑,跑完把结果发回去。
+// 在后台队列跑,agentRun 本身是同步的,一次只跑一个任务。手动任务在跑时不领新任务。
+static void relayPollLoop(void) {
+    NSString *lastErr = nil;
+    while (gRelayOn) {
+        if (gRelayBusy) { sleep(1); continue; }
+        if (gAgentRunning) { sleep(2); continue; }
+        NSString *token = [NSUserDefaults.standardUserDefaults stringForKey:@"relay_token"] ?: @"";
+        NSString *err = nil;
+        NSDictionary *j = relayJSON(@"GET", [NSString stringWithFormat:@"/pa/poll?token=%@", token], nil, &err);
+        if (!j) {
+            if (![err isEqualToString:lastErr]) { agentSay([@"中转站连接失败:" stringByAppendingString:err]); lastErr = err; }
+            sleep(2); continue;
+        }
+        lastErr = nil;
+        NSDictionary *job = j[@"job"];
+        if (![job isKindOfClass:NSDictionary.class]) { sleep(2); continue; }
+        NSString *jobId = [job[@"id"] description] ?: @"";
+        NSString *goal = [job[@"goal"] description] ?: @"";
+        if (!jobId.length || !goal.length) { sleep(2); continue; }
+        gRelayBusy = YES;
+        agentSay([NSString stringWithFormat:@"中转站领到任务:%@", goal]);
+        NSString *key = nil, *base = nil, *model = nil;
+        loadLLMConfig(&key, &base, &model);
+        if (!key.length || !base.length || !model.length) {
+            agentSay(@"当前选中的模型没填 API Key、接口地址、模型名,任务做不了");
+            NSString *e2 = nil;
+            relayJSON(@"POST", @"/pa/result", @{@"token": token, @"job_id": jobId, @"status": @"failed",
+                                                @"note": @"手机里当前选中的模型没填 API Key、接口地址、模型名", @"ocr": @[]}, &e2);
+            gRelayBusy = NO;
+            continue;
+        }
+        gTaskDisplay = goal;
+        agentRun(goal, base, key, model);
+        NSString *status, *result;
+        @synchronized (gLock) { status = gTaskStatus; result = gTaskResultText; }
+        BOOL ok = [status isEqualToString:@"已完成"];
+        NSString *note = result.length ? result : (status.length ? status : @"任务已结束");
+        NSArray *ocrItems = nil;
+        @synchronized (gLock) { ocrItems = [gRelayLastOCR copy]; }
+        NSMutableArray *ocr = [NSMutableArray array];
+        for (NSDictionary *it in ocrItems ?: @[]) {
+            if (ocr.count >= 40) break;
+            [ocr addObject:@{@"text": it[@"text"] ?: @"", @"x": it[@"x"] ?: @0, @"y": it[@"y"] ?: @0}];
+        }
+        NSString *e3 = nil;
+        NSDictionary *r = relayJSON(@"POST", @"/pa/result",
+            @{@"token": token, @"job_id": jobId, @"status": ok ? @"done" : @"failed",
+              @"note": note ?: @"", @"ocr": ocr}, &e3);
+        if (r) agentSay([NSString stringWithFormat:@"任务结果已发回中转站:%@", ok ? @"完成" : @"失败"]);
+        else agentSay([@"任务结果发回失败:" stringByAppendingString:e3 ?: @"?"]);
+        gRelayBusy = NO;
+    }
 }
 
 #pragma mark - 界面
@@ -2106,7 +2195,7 @@ static NSData *attachJPEG(UIImage *img) {
 
 @interface VC : UIViewController <UITextViewDelegate, PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
 @property (nonatomic, strong) UIButton *provBtn, *micBtn;
-@property (nonatomic, strong) UITextField *keyF, *baseF, *modelF;
+@property (nonatomic, strong) UITextField *keyF, *baseF, *modelF, *relayBaseF, *relayTokenF;
 @property (nonatomic, strong) UITextView *taskTV;
 @property (nonatomic, strong) UILabel *phLabel, *attLabel, *log;
 @property (nonatomic, strong) PAVoice *voice;
@@ -2148,6 +2237,13 @@ static NSData *attachJPEG(UIImage *img) {
     self.keyF = [self tf:@"API Key" secure:YES];
     self.baseF = [self tf:@"接口地址" secure:NO];
     self.modelF = [self tf:@"模型名" secure:NO];
+
+    // 中转站:地址 + 密钥 + 开关(默认关,手动开;地址默认 Cloudflare,可改)
+    self.relayBaseF = [self tf:@"中转站地址" secure:NO];
+    self.relayBaseF.text = [NSUserDefaults.standardUserDefaults stringForKey:@"relay_base"] ?: @"https://pcagent-relay.dapeng0910.workers.dev";
+    self.relayTokenF = [self tf:@"中转站密钥" secure:YES];
+    self.relayTokenF.text = [NSUserDefaults.standardUserDefaults stringForKey:@"relay_token"] ?: @"";
+    UIButton *relayBtn = [self btn:@"中转站 开/关" action:@selector(onRelay)];
 
     // 任务输入:多行文字 + 语音 + 附件
     self.taskTV = [UITextView new];
@@ -2201,7 +2297,8 @@ static NSData *attachJPEG(UIImage *img) {
         self.provBtn, self.keyF, self.baseF, self.modelF,
         self.taskTV, [self row:@[self.micBtn, attBtn]], self.attLabel,
         [self row:@[startBtn, stopBtn]], [self row:@[memBtn, resBtn]],
-        brow, [self row:@[keepBtn, diagBtn]], tokenL, self.log]];
+        brow, [self row:@[keepBtn, diagBtn]],
+        self.relayBaseF, self.relayTokenF, relayBtn, tokenL, self.log]];
     st.axis = UILayoutConstraintAxisVertical;
     st.spacing = 10;
     st.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2259,6 +2356,8 @@ static NSData *attachJPEG(UIImage *img) {
     [d setObject:[self.keyF.text stringByTrimmingCharactersInSet:ws] ?: @"" forKey:[NSString stringWithFormat:@"p_%@_key", pid]];
     [d setObject:[self.baseF.text stringByTrimmingCharactersInSet:ws] ?: @"" forKey:[NSString stringWithFormat:@"p_%@_base", pid]];
     [d setObject:[self.modelF.text stringByTrimmingCharactersInSet:ws] ?: @"" forKey:[NSString stringWithFormat:@"p_%@_model", pid]];
+    [d setObject:[self.relayBaseF.text stringByTrimmingCharactersInSet:ws] ?: @"" forKey:@"relay_base"];
+    [d setObject:[self.relayTokenF.text stringByTrimmingCharactersInSet:ws] ?: @"" forKey:@"relay_token"];
 }
 - (void)loadFields {
     NSString *pid = selectedProviderID();
@@ -2338,6 +2437,24 @@ static NSData *attachJPEG(UIImage *img) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ agentRun(full, base, key, model); });
 }
 - (void)onStop { gAgentRunning = NO; [self say:@"正在停止任务……"]; }
+- (void)onRelay {
+    if (gRelayOn) { gRelayOn = NO; [self say:@"中转站已关闭"]; return; }
+    [self.view endEditing:YES];
+    [self saveFields];
+    NSString *key = nil, *base = nil, *model = nil;
+    loadLLMConfig(&key, &base, &model);
+    if (!key.length || !base.length || !model.length) { [self say:@"先填好当前所选模型的 API Key、接口地址、模型名再开中转站"]; return; }
+    NSCharacterSet *ws = NSCharacterSet.whitespaceAndNewlineCharacterSet;
+    NSString *rbase = [self.relayBaseF.text stringByTrimmingCharactersInSet:ws];
+    NSString *token = [self.relayTokenF.text stringByTrimmingCharactersInSet:ws];
+    if (!token.length) { [self say:@"中转站密钥还没填"]; return; }
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    [d setObject:rbase.length ? rbase : @"https://pcagent-relay.dapeng0910.workers.dev" forKey:@"relay_base"];
+    [d setObject:token forKey:@"relay_token"];
+    gRelayOn = YES;
+    [self say:@"中转站已开启,每 2 秒问一次有没有新任务"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ relayPollLoop(); });
+}
 - (void)onKeep { [self say:setKeepAlive(gPlayer == nil)]; }
 - (void)onDiag { [self say:diagReport()]; }
 
