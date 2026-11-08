@@ -107,6 +107,21 @@ static void doSwipe(double x1, double y1, double x2, double y2, int steps, int m
     sendFinger(x2 / s.width, y2 / s.height, 2);
 }
 
+// 硬件键盘快捷键:按住左 Command(0xE3)+ 一个字母键(键盘页 0x07):A=0x04,V=0x19
+static BOOL doCmdKey(uint32_t usage) {
+    if (!pCreateKeyboard || !gClient) return NO;
+    uint32_t seq[4][2] = {{0xE3, 1}, {usage, 1}, {usage, 0}, {0xE3, 0}};
+    for (int i = 0; i < 4; i++) {
+        IOHIDEventRef e = pCreateKeyboard(kCFAllocatorDefault, mach_absolute_time(), 0x07, seq[i][0], seq[i][1] ? true : false, 0);
+        if (!e) return NO;
+        pSetSender(e, 0x8000000817319372ULL);
+        pDispatch(gClient, e);
+        CFRelease(e);
+        usleep(60 * 1000);
+    }
+    return YES;
+}
+
 // 发一个无害的 Shift 键事件:对系统来说算"用户活动",可以重置自动锁屏计时
 static void doShiftKey(void) {
     if (!pCreateKeyboard || !gClient) return;
@@ -582,6 +597,8 @@ static volatile BOOL gAgentRunning;
 static void agentSay(NSString *m);
 static void agentRun(NSString *task, NSString *base, NSString *key, NSString *model);
 static NSMutableArray *gAgentLog; // 最近的任务日志,给 /status 用
+static volatile BOOL gBroadcastStopRequested; // 任务结束时请扩展关闭录屏
+static RPSystemBroadcastPickerView *gPicker;   // 界面里的录屏选择按钮(自动开启录屏时要用)
 static NSMutableArray *gRunLog;          // 本次任务的完整日志(结果窗口用)
 static NSString *gTaskStatus, *gTaskResultText, *gLastResultText, *gTaskDisplay;
 static NSArray *gRunImages;              // 本次任务附带的图片(JPEG 数据)
@@ -674,7 +691,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.7.2", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.8.0", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -686,6 +703,7 @@ static void handleClient(int c) {
         @synchronized (gLock) {
             if ([path isEqualToString:@"/bye"]) {
                 gHbT = 0;
+                gBroadcastStopRequested = NO;
             } else {
                 gHbT = CFAbsoluteTimeGetCurrent();
                 if (q[@"is"]) gExtIS = [q[@"is"] intValue];
@@ -707,7 +725,7 @@ static void handleClient(int c) {
         BOOL now = broadcastAlive();
         if (!was && now) [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:[NSString stringWithFormat:@"广播扩展已连接(扩展内创建 IOSurface:%@)", gExtIS == 1 ? @"成功" : gExtIS == 0 ? @"失败" : @"未知"]];
         if (was && !now) [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:@"广播已停止"];
-        sendJSON(c, 200, @{@"ok": @YES});
+        sendJSON(c, 200, @{@"ok": @YES, @"cmd": gBroadcastStopRequested ? @"stop" : @""});
         return;
     }
     if (![q[@"token"] isEqualToString:gToken]) {
@@ -970,7 +988,7 @@ static NSString *const kAgentSystem =
 @"- swipe: 参数 x,y,x2,y2,或只给 direction(up/down/left/right,表示手指滑动的方向)。往下看更多内容用 up。本设备上滑动可能不稳定,能用别的办法就别滑。\n"
 @"- home: 回到主屏幕。需要回主屏幕时只用这个动作,不要用 swipe。\n"
 @"- open_app: 参数 name(App 的中文名)。直接打开 App。\n"
-@"- input_text: 参数 id 或 x,y,text,可选 app(当前所在 App 的名字)。程序会先临时切到 PhoneAgent 把 text 写入剪贴板(iOS 不允许后台 App 写剪贴板),再切回原来的 App,点击并长按输入框呼出菜单;下一步必须观察并点击“粘贴”或“允许粘贴”,再确认输入框出现目标文字。这是输入文字的首选动作,text 必须是要输入的完整文字。\n"
+@"- input_text: 参数 id 或 x,y,text,可选 app(当前所在 App 的名字)。程序会先临时切到 PhoneAgent 把 text 写入剪贴板(iOS 不允许后台 App 写剪贴板),再切回原来的 App,点击输入框并用键盘快捷键粘贴(会替换输入框里原有的文字;不行时自动改用长按菜单,并自动点掉“允许粘贴”);完成后请看截图确认输入框里出现了目标文字。这是输入文字的首选动作,text 必须是要输入的完整文字。\n"
 @"- set_clipboard: 参数 text,可选 app。只把文字放进剪贴板(同样会临时切到 PhoneAgent 再切回),不点击。一般直接用 input_text。\n"
 @"- wait: 等待 1.5 秒。\n"
 @"- done: 参数 text。任务已完成;text 是写给用户看的完整结果(如果任务是查询、总结、比较信息,把得到的信息完整清楚地写在这里)。\n"
@@ -983,7 +1001,7 @@ static NSString *const kAgentSystem =
 @"5. 看不到想要的内容时,先上滑或换搜索词,不要重复无效动作。\n"
 @"6. visible_text 必须如实抄录截图中的关键文字,如果看到支付密码、付款、结算、提交订单等内容,action 必须为 stop。\n"
 @"7. 找不到 App 时,先按 open_app 返回的已安装 App 列表换准确名称重试;仍找不到时程序会自动回主屏幕并左滑进入 App 资源库,这时点顶部搜索框,用 input_text 输入 App 名称搜索,再点搜索结果打开。\n"
-@"8. input_text 后如果看到“粘贴”或“允许粘贴”，必须点击对应菜单；如果输入框仍为空，重新使用 input_text，不要只重复 tap。";
+@"8. input_text 由程序自己完成粘贴;如果下一张截图里输入框仍是空的,再次使用 input_text,并确认 id 或 x,y 指向的是输入框。";
 
 static NSString *memoryText(void) { return [NSUserDefaults.standardUserDefaults stringForKey:@"memory_text"] ?: @""; }
 
@@ -1489,20 +1507,39 @@ static NSDictionary *agFindOnScreen(NSArray *words, NSArray *excludes, NSString 
     return nil;
 }
 
-// 在 (x,y) 的输入框里输入文字:写剪贴板(必须在前台) -> 回到原 App -> 长按 -> (有“全选”就先全选以覆盖旧内容) -> 点“粘贴” -> 点“允许粘贴”
-static BOOL agPasteText(NSString *text, double x, double y, NSString **note) {
+// 在 (x,y) 的输入框里输入文字:写剪贴板(必须在前台) -> 回到原 App -> 点输入框聚焦
+// 方法一:硬件键盘快捷键 Cmd+A(替换旧内容)+ Cmd+V,并自动点掉 iOS 的“允许粘贴”确认框;用 OCR 检查文字有没有出现
+// 方法二(方法一没见效时):长按输入框 -> (有“全选”就先全选) -> 点“粘贴” -> 点“允许粘贴”
+static BOOL agPasteText(NSString *text, double x, double y, NSString *backHint, NSString **note) {
     NSString *n = nil; BOOL stranded = NO;
-    if (!writeClipboardInForeground(text, nil, &n, &stranded)) { *note = n ?: @"剪贴板写入失败"; return NO; }
+    if (!writeClipboardInForeground(text, backHint, &n, &stranded)) { *note = n ?: @"剪贴板写入失败"; return NO; }
     if (stranded) { *note = @"剪贴板已写入,但没能自动回到原来的 App"; return NO; }
     usleep(800 * 1000);
     doTap(x, y);
-    usleep(700 * 1000);
-    doLongPress(x, y, 1100);
+    usleep(900 * 1000);
     NSString *e = nil;
+
+    BOOL sent = doCmdKey(0x04);          // Cmd+A
+    usleep(250 * 1000);
+    sent = doCmdKey(0x19) && sent;       // Cmd+V
+    usleep(900 * 1000);
+    NSDictionary *allow1 = agFindOnScreen(@[@"允许粘贴"], @[@"不允许"], &e);
+    if (allow1) { doTap([allow1[@"x"] doubleValue], [allow1[@"y"] doubleValue]); usleep(900 * 1000); }
+    if (sent) {
+        NSString *flat = [[text componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] componentsJoinedByString:@""];
+        NSString *snip = flat.length > 6 ? [flat substringToIndex:6] : flat;
+        if (!snip.length) return YES;
+        waitForStableFrame(2.0);
+        UIImage *img = takeScreenshot(&e);
+        NSArray *items = img ? ocrImage(img, &e) : nil;
+        for (NSDictionary *it in items) if ([it[@"text"] containsString:snip]) return YES;
+    }
+
+    doLongPress(x, y, 1100);
     NSDictionary *all = agFindOnScreen(@[@"全选"], @[], &e);
     if (all) { doTap([all[@"x"] doubleValue], [all[@"y"] doubleValue]); usleep(800 * 1000); }
     NSDictionary *paste = agFindOnScreen(@[@"粘贴"], @[@"允许", @"不允许", @"并"], &e);
-    if (!paste) { *note = @"没有找到“粘贴”菜单(输入框可能没聚焦)"; return NO; }
+    if (!paste) { *note = @"键盘快捷键没见效,也没有找到“粘贴”菜单(输入框可能没聚焦)"; return NO; }
     doTap([paste[@"x"] doubleValue], [paste[@"y"] doubleValue]);
     usleep(900 * 1000);
     NSDictionary *allow = agFindOnScreen(@[@"允许粘贴"], @[@"不允许"], &e);
@@ -1616,7 +1653,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
             NSString *t = agArg(action, @"text") ?: @"";
             if (lastX < 0) { pendingNote = @"(系统提示:输入文字前需要先点击输入框。)"; continue; }
             NSString *note = nil;
-            if (!agPasteText(t, lastX, lastY, &note)) {
+            if (!agPasteText(t, lastX, lastY, nil, &note)) {
                 agentSay([@"提示:输入失败:" stringByAppendingString:note ?: @"?"]);
                 pendingNote = [NSString stringWithFormat:@"(系统提示:Type 失败:%@。请重新点击输入框后再试。)", note ?: @""];
             }
@@ -1722,13 +1759,67 @@ static void memoryLearn(NSString *task, NSString *result) {
     [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:[NSString stringWithFormat:@"已记住新偏好:\n%@", joined]];
 }
 
+// 自动开启屏幕录制:先把 PhoneAgent 切到前台,触发系统的“屏幕直播”面板,再用 HID 点面板里的“开始直播”。
+// 难点:此时还没有录屏就没有截图,看不到按钮在哪,所以只能"盲点"——按屏幕高度的若干个比例位置依次试,
+// 哪个位置能让广播真的连上,就把这个比例记下来,以后直接用。
+static void triggerPicker(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        for (UIView *v in gPicker.subviews)
+            if ([v isKindOfClass:UIButton.class]) { [(UIButton *)v sendActionsForControlEvents:UIControlEventTouchUpInside]; break; }
+    });
+}
+
+static BOOL ensureBroadcast(NSString **note) {
+    if (broadcastAlive()) return YES;
+    if (!gPicker) { *note = @"找不到录屏按钮"; return NO; }
+    if (appStateNow() != UIApplicationStateActive) {
+        openApp(NSBundle.mainBundle.bundleIdentifier);
+        if (!waitAppActive(6)) { *note = @"PhoneAgent 没能回到前台"; return NO; }
+        usleep(700 * 1000);
+    }
+    CGSize sc = screenSize();
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    double saved = [d doubleForKey:@"bcast_btn_y"];
+    NSMutableArray *cands = [NSMutableArray array];
+    if (saved > 0) [cands addObject:@(saved)];
+    for (NSNumber *r in @[@0.86, @0.82, @0.78, @0.74, @0.70, @0.66, @0.90, @0.62])
+        if (fabs(r.doubleValue - saved) > 0.005) [cands addObject:r];
+    for (NSNumber *r in cands) {
+        triggerPicker();
+        usleep(1600 * 1000); // 等系统的“屏幕直播”面板弹出
+        doTap(sc.width / 2, sc.height * r.doubleValue);
+        for (int i = 0; i < 40 && !broadcastAlive(); i++) usleep(200 * 1000); // 3 秒倒计时 + 扩展连接
+        if (broadcastAlive()) {
+            [d setDouble:r.doubleValue forKey:@"bcast_btn_y"];
+            usleep(1000 * 1000);
+            return YES;
+        }
+        doTap(sc.width / 2, sc.height * 0.12); // 没点中:点面板外面把它收起来,再试下一个位置
+        usleep(900 * 1000);
+    }
+    *note = @"盲点“开始直播”的几个位置都没有成功";
+    return NO;
+}
+
+// 任务结束后关闭录屏:让广播扩展自己结束(扩展调用 finishBroadcastWithError),最多等 10 秒
+static void requestBroadcastStop(void) {
+    if (!broadcastAlive()) return;
+    gBroadcastStopRequested = YES;
+    for (int i = 0; i < 50 && broadcastAlive(); i++) usleep(200 * 1000);
+    BOOL still = broadcastAlive();
+    gBroadcastStopRequested = NO;
+    agentSay(still ? @"提示:屏幕录制没能自动关闭,请手动关闭" : @"屏幕录制已自动关闭");
+}
+
 static void taskRunBegin(NSString *task) {
     @synchronized (gLock) { [gRunLog removeAllObjects]; gTaskStatus = @""; gTaskResultText = @""; }
+    gAgentRunning = YES; // 从这里开始就算"任务进行中"(包括自动开启录屏的阶段)
     taskAwakeStart();
 }
 
 // 任务结束:停止防锁屏 -> 回到 PhoneAgent -> 弹出结果窗口 -> 后台提炼记忆
-static void taskRunEnd(NSString *task) {
+static void taskRunEnd(NSString *task, BOOL stopCast) {
+    gAgentRunning = NO;
     taskAwakeStop();
     NSString *status, *result; NSArray *lines;
     @synchronized (gLock) { status = gTaskStatus; result = gTaskResultText; lines = [gRunLog copy]; }
@@ -1746,6 +1837,7 @@ static void taskRunEnd(NSString *task) {
     [NSNotificationCenter.defaultCenter postNotificationName:@"pa.showResult" object:text];
     NSString *shownCopy = [shown copy], *resultCopy = [result copy];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ memoryLearn(shownCopy, resultCopy); });
+    if (stopCast) requestBroadcastStop();
 }
 
 static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString *model) {
@@ -1881,27 +1973,32 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             NSString *hintBid = nil;
             NSString *appHint = [act[@"app"] description];
             if (appHint.length) { NSString *i2 = nil; hintBid = bundleForAppName(appHint, &i2); }
-            NSString *note = nil; BOOL stranded = NO;
-            BOOL ok = writeClipboardInForeground(text, hintBid, &note, &stranded);
-            if (!ok) {
-                [history addObject:[NSString stringWithFormat:@"%d. %@ 失败:%@", step, action, note]];
-                agentSay([@"提示:" stringByAppendingString:note ?: @"剪贴板写入失败"]);
-                sleep(1);
-                continue;
-            }
-            if (stranded) {
-                [history addObject:[NSString stringWithFormat:@"%d. %@ 已写入剪贴板,但没能回到原来的 App", step, action]];
-                agentSay(@"提示:剪贴板已写入,但没能自动回到原来的 App,请用 open_app 回到目标 App");
-                continue;
-            }
+            NSString *note = nil;
             if (typing) {
-                doTap(x, y);
-                usleep(800 * 1000);
-                doLongPress(x, y, 1100);
-                result = @"剪贴板已确认,已回到目标 App、聚焦输入框并呼出粘贴菜单;下一步请点击粘贴或允许粘贴";
+                BOOL ok = agPasteText(text, x, y, hintBid, &note);
+                if (!ok) {
+                    [history addObject:[NSString stringWithFormat:@"%d. input_text 失败:%@", step, note]];
+                    agentSay([@"提示:输入失败:" stringByAppendingString:note ?: @"?"]);
+                    sleep(1);
+                    continue;
+                }
+                result = @"已把文字粘贴进输入框(键盘快捷键或粘贴菜单),请看下一张截图确认";
                 [history addObject:[NSString stringWithFormat:@"%d. input_text(%@,%@)", step, usedID ? [NSString stringWithFormat:@"id=%ld", (long)oid] : [NSString stringWithFormat:@"%.0f,%.0f", xpx, ypx], text]];
-                sleep(2);
+                sleep(1);
             } else {
+                BOOL stranded = NO;
+                BOOL ok = writeClipboardInForeground(text, hintBid, &note, &stranded);
+                if (!ok) {
+                    [history addObject:[NSString stringWithFormat:@"%d. set_clipboard 失败:%@", step, note]];
+                    agentSay([@"提示:" stringByAppendingString:note ?: @"剪贴板写入失败"]);
+                    sleep(1);
+                    continue;
+                }
+                if (stranded) {
+                    [history addObject:[NSString stringWithFormat:@"%d. set_clipboard 已写入剪贴板,但没能回到原来的 App", step]];
+                    agentSay(@"提示:剪贴板已写入,但没能自动回到原来的 App,请用 open_app 回到目标 App");
+                    continue;
+                }
                 [history addObject:[NSString stringWithFormat:@"%d. set_clipboard(%@) 已确认", step, text]];
             }
         } else if ([action isEqualToString:@"home"]) {
@@ -1926,8 +2023,17 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
 // 对外的入口:开始/收尾都在这里处理,中间走原来的逻辑
 static void agentRun(NSString *task, NSString *base, NSString *key, NSString *model) {
     taskRunBegin(task);
-    agentRunCore(task, base, key, model);
-    taskRunEnd(task);
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    BOOL autoCast = [ud objectForKey:@"auto_cast"] ? [ud boolForKey:@"auto_cast"] : YES;
+    BOOL proceed = YES;
+    if (autoCast && !broadcastAlive()) {
+        agentSay(@"屏幕录制没开,正在自动开启……");
+        NSString *n = nil;
+        if (ensureBroadcast(&n)) agentSay(@"屏幕录制已自动开启");
+        else { agentSay([NSString stringWithFormat:@"任务停止:自动开启屏幕录制失败(%@),请手动开启屏幕广播后再开始", n ?: @""]); proceed = NO; }
+    }
+    if (proceed && gAgentRunning) agentRunCore(task, base, key, model);
+    taskRunEnd(task, autoCast);
 }
 
 #pragma mark - 界面
@@ -2189,6 +2295,16 @@ static NSData *attachJPEG(UIImage *img) {
     pv.showsMicrophoneButton = NO;
     [pv.widthAnchor constraintEqualToConstant:56].active = YES;
     [pv.heightAnchor constraintEqualToConstant:56].active = YES;
+    gPicker = pv;
+    UILabel *acl = [UILabel new];
+    acl.text = @"任务时自动开启/关闭屏幕录制"; acl.font = [UIFont systemFontOfSize:15]; acl.numberOfLines = 0;
+    UISwitch *acs = [UISwitch new];
+    NSUserDefaults *ud0 = NSUserDefaults.standardUserDefaults;
+    acs.on = [ud0 objectForKey:@"auto_cast"] ? [ud0 boolForKey:@"auto_cast"] : YES;
+    [acs addTarget:self action:@selector(onAutoCast:) forControlEvents:UIControlEventValueChanged];
+    UIStackView *acrow = [[UIStackView alloc] initWithArrangedSubviews:@[acl, acs]];
+    acrow.axis = UILayoutConstraintAxisHorizontal; acrow.alignment = UIStackViewAlignmentCenter;
+    acrow.distribution = UIStackViewDistributionEqualSpacing;
     UIStackView *brow = [[UIStackView alloc] initWithArrangedSubviews:@[bl, pv]];
     brow.axis = UILayoutConstraintAxisHorizontal; brow.spacing = 10; brow.alignment = UIStackViewAlignmentCenter;
 
@@ -2203,7 +2319,7 @@ static NSData *attachJPEG(UIImage *img) {
         self.provBtn, self.keyF, self.baseF, self.modelF,
         self.taskTV, [self row:@[self.micBtn, attBtn]], self.attLabel,
         [self row:@[startBtn, stopBtn]], [self row:@[memBtn, resBtn]],
-        brow, [self row:@[keepBtn, diagBtn]], tokenL, self.log]];
+        acrow, brow, [self row:@[keepBtn, diagBtn]], tokenL, self.log]];
     st.axis = UILayoutConstraintAxisVertical;
     st.spacing = 10;
     st.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2339,6 +2455,7 @@ static NSData *attachJPEG(UIImage *img) {
     if (!broadcastAlive()) [self say:@"提醒:屏幕广播还没开,没有广播会截屏失败"];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ agentRun(full, base, key, model); });
 }
+- (void)onAutoCast:(UISwitch *)sw { [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"auto_cast"]; }
 - (void)onStop { gAgentRunning = NO; [self say:@"正在停止任务……"]; }
 - (void)onKeep { [self say:setKeepAlive(gPlayer == nil)]; }
 - (void)onDiag { [self say:diagReport()]; }

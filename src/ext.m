@@ -13,29 +13,31 @@
 #import <CoreVideo/CoreVideo.h>
 #import "shared.h"
 
-static void postToHost(NSString *path, NSData *body) {
+static NSString *postToHost(NSString *path, NSData *body) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s < 0) return;
+    if (s < 0) return @"";
     struct timeval tv = {2, 0};
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     struct sockaddr_in a; memset(&a, 0, sizeof a);
     a.sin_family = AF_INET; a.sin_port = htons(PORT); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (connect(s, (struct sockaddr *)&a, sizeof a) != 0) { close(s); return; }
+    if (connect(s, (struct sockaddr *)&a, sizeof a) != 0) { close(s); return @""; }
     NSString *h = [NSString stringWithFormat:
         @"POST %@ HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n",
         path, (unsigned long)body.length];
     NSData *hd = [h dataUsingEncoding:NSUTF8StringEncoding];
-    if (write(s, hd.bytes, hd.length) < 0) { close(s); return; }
+    if (write(s, hd.bytes, hd.length) < 0) { close(s); return @""; }
     const uint8_t *p = body.bytes; size_t left = body.length;
     while (left > 0) {
         ssize_t n = write(s, p, left);
         if (n <= 0) break;
         p += n; left -= n;
     }
-    char buf[128];
-    (void)read(s, buf, sizeof buf);
+    NSMutableData *resp = [NSMutableData data];
+    char buf[512]; ssize_t rn;
+    while ((rn = read(s, buf, sizeof buf)) > 0) { [resp appendBytes:buf length:rn]; if (resp.length > 4096) break; }
     close(s);
+    return [[NSString alloc] initWithData:resp encoding:NSUTF8StringEncoding] ?: @"";
 }
 
 // 在扩展进程里试一下能不能创建 IOSurface(用来判断这个限制是不是整个 App 都有)
@@ -74,7 +76,14 @@ static int iosurfaceWorks(void) {
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _q);
     dispatch_source_set_timer(_timer, DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC, NSEC_PER_SEC / 2);
     dispatch_source_set_event_handler(_timer, ^{
-        postToHost([NSString stringWithFormat:@"/hb?key=%s&is=%d", FRAME_KEY, self->_isf], [NSData data]);
+        NSString *resp = postToHost([NSString stringWithFormat:@"/hb?key=%s&is=%d", FRAME_KEY, self->_isf], [NSData data]);
+        if ([resp containsString:@"\"cmd\":\"stop\""]) { // 主 App 要求结束录屏(任务已完成)
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSString *msg = @"任务已结束,屏幕录制已自动关闭";
+                [self finishBroadcastWithError:[NSError errorWithDomain:@"PhoneAgent" code:1
+                                                               userInfo:@{NSLocalizedDescriptionKey: msg, NSLocalizedFailureReasonErrorKey: msg}]];
+            });
+        }
     });
     dispatch_resume(_timer);
     // 屏幕静止时系统不会再推新帧,所以"最后一帧"不能因为限速被丢掉:
