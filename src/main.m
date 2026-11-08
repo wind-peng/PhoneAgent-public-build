@@ -707,7 +707,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.8.3", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.8.4", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -1841,9 +1841,26 @@ static void requestBroadcastStop(void) {
     agentSay(still ? @"提示:屏幕录制没能自动关闭,请手动关闭" : @"屏幕录制已自动关闭");
 }
 
+// 任务结果自动朗读:用系统语音读出结果文字,开关存在 speak_result(默认开)
+static AVSpeechSynthesizer *gSpeaker;
+static void speakResultText(NSString *text) {
+    if (!text.length) return;
+    if (!gSpeaker) gSpeaker = [AVSpeechSynthesizer new];
+    [gSpeaker stopSpeakingAtBoundary:AVSpeechBoundaryImmediate];
+    AVSpeechUtterance *u = [AVSpeechUtterance speechUtteranceWithString:text];
+    AVSpeechSynthesisVoice *v = [AVSpeechSynthesisVoice voiceWithLanguage:@"zh-CN"];
+    if (v) u.voice = v;
+    u.rate = AVSpeechUtteranceDefaultSpeechRate;
+    [gSpeaker speakUtterance:u];
+}
+static void stopSpeak(void) {
+    if (gSpeaker) [gSpeaker stopSpeakingAtBoundary:AVSpeechBoundaryImmediate];
+}
+
 static void taskRunBegin(NSString *task) {
     @synchronized (gLock) { [gRunLog removeAllObjects]; gTaskStatus = @""; gTaskResultText = @""; }
     gAgentRunning = YES; // 从这里开始就算"任务进行中"(包括自动开启录屏的阶段)
+    stopSpeak(); // 新任务开始,停掉上一个结果的朗读
     taskAwakeStart();
 }
 
@@ -1887,6 +1904,9 @@ static void taskRunEnd(NSString *task, BOOL stopCast) {
         if (broadcastAlive()) agentSay(@"提示:屏幕录制还没关掉,结果先显示了,请手动关闭录屏");
     }
     [NSNotificationCenter.defaultCenter postNotificationName:@"pa.showResult" object:text];
+    NSUserDefaults *ud2 = NSUserDefaults.standardUserDefaults;
+    BOOL speak = [ud2 objectForKey:@"speak_result"] ? [ud2 boolForKey:@"speak_result"] : YES;
+    if (speak) speakResultText(result);
     NSString *shownCopy = [shown copy], *resultCopy = [result copy];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ memoryLearn(shownCopy, resultCopy); });
 }
@@ -2366,6 +2386,14 @@ static NSData *attachJPEG(UIImage *img) {
     UIStackView *acrow = [[UIStackView alloc] initWithArrangedSubviews:@[acl, acs]];
     acrow.axis = UILayoutConstraintAxisHorizontal; acrow.alignment = UIStackViewAlignmentCenter;
     acrow.distribution = UIStackViewDistributionEqualSpacing;
+    UILabel *spl = [UILabel new];
+    spl.text = @"任务结束自动朗读结果"; spl.font = [UIFont systemFontOfSize:15]; spl.numberOfLines = 0;
+    UISwitch *sps = [UISwitch new];
+    sps.on = [ud0 objectForKey:@"speak_result"] ? [ud0 boolForKey:@"speak_result"] : YES;
+    [sps addTarget:self action:@selector(onSpeakResult:) forControlEvents:UIControlEventValueChanged];
+    UIStackView *sprow = [[UIStackView alloc] initWithArrangedSubviews:@[spl, sps]];
+    sprow.axis = UILayoutConstraintAxisHorizontal; sprow.alignment = UIStackViewAlignmentCenter;
+    sprow.distribution = UIStackViewDistributionEqualSpacing;
     UIStackView *brow = [[UIStackView alloc] initWithArrangedSubviews:@[bl, pv]];
     brow.axis = UILayoutConstraintAxisHorizontal; brow.spacing = 10; brow.alignment = UIStackViewAlignmentCenter;
 
@@ -2380,7 +2408,7 @@ static NSData *attachJPEG(UIImage *img) {
         provRow, self.keyF, self.baseF, self.modelF,
         self.taskTV, [self row:@[self.micBtn, attBtn]], self.attLabel,
         [self row:@[startBtn, stopBtn]], [self row:@[memBtn, resBtn]],
-        acrow, brow, [self row:@[keepBtn, diagBtn]], tokenL, self.log]];
+        acrow, sprow, brow, [self row:@[keepBtn, diagBtn]], tokenL, self.log]];
     st.axis = UILayoutConstraintAxisVertical;
     st.spacing = 10;
     st.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2591,6 +2619,7 @@ static NSData *attachJPEG(UIImage *img) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ agentRun(full, base, key, model); });
 }
 - (void)onAutoCast:(UISwitch *)sw { [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"auto_cast"]; }
+- (void)onSpeakResult:(UISwitch *)sw { [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"speak_result"]; if (!sw.on) stopSpeak(); }
 - (void)onStop { gAgentRunning = NO; [self say:@"正在停止任务……"]; }
 - (void)onKeep { [self say:setKeepAlive(gPlayer == nil)]; }
 - (void)onDiag { [self say:diagReport()]; }
