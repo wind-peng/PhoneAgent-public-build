@@ -707,7 +707,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.8.2", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.8.3", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -1878,6 +1878,13 @@ static void taskRunEnd(NSString *task, BOOL stopCast) {
         doTap(sc.width * okx, sc.height * oky);
         usleep(1000 * 1000);
         [NSNotificationCenter.defaultCenter postNotificationName:@"pa.closing" object:@NO];
+    }
+    if (stopCast && broadcastAlive()) {
+        // 出结果前最后确认一次录屏已经关了:再请扩展关一次,最多再等 8 秒,确认关了再出结果
+        gBroadcastStopRequested = YES;
+        for (int i = 0; i < 40 && broadcastAlive(); i++) usleep(200 * 1000);
+        gBroadcastStopRequested = NO;
+        if (broadcastAlive()) agentSay(@"提示:屏幕录制还没关掉,结果先显示了,请手动关闭录屏");
     }
     [NSNotificationCenter.defaultCenter postNotificationName:@"pa.showResult" object:text];
     NSString *shownCopy = [shown copy], *resultCopy = [result copy];
