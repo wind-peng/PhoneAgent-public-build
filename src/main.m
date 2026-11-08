@@ -707,7 +707,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.8.1", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.8.2", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -1820,6 +1820,8 @@ static BOOL ensureBroadcast(NSString **note) {
         if (broadcastAlive()) {
             [d setDouble:r.doubleValue forKey:@"bcast_btn_y"];
             usleep(1000 * 1000);
+            doTap(sc.width / 2, sc.height * 0.12); // 点开始直播后点一下空白处,把面板收起来回到主屏幕
+            usleep(700 * 1000);
             return YES;
         }
         doTap(sc.width / 2, sc.height * 0.12); // 没点中:点面板外面把它收起来,再试下一个位置
@@ -2725,14 +2727,9 @@ static NSData *attachJPEG(UIImage *img) {
     agentSay([NSString stringWithFormat:@"收到语音任务:%@", task]);
     [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:[NSString stringWithFormat:@"收到语音任务:%@", task]];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        for (int i = 0; i < 30 && !broadcastAlive(); i++) usleep(200 * 1000); // 冷启动后扩展要重新连上
-        if (!broadcastAlive()) {
-            [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:@"屏幕广播没开,任务未执行:请先开启屏幕广播"];
-            return;
-        }
         if (gAgentRunning) return;
         gRunImages = nil; gTaskDisplay = task;
-        agentRun(task, base, key, model);
+        agentRun(task, base, key, model); // agentRun 里有自动开录屏,不在这里提前拦
     });
     return YES;
 }
