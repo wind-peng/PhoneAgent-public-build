@@ -707,7 +707,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.8.4", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.8.5", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -778,7 +778,7 @@ static void handleClient(int c) {
             return;
         }
         if (gAgentRunning) { sendJSON(c, 409, @{@"ok": @NO, @"error": @"已有任务在运行"}); return; }
-        if (!broadcastAlive()) { sendJSON(c, 409, @{@"ok": @NO, @"error": @"屏幕广播没开,请先在 PhoneAgent 里开启"}); return; }
+        // 不在入口提前拦截录屏；agentRun 会根据 auto_cast 设置自动开启。
         agentSay([NSString stringWithFormat:@"收到语音任务:%@", task]);
         [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:[NSString stringWithFormat:@"收到语音任务:%@", task]];
         gRunImages = nil; gTaskDisplay = task;
@@ -1787,6 +1787,8 @@ static void memoryLearn(NSString *task, NSString *result) {
     [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:[NSString stringWithFormat:@"已记住新偏好:\n%@", joined]];
 }
 
+static BOOL goHome(NSString **note);
+
 // 自动开启屏幕录制:先把 PhoneAgent 切到前台,触发系统的“屏幕直播”面板,再用 HID 点面板里的“开始直播”。
 // 难点:此时还没有录屏就没有截图,看不到按钮在哪,所以只能"盲点"——按屏幕高度的若干个比例位置依次试,
 // 哪个位置能让广播真的连上,就把这个比例记下来,以后直接用。
@@ -1819,9 +1821,11 @@ static BOOL ensureBroadcast(NSString **note) {
         for (int i = 0; i < 40 && !broadcastAlive(); i++) usleep(200 * 1000); // 3 秒倒计时 + 扩展连接
         if (broadcastAlive()) {
             [d setDouble:r.doubleValue forKey:@"bcast_btn_y"];
+            // 开始直播后用 Home 事件回到主屏幕，避免只点空白处仍停留在 PhoneAgent。
             usleep(1000 * 1000);
-            doTap(sc.width / 2, sc.height * 0.12); // 点开始直播后点一下空白处,把面板收起来回到主屏幕
-            usleep(700 * 1000);
+            NSString *homeNote = nil;
+            goHome(&homeNote);
+            usleep(500 * 1000);
             return YES;
         }
         doTap(sc.width / 2, sc.height * 0.12); // 没点中:点面板外面把它收起来,再试下一个位置
