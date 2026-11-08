@@ -612,14 +612,30 @@ static NSString *savedSetting(NSString *k, NSString *def) {
 }
 
 // ---- 模型提供商:每个提供商各自保存 API Key / 接口地址 / 模型名 ----
-static NSArray *providerList(void) {
+static NSArray *defaultProviders(void) {
     return @[
         @{@"id": @"deepseek", @"name": @"DeepSeek", @"base": @"https://api.deepseek.com", @"model": @"deepseek-flash"},
         @{@"id": @"glm", @"name": @"智谱 GLM-5.3", @"base": @"https://open.bigmodel.cn/api/paas/v4", @"model": @"glm-5.3-flash"},
         @{@"id": @"autoglm", @"name": @"智谱 AutoGLM-Phone", @"base": @"https://open.bigmodel.cn/api/paas/v4", @"model": @"autoglm-phone"},
         @{@"id": @"custom", @"name": @"自定义(OpenAI 兼容接口)", @"base": @"", @"model": @""}];
 }
-static NSString *selectedProviderID(void) { return savedSetting(@"provider", @"deepseek"); }
+// 模型列表保存在本机;没改过就用上面的默认列表。界面里可以添加、删除。
+static NSArray *providerList(void) {
+    NSData *d = [NSUserDefaults.standardUserDefaults dataForKey:@"providers_json"];
+    id o = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+    if ([o isKindOfClass:NSArray.class] && [o count]) return o;
+    return defaultProviders();
+}
+static void saveProviders(NSArray *list) {
+    NSData *d = [NSJSONSerialization dataWithJSONObject:list options:0 error:nil];
+    if (d) [NSUserDefaults.standardUserDefaults setObject:d forKey:@"providers_json"];
+}
+static NSString *selectedProviderID(void) {
+    NSString *cur = savedSetting(@"provider", @"deepseek");
+    NSArray *list = providerList();
+    for (NSDictionary *p in list) if ([p[@"id"] isEqualToString:cur]) return cur;
+    return [list.firstObject[@"id"] description] ?: @"deepseek";
+}
 static NSString *providerDefault(NSString *pid, NSString *field) {
     for (NSDictionary *p in providerList()) if ([p[@"id"] isEqualToString:pid]) return p[field] ?: @"";
     return @"";
@@ -691,7 +707,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.8.0", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.8.1", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -1508,10 +1524,13 @@ static NSDictionary *agFindOnScreen(NSArray *words, NSArray *excludes, NSString 
 }
 
 // 在 (x,y) 的输入框里输入文字:写剪贴板(必须在前台) -> 回到原 App -> 点输入框聚焦
-// 方法一:硬件键盘快捷键 Cmd+A(替换旧内容)+ Cmd+V,并自动点掉 iOS 的“允许粘贴”确认框;用 OCR 检查文字有没有出现
-// 方法二(方法一没见效时):长按输入框 -> (有“全选”就先全选) -> 点“粘贴” -> 点“允许粘贴”
+// 方法一:硬件键盘快捷键 Cmd+A(替换旧内容)+ Cmd+V,并自动点掉 iOS 的“允许粘贴”确认框。
+//   判断有没有生效:出现过“允许粘贴”框 / Cmd+V 前后画面变了 / OCR 在屏幕上看到了粘贴的文字,任一成立就算成功。
+// 方法二(方法一看不出效果时):长按输入框 -> (有“全选”就先全选) -> 点“粘贴” -> 点“允许粘贴”。
+// 两种都无法确认时也返回 YES,但 note 里写明“没能确认”,让模型看下一张截图自己判断(输入其实经常是成功的)。
 static BOOL agPasteText(NSString *text, double x, double y, NSString *backHint, NSString **note) {
     NSString *n = nil; BOOL stranded = NO;
+    *note = nil;
     if (!writeClipboardInForeground(text, backHint, &n, &stranded)) { *note = n ?: @"剪贴板写入失败"; return NO; }
     if (stranded) { *note = @"剪贴板已写入,但没能自动回到原来的 App"; return NO; }
     usleep(800 * 1000);
@@ -1519,17 +1538,24 @@ static BOOL agPasteText(NSString *text, double x, double y, NSString *backHint, 
     usleep(900 * 1000);
     NSString *e = nil;
 
-    BOOL sent = doCmdKey(0x04);          // Cmd+A
-    usleep(250 * 1000);
-    sent = doCmdKey(0x19) && sent;       // Cmd+V
+    BOOL sent = doCmdKey(0x04);                 // Cmd+A:选中旧内容(没有旧内容就什么也不发生)
+    usleep(500 * 1000);
+    waitForStableFrame(2.0);
+    NSData *f1 = agLatestJPEG(&e);
+    NSString *sig1 = f1 ? agFrameSig(f1) : @"";
+    sent = doCmdKey(0x19) && sent;              // Cmd+V
     usleep(900 * 1000);
     NSDictionary *allow1 = agFindOnScreen(@[@"允许粘贴"], @[@"不允许"], &e);
     if (allow1) { doTap([allow1[@"x"] doubleValue], [allow1[@"y"] doubleValue]); usleep(900 * 1000); }
+    waitForStableFrame(2.0);
+    NSData *f2 = agLatestJPEG(&e);
+    NSString *sig2 = f2 ? agFrameSig(f2) : @"";
     if (sent) {
+        if (allow1) return YES;
+        if (sig1.length && sig2.length && ![sig1 isEqualToString:sig2]) return YES;
         NSString *flat = [[text componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] componentsJoinedByString:@""];
         NSString *snip = flat.length > 6 ? [flat substringToIndex:6] : flat;
         if (!snip.length) return YES;
-        waitForStableFrame(2.0);
         UIImage *img = takeScreenshot(&e);
         NSArray *items = img ? ocrImage(img, &e) : nil;
         for (NSDictionary *it in items) if ([it[@"text"] containsString:snip]) return YES;
@@ -1539,7 +1565,7 @@ static BOOL agPasteText(NSString *text, double x, double y, NSString *backHint, 
     NSDictionary *all = agFindOnScreen(@[@"全选"], @[], &e);
     if (all) { doTap([all[@"x"] doubleValue], [all[@"y"] doubleValue]); usleep(800 * 1000); }
     NSDictionary *paste = agFindOnScreen(@[@"粘贴"], @[@"允许", @"不允许", @"并"], &e);
-    if (!paste) { *note = @"键盘快捷键没见效,也没有找到“粘贴”菜单(输入框可能没聚焦)"; return NO; }
+    if (!paste) { *note = @"没能确认文字是否输入成功(键盘快捷键没有明显效果,也没找到“粘贴”菜单)"; return YES; }
     doTap([paste[@"x"] doubleValue], [paste[@"y"] doubleValue]);
     usleep(900 * 1000);
     NSDictionary *allow = agFindOnScreen(@[@"允许粘贴"], @[@"不允许"], &e);
@@ -1656,6 +1682,8 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
             if (!agPasteText(t, lastX, lastY, nil, &note)) {
                 agentSay([@"提示:输入失败:" stringByAppendingString:note ?: @"?"]);
                 pendingNote = [NSString stringWithFormat:@"(系统提示:Type 失败:%@。请重新点击输入框后再试。)", note ?: @""];
+            } else if (note.length) {
+                pendingNote = [NSString stringWithFormat:@"(系统提示:已执行输入,但%@。请看当前截图;输入框是空的就重新点击输入框后再 Type。)", note];
             }
         } else if ([act isEqualToString:@"launch"]) {
             NSString *name = agArg(action, @"app") ?: @"";
@@ -1782,7 +1810,7 @@ static BOOL ensureBroadcast(NSString **note) {
     double saved = [d doubleForKey:@"bcast_btn_y"];
     NSMutableArray *cands = [NSMutableArray array];
     if (saved > 0) [cands addObject:@(saved)];
-    for (NSNumber *r in @[@0.86, @0.82, @0.78, @0.74, @0.70, @0.66, @0.90, @0.62])
+    for (NSNumber *r in @[@0.589, @0.575, @0.603, @0.56, @0.62]) // 0.589 来自你发的截图:“开始直播”按钮中心在屏幕高度的 58.9% 处
         if (fabs(r.doubleValue - saved) > 0.005) [cands addObject:r];
     for (NSNumber *r in cands) {
         triggerPicker();
@@ -1834,10 +1862,24 @@ static void taskRunEnd(NSString *task, BOOL stopCast) {
         waitAppActive(6);
         usleep(500 * 1000);
     }
+    if (stopCast && broadcastAlive()) {
+        // 先关录屏,并自动点掉系统弹出的“直播已停止”提示里的“好”,然后才显示结果窗口。
+        // 期间盖一层“正在关闭屏幕录制”的遮罩:万一没点中提示框,点击也只会落在遮罩上,不会误点别的。
+        [NSNotificationCenter.defaultCenter postNotificationName:@"pa.closing" object:@YES];
+        requestBroadcastStop();
+        usleep(1700 * 1000); // 等系统弹出提示
+        CGSize sc = screenSize();
+        NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+        double okx = [ud doubleForKey:@"stop_ok_x"], oky = [ud doubleForKey:@"stop_ok_y"];
+        if (okx <= 0) okx = 0.327; // 来自你发的截图:“好”按钮中心在屏幕宽的 32.7%、高的 56.6%
+        if (oky <= 0) oky = 0.566;
+        doTap(sc.width * okx, sc.height * oky);
+        usleep(1000 * 1000);
+        [NSNotificationCenter.defaultCenter postNotificationName:@"pa.closing" object:@NO];
+    }
     [NSNotificationCenter.defaultCenter postNotificationName:@"pa.showResult" object:text];
     NSString *shownCopy = [shown copy], *resultCopy = [result copy];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ memoryLearn(shownCopy, resultCopy); });
-    if (stopCast) requestBroadcastStop();
 }
 
 static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString *model) {
@@ -1982,7 +2024,8 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                     sleep(1);
                     continue;
                 }
-                result = @"已把文字粘贴进输入框(键盘快捷键或粘贴菜单),请看下一张截图确认";
+                result = note.length ? [NSString stringWithFormat:@"已尝试粘贴,但%@;请看下一张截图确认输入框里有没有文字,没有就再用 input_text", note]
+                                     : @"已把文字粘贴进输入框(键盘快捷键或粘贴菜单),请看下一张截图确认";
                 [history addObject:[NSString stringWithFormat:@"%d. input_text(%@,%@)", step, usedID ? [NSString stringWithFormat:@"id=%ld", (long)oid] : [NSString stringWithFormat:@"%.0f,%.0f", xpx, ypx], text]];
                 sleep(1);
             } else {
@@ -2219,6 +2262,7 @@ static NSData *attachJPEG(UIImage *img) {
 @property (nonatomic, strong) UILabel *phLabel, *attLabel, *log;
 @property (nonatomic, strong) PAVoice *voice;
 @property (nonatomic, copy) NSString *voiceBase;
+@property (nonatomic, strong) UIView *closingView;
 @end
 
 @implementation VC
@@ -2253,6 +2297,14 @@ static NSData *attachJPEG(UIImage *img) {
     self.provBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     self.provBtn.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
     self.provBtn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
+    UIButton *addBtn = [self btn:@"＋添加" action:@selector(onAddProvider)];
+    UIButton *delBtn = [self btn:@"删除" action:@selector(onDeleteProvider)];
+    [delBtn setTitleColor:UIColor.systemRedColor forState:UIControlStateNormal];
+    [addBtn setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [delBtn setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [self.provBtn setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+    UIStackView *provRow = [[UIStackView alloc] initWithArrangedSubviews:@[self.provBtn, addBtn, delBtn]];
+    provRow.axis = UILayoutConstraintAxisHorizontal; provRow.spacing = 16; provRow.alignment = UIStackViewAlignmentCenter;
     self.keyF = [self tf:@"API Key" secure:YES];
     self.baseF = [self tf:@"接口地址" secure:NO];
     self.modelF = [self tf:@"模型名" secure:NO];
@@ -2316,7 +2368,7 @@ static NSData *attachJPEG(UIImage *img) {
     self.log.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
 
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
-        self.provBtn, self.keyF, self.baseF, self.modelF,
+        provRow, self.keyF, self.baseF, self.modelF,
         self.taskTV, [self row:@[self.micBtn, attBtn]], self.attLabel,
         [self row:@[startBtn, stopBtn]], [self row:@[memBtn, resBtn]],
         acrow, brow, [self row:@[keepBtn, diagBtn]], tokenL, self.log]];
@@ -2342,6 +2394,8 @@ static NSData *attachJPEG(UIImage *img) {
     // 通知:日志、结果窗口
     [NSNotificationCenter.defaultCenter addObserverForName:@"pa.say" object:nil queue:nil
                                                 usingBlock:^(NSNotification *n) { [wself say:[n.object description]]; }];
+    [NSNotificationCenter.defaultCenter addObserverForName:@"pa.closing" object:nil queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(NSNotification *n) { [wself setClosingOverlay:[n.object boolValue]]; }];
     [NSNotificationCenter.defaultCenter addObserverForName:@"pa.showResult" object:nil queue:NSOperationQueue.mainQueue
                                                 usingBlock:^(NSNotification *n) { [wself showResult:[n.object description]]; }];
 
@@ -2401,6 +2455,59 @@ static NSData *attachJPEG(UIImage *img) {
     self.provBtn.showsMenuAsPrimaryAction = YES;
     [self.provBtn setTitle:[NSString stringWithFormat:@"模型:%@  ▾", curName] forState:UIControlStateNormal];
 }
+- (void)onAddProvider {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"添加自定义模型"
+        message:@"接口需要兼容 OpenAI 的 /chat/completions。接口地址和模型名以后可以在界面里再改。" preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) { tf.placeholder = @"名称,例如:通义千问"; }];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"接口地址,例如 https://xxx/v1";
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone; tf.autocorrectionType = UITextAutocorrectionTypeNo; tf.keyboardType = UIKeyboardTypeURL;
+    }];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"模型名";
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone; tf.autocorrectionType = UITextAutocorrectionTypeNo;
+    }];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak UIAlertController *wac = ac;
+    [ac addAction:[UIAlertAction actionWithTitle:@"添加" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        NSCharacterSet *ws = NSCharacterSet.whitespaceAndNewlineCharacterSet;
+        NSString *name = [wac.textFields[0].text stringByTrimmingCharactersInSet:ws];
+        NSString *base = [wac.textFields[1].text stringByTrimmingCharactersInSet:ws];
+        NSString *model = [wac.textFields[2].text stringByTrimmingCharactersInSet:ws];
+        if (!name.length) name = @"自定义模型";
+        [self saveFields];
+        NSMutableArray *list = [providerList() mutableCopy];
+        NSString *pid = [NSString stringWithFormat:@"c%.0f", [NSDate date].timeIntervalSince1970 * 1000];
+        [list addObject:@{@"id": pid, @"name": name, @"base": base ?: @"", @"model": model ?: @""}];
+        saveProviders(list);
+        [NSUserDefaults.standardUserDefaults setObject:pid forKey:@"provider"];
+        [self loadFields];
+        [self buildProviderMenu];
+        [self say:[NSString stringWithFormat:@"已添加模型“%@”,请填写它的 API Key", name]];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+- (void)onDeleteProvider {
+    NSMutableArray *list = [providerList() mutableCopy];
+    if (list.count <= 1) { [self say:@"至少要保留一个模型"]; return; }
+    NSString *pid = selectedProviderID(), *name = pid;
+    for (NSDictionary *p in list) if ([p[@"id"] isEqualToString:pid]) name = p[@"name"];
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"删除模型"
+        message:[NSString stringWithFormat:@"删除“%@”?它保存的 API Key、接口地址和模型名也会一起删除。", name] preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        NSMutableArray *rest = [NSMutableArray array];
+        for (NSDictionary *p in list) if (![p[@"id"] isEqualToString:pid]) [rest addObject:p];
+        saveProviders(rest);
+        NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+        for (NSString *f in @[@"key", @"base", @"model"]) [d removeObjectForKey:[NSString stringWithFormat:@"p_%@_%@", pid, f]];
+        [d setObject:rest.firstObject[@"id"] forKey:@"provider"];
+        [self loadFields];
+        [self buildProviderMenu];
+        [self say:[NSString stringWithFormat:@"已删除模型“%@”", name]];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
 - (void)switchProvider:(NSString *)pid {
     [self saveFields];
     [NSUserDefaults.standardUserDefaults setObject:pid forKey:@"provider"];
@@ -2415,6 +2522,25 @@ static NSData *attachJPEG(UIImage *img) {
         if (t.length > 6000) t = [t substringToIndex:6000];
         self.log.text = t;
     });
+}
+// 任务结束、自动关闭录屏的几秒里盖一层遮罩,吞掉点击
+- (void)setClosingOverlay:(BOOL)on {
+    if (!on) { [self.closingView removeFromSuperview]; self.closingView = nil; return; }
+    if (self.closingView) return;
+    UIWindow *w = self.view.window ?: UIApplication.sharedApplication.windows.firstObject;
+    if (!w) return;
+    UIView *v = [[UIView alloc] initWithFrame:w.bounds];
+    v.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    v.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
+    v.userInteractionEnabled = YES;
+    UILabel *l = [UILabel new];
+    l.text = @"任务已结束,正在关闭屏幕录制……"; l.textColor = UIColor.whiteColor;
+    l.font = [UIFont systemFontOfSize:17 weight:UIFontWeightMedium]; l.textAlignment = NSTextAlignmentCenter;
+    l.frame = CGRectMake(0, w.bounds.size.height * 0.3, w.bounds.size.width, 30);
+    l.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [v addSubview:l];
+    [w addSubview:v];
+    self.closingView = v;
 }
 - (void)showResult:(NSString *)text {
     gLastResultText = text;
