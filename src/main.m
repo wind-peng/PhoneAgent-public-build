@@ -707,7 +707,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.8.7", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.8.8", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -1794,6 +1794,10 @@ static void memoryLearn(NSString *task, NSString *result) {
 // 自动开启屏幕录制:先把 PhoneAgent 切到前台,触发系统的“屏幕直播”面板,再用 HID 点面板里的“开始直播”。
 // 难点:此时还没有录屏就没有截图,看不到按钮在哪,所以只能"盲点"——按屏幕高度的若干个比例位置依次试,
 // 哪个位置能让广播真的连上,就把这个比例记下来,以后直接用。
+static void castGuard(BOOL on) {
+    [NSNotificationCenter.defaultCenter postNotificationName:@"pa.guard" object:@(on)];
+}
+
 static void triggerPicker(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         for (UIView *v in gPicker.subviews)
@@ -1812,6 +1816,7 @@ static BOOL ensureBroadcast(NSString **note) {
         if (!waitAppActive(6)) { *note = @"PhoneAgent 没能回到前台"; return NO; }
         usleep(700 * 1000);
     }
+    castGuard(YES); // 盲点期间在 PhoneAgent 自己的界面上盖一层透明的"吞点击"层:系统面板在它上面,点面板不受影响;面板不在时,盲点只会落在这层上
     CGSize sc = screenSize();
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     double saved = [d doubleForKey:@"bcast_btn_y"];
@@ -1827,13 +1832,15 @@ static BOOL ensureBroadcast(NSString **note) {
         if (broadcastAlive()) {
             [d setDouble:r.doubleValue forKey:@"bcast_btn_y"];
             usleep(900 * 1000);
-            doTap(sc.width / 2, sc.height * 0.03); // 倒计时结束后系统面板还停在屏幕上:点一下面板外的空白处(顶部状态栏位置,对任何界面都无害)把它收起来
+            doTap(sc.width / 2, sc.height * 0.81); // 倒计时结束后系统面板还停在屏幕上:点面板下面空白区域的中心(按截图:面板下缘 61.8%,下面空白区中心约 81%)把它收起来
             usleep(900 * 1000);
+            castGuard(NO);
             return YES;
         }
-        doTap(sc.width / 2, sc.height * 0.03); // 没点中:点面板外面把它收起来,再试下一个位置
+        doTap(sc.width / 2, sc.height * 0.81); // 没点中:点面板下面的空白处把它收起来,再试下一个位置
         usleep(900 * 1000);
     }
+    castGuard(NO);
     *note = @"盲点“开始直播”的几个位置都没有成功";
     return NO;
 }
@@ -2317,7 +2324,7 @@ static NSData *attachJPEG(UIImage *img) {
 @property (nonatomic, strong) UILabel *phLabel, *attLabel, *log;
 @property (nonatomic, strong) PAVoice *voice;
 @property (nonatomic, copy) NSString *voiceBase;
-@property (nonatomic, strong) UIView *closingView;
+@property (nonatomic, strong) UIView *closingView, *guardView;
 @end
 
 @implementation VC
@@ -2457,6 +2464,8 @@ static NSData *attachJPEG(UIImage *img) {
     // 通知:日志、结果窗口
     [NSNotificationCenter.defaultCenter addObserverForName:@"pa.say" object:nil queue:nil
                                                 usingBlock:^(NSNotification *n) { [wself say:[n.object description]]; }];
+    [NSNotificationCenter.defaultCenter addObserverForName:@"pa.guard" object:nil queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(NSNotification *n) { [wself setGuardOverlay:[n.object boolValue]]; }];
     [NSNotificationCenter.defaultCenter addObserverForName:@"pa.closing" object:nil queue:NSOperationQueue.mainQueue
                                                 usingBlock:^(NSNotification *n) { [wself setClosingOverlay:[n.object boolValue]]; }];
     [NSNotificationCenter.defaultCenter addObserverForName:@"pa.showResult" object:nil queue:NSOperationQueue.mainQueue
@@ -2591,6 +2600,17 @@ static NSData *attachJPEG(UIImage *img) {
     });
 }
 // 任务结束、自动关闭录屏的几秒里盖一层遮罩,吞掉点击
+// 自动开启录屏的盲点期间:透明的吞点击层(盖在 PhoneAgent 自己的界面上,系统面板在它上面)
+- (void)setGuardOverlay:(BOOL)on {
+    if (!on) { [self.guardView removeFromSuperview]; self.guardView = nil; return; }
+    if (self.guardView) return;
+    UIView *v = [[UIView alloc] initWithFrame:self.view.bounds];
+    v.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    v.backgroundColor = UIColor.clearColor;
+    v.userInteractionEnabled = YES;
+    [self.view addSubview:v];
+    self.guardView = v;
+}
 - (void)setClosingOverlay:(BOOL)on {
     if (!on) { [self.closingView removeFromSuperview]; self.closingView = nil; return; }
     if (self.closingView) return;
