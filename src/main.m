@@ -600,7 +600,7 @@ static NSMutableArray *gAgentLog; // 最近的任务日志,给 /status 用
 static volatile BOOL gBroadcastStopRequested; // 任务结束时请扩展关闭录屏
 static RPSystemBroadcastPickerView *gPicker;   // 界面里的录屏选择按钮(自动开启录屏时要用)
 static NSMutableArray *gRunLog;          // 本次任务的完整日志(结果窗口用)
-static NSString *gTaskStatus, *gTaskResultText, *gLastResultText, *gTaskDisplay;
+static NSString *gTaskStatus, *gTaskResultText, *gLastResultText, *gTaskDisplay, *gLastSpeechText;
 static NSArray *gRunImages;              // 本次任务附带的图片(JPEG 数据)
 static NSMutableArray *gAttachImages, *gAttachNames; // 界面里已选的附件
 static NSMutableString *gAttachText;     // 界面里已选文件的文字内容
@@ -707,7 +707,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.8.6", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.8.7", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -778,7 +778,11 @@ static void handleClient(int c) {
             return;
         }
         if (gAgentRunning) { sendJSON(c, 409, @{@"ok": @NO, @"error": @"已有任务在运行"}); return; }
-        // 不在入口提前拦截录屏；agentRun 会根据 auto_cast 设置自动开启。
+        {
+            NSUserDefaults *u2 = NSUserDefaults.standardUserDefaults;
+            BOOL autoCast = [u2 objectForKey:@"auto_cast"] ? [u2 boolForKey:@"auto_cast"] : YES;
+            if (!autoCast && !broadcastAlive()) { sendJSON(c, 409, @{@"ok": @NO, @"error": @"屏幕广播没开,请先在 PhoneAgent 里开启,或打开“任务时自动开启/关闭屏幕录制”开关"}); return; }
+        }
         agentSay([NSString stringWithFormat:@"收到语音任务:%@", task]);
         [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:[NSString stringWithFormat:@"收到语音任务:%@", task]];
         gRunImages = nil; gTaskDisplay = task;
@@ -1787,8 +1791,6 @@ static void memoryLearn(NSString *task, NSString *result) {
     [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:[NSString stringWithFormat:@"已记住新偏好:\n%@", joined]];
 }
 
-static BOOL goHome(NSString **note);
-
 // 自动开启屏幕录制:先把 PhoneAgent 切到前台,触发系统的“屏幕直播”面板,再用 HID 点面板里的“开始直播”。
 // 难点:此时还没有录屏就没有截图,看不到按钮在哪,所以只能"盲点"——按屏幕高度的若干个比例位置依次试,
 // 哪个位置能让广播真的连上,就把这个比例记下来,以后直接用。
@@ -1800,6 +1802,9 @@ static void triggerPicker(void) {
 }
 
 static BOOL ensureBroadcast(NSString **note) {
+    if (broadcastAlive()) return YES;
+    // 冷启动或刚回到前台时,扩展的心跳最多要 2 秒才到;先等一等,免得录屏明明开着却又去触发“开始直播”(那样会点到“停止直播”)
+    for (int i = 0; i < 18 && !broadcastAlive(); i++) usleep(200 * 1000);
     if (broadcastAlive()) return YES;
     if (!gPicker) { *note = @"找不到录屏按钮"; return NO; }
     if (appStateNow() != UIApplicationStateActive) {
@@ -1821,14 +1826,12 @@ static BOOL ensureBroadcast(NSString **note) {
         for (int i = 0; i < 40 && !broadcastAlive(); i++) usleep(200 * 1000); // 3 秒倒计时 + 扩展连接
         if (broadcastAlive()) {
             [d setDouble:r.doubleValue forKey:@"bcast_btn_y"];
-            // 开始直播后用 Home 事件回到主屏幕，避免只点空白处仍停留在 PhoneAgent。
-            usleep(1000 * 1000);
-            NSString *homeNote = nil;
-            goHome(&homeNote);
-            usleep(500 * 1000);
+            usleep(900 * 1000);
+            doTap(sc.width / 2, sc.height * 0.03); // 倒计时结束后系统面板还停在屏幕上:点一下面板外的空白处(顶部状态栏位置,对任何界面都无害)把它收起来
+            usleep(900 * 1000);
             return YES;
         }
-        doTap(sc.width / 2, sc.height * 0.12); // 没点中:点面板外面把它收起来,再试下一个位置
+        doTap(sc.width / 2, sc.height * 0.03); // 没点中:点面板外面把它收起来,再试下一个位置
         usleep(900 * 1000);
     }
     *note = @"盲点“开始直播”的几个位置都没有成功";
@@ -1845,26 +1848,9 @@ static void requestBroadcastStop(void) {
     agentSay(still ? @"提示:屏幕录制没能自动关闭,请手动关闭" : @"屏幕录制已自动关闭");
 }
 
-// 任务结果自动朗读:用系统语音读出结果文字,开关存在 speak_result(默认开)
-static AVSpeechSynthesizer *gSpeaker;
-static void speakResultText(NSString *text) {
-    if (!text.length) return;
-    if (!gSpeaker) gSpeaker = [AVSpeechSynthesizer new];
-    [gSpeaker stopSpeakingAtBoundary:AVSpeechBoundaryImmediate];
-    AVSpeechUtterance *u = [AVSpeechUtterance speechUtteranceWithString:text];
-    AVSpeechSynthesisVoice *v = [AVSpeechSynthesisVoice voiceWithLanguage:@"zh-CN"];
-    if (v) u.voice = v;
-    u.rate = AVSpeechUtteranceDefaultSpeechRate;
-    [gSpeaker speakUtterance:u];
-}
-static void stopSpeak(void) {
-    if (gSpeaker) [gSpeaker stopSpeakingAtBoundary:AVSpeechBoundaryImmediate];
-}
-
 static void taskRunBegin(NSString *task) {
     @synchronized (gLock) { [gRunLog removeAllObjects]; gTaskStatus = @""; gTaskResultText = @""; }
     gAgentRunning = YES; // 从这里开始就算"任务进行中"(包括自动开启录屏的阶段)
-    stopSpeak(); // 新任务开始,停掉上一个结果的朗读
     taskAwakeStart();
 }
 
@@ -1880,6 +1866,7 @@ static void taskRunEnd(NSString *task, BOOL stopCast) {
     NSString *text = [NSString stringWithFormat:@"【任务】\n%@\n\n【状态】%@\n\n【结果】\n%@\n\n【执行记录】\n%@",
                       shown, status, result, [lines componentsJoinedByString:@"\n"]];
     gLastResultText = text;
+    gLastSpeechText = [NSString stringWithFormat:@"任务%@。%@", status, result];
     if (appStateNow() != UIApplicationStateActive) {
         openApp(NSBundle.mainBundle.bundleIdentifier);
         waitAppActive(6);
@@ -1900,17 +1887,7 @@ static void taskRunEnd(NSString *task, BOOL stopCast) {
         usleep(1000 * 1000);
         [NSNotificationCenter.defaultCenter postNotificationName:@"pa.closing" object:@NO];
     }
-    if (stopCast && broadcastAlive()) {
-        // 出结果前最后确认一次录屏已经关了:再请扩展关一次,最多再等 8 秒,确认关了再出结果
-        gBroadcastStopRequested = YES;
-        for (int i = 0; i < 40 && broadcastAlive(); i++) usleep(200 * 1000);
-        gBroadcastStopRequested = NO;
-        if (broadcastAlive()) agentSay(@"提示:屏幕录制还没关掉,结果先显示了,请手动关闭录屏");
-    }
     [NSNotificationCenter.defaultCenter postNotificationName:@"pa.showResult" object:text];
-    NSUserDefaults *ud2 = NSUserDefaults.standardUserDefaults;
-    BOOL speak = [ud2 objectForKey:@"speak_result"] ? [ud2 boolForKey:@"speak_result"] : YES;
-    if (speak) speakResultText(result);
     NSString *shownCopy = [shown copy], *resultCopy = [result copy];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ memoryLearn(shownCopy, resultCopy); });
 }
@@ -2114,6 +2091,41 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
 
 #pragma mark - 界面
 
+// ---- 语音朗读(系统自带的语音合成,中文) ----
+@interface PATTS : NSObject <AVSpeechSynthesizerDelegate>
++ (instancetype)shared;
+- (void)speak:(NSString *)text;
+- (void)stop;
+@property (nonatomic, readonly) BOOL speaking;
+@end
+
+@implementation PATTS {
+    AVSpeechSynthesizer *_syn;
+}
++ (instancetype)shared {
+    static PATTS *s; static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [PATTS new]; s->_syn = [AVSpeechSynthesizer new]; s->_syn.delegate = s; });
+    return s;
+}
+- (BOOL)speaking { return _syn.isSpeaking; }
+- (void)speak:(NSString *)text {
+    [self stop];
+    NSString *t = text.length > 1500 ? [text substringToIndex:1500] : text;
+    if (!t.length) return;
+    AVSpeechUtterance *u = [AVSpeechUtterance speechUtteranceWithString:t];
+    u.voice = [AVSpeechSynthesisVoice voiceWithLanguage:@"zh-CN"];
+    u.rate = AVSpeechUtteranceDefaultSpeechRate;
+    [_syn speakUtterance:u];
+}
+- (void)stop { if (_syn.isSpeaking) [_syn stopSpeakingAtBoundary:AVSpeechBoundaryImmediate]; }
+- (void)speechSynthesizer:(AVSpeechSynthesizer *)s didFinishSpeechUtterance:(AVSpeechUtterance *)u {
+    [NSNotificationCenter.defaultCenter postNotificationName:@"pa.ttsDone" object:nil];
+}
+- (void)speechSynthesizer:(AVSpeechSynthesizer *)s didCancelSpeechUtterance:(AVSpeechUtterance *)u {
+    [NSNotificationCenter.defaultCenter postNotificationName:@"pa.ttsDone" object:nil];
+}
+@end
+
 // ---- 语音输入(在 App 里按麦克风按钮;识别由系统的语音识别完成) ----
 @interface PAVoice : NSObject
 @property (nonatomic, copy) void (^onText)(NSString *text);
@@ -2205,6 +2217,7 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
 // ---- 结果窗口:可以选中文字、一键复制 ----
 @interface ResultVC : UIViewController
 @property (nonatomic, copy) NSString *text;
+@property (nonatomic, strong) UIBarButtonItem *speakItem;
 @end
 @implementation ResultVC
 - (void)viewDidLoad {
@@ -2219,9 +2232,18 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     tv.text = self.text;
     [self.view addSubview:tv];
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain target:self action:@selector(close)];
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"复制全部" style:UIBarButtonItemStylePlain target:self action:@selector(copyAll)];
+    UIBarButtonItem *copyItem = [[UIBarButtonItem alloc] initWithTitle:@"复制全部" style:UIBarButtonItemStylePlain target:self action:@selector(copyAll)];
+    self.speakItem = [[UIBarButtonItem alloc] initWithTitle:[PATTS shared].speaking ? @"停止" : @"朗读" style:UIBarButtonItemStylePlain target:self action:@selector(toggleSpeak)];
+    self.navigationItem.rightBarButtonItems = @[copyItem, self.speakItem];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(ttsDone) name:@"pa.ttsDone" object:nil];
 }
-- (void)close { [self dismissViewControllerAnimated:YES completion:nil]; }
+- (void)toggleSpeak {
+    if ([PATTS shared].speaking) { [[PATTS shared] stop]; self.speakItem.title = @"朗读"; }
+    else { [[PATTS shared] speak:gLastSpeechText.length ? gLastSpeechText : self.text]; self.speakItem.title = @"停止"; }
+}
+- (void)ttsDone { dispatch_async(dispatch_get_main_queue(), ^{ self.speakItem.title = @"朗读"; }); }
+- (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self]; }
+- (void)close { [[PATTS shared] stop]; [self dismissViewControllerAnimated:YES completion:nil]; }
 - (void)copyAll {
     UIPasteboard.generalPasteboard.string = self.text;
     self.navigationItem.rightBarButtonItem.title = @"已复制";
@@ -2390,14 +2412,14 @@ static NSData *attachJPEG(UIImage *img) {
     UIStackView *acrow = [[UIStackView alloc] initWithArrangedSubviews:@[acl, acs]];
     acrow.axis = UILayoutConstraintAxisHorizontal; acrow.alignment = UIStackViewAlignmentCenter;
     acrow.distribution = UIStackViewDistributionEqualSpacing;
-    UILabel *spl = [UILabel new];
-    spl.text = @"任务结束自动朗读结果"; spl.font = [UIFont systemFontOfSize:15]; spl.numberOfLines = 0;
-    UISwitch *sps = [UISwitch new];
-    sps.on = [ud0 objectForKey:@"speak_result"] ? [ud0 boolForKey:@"speak_result"] : YES;
-    [sps addTarget:self action:@selector(onSpeakResult:) forControlEvents:UIControlEventValueChanged];
-    UIStackView *sprow = [[UIStackView alloc] initWithArrangedSubviews:@[spl, sps]];
-    sprow.axis = UILayoutConstraintAxisHorizontal; sprow.alignment = UIStackViewAlignmentCenter;
-    sprow.distribution = UIStackViewDistributionEqualSpacing;
+    UILabel *ttl = [UILabel new];
+    ttl.text = @"任务结果自动语音朗读"; ttl.font = [UIFont systemFontOfSize:15]; ttl.numberOfLines = 0;
+    UISwitch *tts = [UISwitch new];
+    tts.on = [ud0 objectForKey:@"tts_on"] ? [ud0 boolForKey:@"tts_on"] : YES;
+    [tts addTarget:self action:@selector(onTTS:) forControlEvents:UIControlEventValueChanged];
+    UIStackView *ttsrow = [[UIStackView alloc] initWithArrangedSubviews:@[ttl, tts]];
+    ttsrow.axis = UILayoutConstraintAxisHorizontal; ttsrow.alignment = UIStackViewAlignmentCenter;
+    ttsrow.distribution = UIStackViewDistributionEqualSpacing;
     UIStackView *brow = [[UIStackView alloc] initWithArrangedSubviews:@[bl, pv]];
     brow.axis = UILayoutConstraintAxisHorizontal; brow.spacing = 10; brow.alignment = UIStackViewAlignmentCenter;
 
@@ -2412,7 +2434,7 @@ static NSData *attachJPEG(UIImage *img) {
         provRow, self.keyF, self.baseF, self.modelF,
         self.taskTV, [self row:@[self.micBtn, attBtn]], self.attLabel,
         [self row:@[startBtn, stopBtn]], [self row:@[memBtn, resBtn]],
-        acrow, sprow, brow, [self row:@[keepBtn, diagBtn]], tokenL, self.log]];
+        acrow, ttsrow, brow, [self row:@[keepBtn, diagBtn]], tokenL, self.log]];
     st.axis = UILayoutConstraintAxisVertical;
     st.spacing = 10;
     st.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2438,7 +2460,11 @@ static NSData *attachJPEG(UIImage *img) {
     [NSNotificationCenter.defaultCenter addObserverForName:@"pa.closing" object:nil queue:NSOperationQueue.mainQueue
                                                 usingBlock:^(NSNotification *n) { [wself setClosingOverlay:[n.object boolValue]]; }];
     [NSNotificationCenter.defaultCenter addObserverForName:@"pa.showResult" object:nil queue:NSOperationQueue.mainQueue
-                                                usingBlock:^(NSNotification *n) { [wself showResult:[n.object description]]; }];
+                                                usingBlock:^(NSNotification *n) {
+        [wself showResult:[n.object description]];
+        NSUserDefaults *ud1 = NSUserDefaults.standardUserDefaults;
+        if (!([ud1 objectForKey:@"tts_on"] && ![ud1 boolForKey:@"tts_on"])) [[PATTS shared] speak:gLastSpeechText];
+    }];
 
     // 语音输入
     self.voice = [PAVoice new];
@@ -2608,6 +2634,7 @@ static NSData *attachJPEG(UIImage *img) {
     [self.view endEditing:YES];
     [self saveFields];
     if (self.voice.listening) [self.voice stop];
+    [[PATTS shared] stop];
     if (gAgentRunning) { [self say:@"已有任务在运行"]; return; }
     NSString *key = nil, *base = nil, *model = nil;
     loadLLMConfig(&key, &base, &model);
@@ -2622,8 +2649,8 @@ static NSData *attachJPEG(UIImage *img) {
     if (!broadcastAlive()) [self say:@"提醒:屏幕广播还没开,没有广播会截屏失败"];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ agentRun(full, base, key, model); });
 }
+- (void)onTTS:(UISwitch *)sw { [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"tts_on"]; if (!sw.on) [[PATTS shared] stop]; }
 - (void)onAutoCast:(UISwitch *)sw { [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"auto_cast"]; }
-- (void)onSpeakResult:(UISwitch *)sw { [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"speak_result"]; if (!sw.on) stopSpeak(); }
 - (void)onStop { gAgentRunning = NO; [self say:@"正在停止任务……"]; }
 - (void)onKeep { [self say:setKeepAlive(gPlayer == nil)]; }
 - (void)onDiag { [self say:diagReport()]; }
@@ -2767,9 +2794,18 @@ static NSData *attachJPEG(UIImage *img) {
     agentSay([NSString stringWithFormat:@"收到语音任务:%@", task]);
     [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:[NSString stringWithFormat:@"收到语音任务:%@", task]];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSUserDefaults *u2 = NSUserDefaults.standardUserDefaults;
+        BOOL autoCast = [u2 objectForKey:@"auto_cast"] ? [u2 boolForKey:@"auto_cast"] : YES;
+        if (!autoCast) { // 没打开“自动开启录屏”才需要现成的广播;冷启动后扩展要重新连上,最多等 6 秒
+            for (int i = 0; i < 30 && !broadcastAlive(); i++) usleep(200 * 1000);
+            if (!broadcastAlive()) {
+                [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:@"屏幕广播没开,任务未执行:请先开启屏幕广播,或打开界面里“任务时自动开启/关闭屏幕录制”的开关"];
+                return;
+            }
+        }
         if (gAgentRunning) return;
         gRunImages = nil; gTaskDisplay = task;
-        agentRun(task, base, key, model); // agentRun 里有自动开录屏,不在这里提前拦
+        agentRun(task, base, key, model); // 开关打开时,agentRun 会自己检查录屏并自动开启
     });
     return YES;
 }
