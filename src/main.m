@@ -20,6 +20,7 @@
 
 #import <ReplayKit/ReplayKit.h>
 #import <Speech/Speech.h>
+#import <UserNotifications/UserNotifications.h>
 #import <PhotosUI/PhotosUI.h>
 #import <PDFKit/PDFKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
@@ -605,6 +606,17 @@ static NSArray *gRunImages;              // 本次任务附带的图片(JPEG 数
 static NSMutableArray *gAttachImages, *gAttachNames; // 界面里已选的附件
 static NSMutableString *gAttachText;     // 界面里已选文件的文字内容
 
+// ---- 需要用户参与的请求(暂停 / 确认):界面弹窗、通知按钮、URL、HTTP 都可以回应 ----
+enum { PAReqNone = 0, PAReqWaiting = 1, PAReqAllow = 2, PAReqAllowAll = 3, PAReqDeny = 4, PAReqStop = 5 };
+static volatile int gReqState;
+static NSString *gReqKind, *gReqText;
+static volatile BOOL gConfirmSkipThisTask;   // 用户选了“本次任务不再问”
+static void agentRespond(int st) { if (gReqState == PAReqWaiting) gReqState = st; }
+// ---- 经验库 ----
+static NSMutableArray *gExpSteps;            // 本次任务已执行的步骤(成功后存进经验库)
+static NSString *gExpHint, *gExpReplayID;    // 给模型的参考提示 / 本次回放用到的经验 id
+static BOOL gExpReplayAborted;               // 回放中途中止过
+
 // 读已保存的设置(空字符串按没有处理)。模型名在界面里存的键是 llm_model。
 static NSString *savedSetting(NSString *k, NSString *def) {
     NSString *v = [NSUserDefaults.standardUserDefaults stringForKey:k];
@@ -648,6 +660,194 @@ static NSString *provValue(NSString *pid, NSString *field) {
 static void loadLLMConfig(NSString **key, NSString **base, NSString **model) {
     NSString *pid = selectedProviderID();
     *key = provValue(pid, @"key"); *base = provValue(pid, @"base"); *model = provValue(pid, @"model");
+}
+
+// ---- 安全设置:敏感操作确认、禁止进入的 App ----
+static NSString *defaultSensitiveWords(void) { return @"发送\n发布\n提交\n删除\n清空\n退出登录\n注销\n卸载\n授权\n拨打\n呼叫\n预订\n报名\n转发"; }
+static NSString *defaultBlockedApps(void) { return @"银行\n支付宝\n云闪付\n数字人民币\n京东金融\n蚂蚁财富\n钱包\nWallet"; }
+static NSArray *splitList(NSString *t) {
+    NSMutableArray *out = [NSMutableArray array];
+    NSCharacterSet *seps = [NSCharacterSet characterSetWithCharactersInString:@"\n,，、;；"];
+    for (NSString *p in [t componentsSeparatedByCharactersInSet:seps]) {
+        NSString *x = [p stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (x.length) [out addObject:x];
+    }
+    return out;
+}
+static NSArray *sensitiveWords(void) { return splitList([NSUserDefaults.standardUserDefaults stringForKey:@"sens_words"] ?: defaultSensitiveWords()); }
+static NSArray *blockedApps(void) { return splitList([NSUserDefaults.standardUserDefaults stringForKey:@"blocked_apps"] ?: defaultBlockedApps()); }
+static BOOL confirmEnabled(void) {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    return [d objectForKey:@"confirm_on"] ? [d boolForKey:@"confirm_on"] : YES;
+}
+static BOOL isBlockedApp(NSString *name, NSString *bid) {
+    for (NSString *e in blockedApps())
+        if ([name localizedCaseInsensitiveContainsString:e] || [bid localizedCaseInsensitiveContainsString:e]) return YES;
+    return NO;
+}
+// 涉及花钱的词:永远不自动点击,只能请用户本人完成(不受“敏感操作确认”开关影响)
+static NSArray *moneyWords(void) {
+    return @[@"支付", @"付款", @"结算", @"提交订单", @"立即购买", @"去支付", @"转账", @"汇款", @"充值", @"红包", @"免密支付", @"支付密码"];
+}
+// 点击位置附近(OCR 框外扩 25pt)的文字
+static NSString *textNear(NSArray *items, double x, double y) {
+    NSMutableArray *parts = [NSMutableArray array];
+    for (NSDictionary *it in items) {
+        double dx = fabs([it[@"x"] doubleValue] - x), dy = fabs([it[@"y"] doubleValue] - y);
+        double hw = [it[@"w"] doubleValue] / 2 + 25, hh = [it[@"h"] doubleValue] / 2 + 25;
+        if (dx <= hw && dy <= hh) [parts addObject:it[@"text"] ?: @""];
+    }
+    return [parts componentsJoinedByString:@" "];
+}
+// 恰好落在某个 OCR 框里(外扩 12pt)的那段文字,没有就返回空
+static NSString *nearestItemText(NSArray *items, double x, double y) {
+    NSString *best = @""; double bd = 1e9;
+    for (NSDictionary *it in items) {
+        double dx = fabs(x - [it[@"x"] doubleValue]), dy = fabs(y - [it[@"y"] doubleValue]);
+        double hw = [it[@"w"] doubleValue] / 2 + 12, hh = [it[@"h"] doubleValue] / 2 + 12;
+        if (dx <= hw && dy <= hh && dx + dy < bd) { bd = dx + dy; best = it[@"text"] ?: @""; }
+    }
+    return best;
+}
+// category:2 = 涉及花钱(只能用户本人操作),1 = 需要先征得用户同意
+static NSString *sensitiveMatch(NSString *text, int *category) {
+    if (!text.length) return nil;
+    for (NSString *w in moneyWords()) if ([text containsString:w]) { *category = 2; return w; }
+    if (!confirmEnabled()) return nil;
+    for (NSString *w in sensitiveWords()) if ([text localizedCaseInsensitiveContainsString:w]) { *category = 1; return w; }
+    return nil;
+}
+// 综合“按钮名 + 点击位置附近的文字 + 模型写的风险说明”判断这一步是否敏感
+static NSString *classifyAction(NSString *target, NSString *risk, NSArray *items, double x, double y, int *category) {
+    NSString *near = items.count ? textNear(items, x, y) : @"";
+    NSString *blob = [NSString stringWithFormat:@"%@ %@ %@", target ?: @"", near, risk ?: @""];
+    int cat = 0;
+    NSString *w = sensitiveMatch(blob, &cat);
+    if (!w && risk.length && confirmEnabled()) { cat = 1; w = @"模型标注的风险"; }
+    *category = cat;
+    return w;
+}
+
+// ---- 经验库:存取、相似度、提示 ----
+static BOOL expEnabled(void) {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    return [d objectForKey:@"exp_on"] ? [d boolForKey:@"exp_on"] : YES;
+}
+static BOOL expReplayEnabled(void) {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    return [d objectForKey:@"exp_replay_on"] ? [d boolForKey:@"exp_replay_on"] : YES;
+}
+static NSMutableArray *expLoad(void) {
+    NSData *d = [NSUserDefaults.standardUserDefaults dataForKey:@"exp_json"];
+    id o = d ? [NSJSONSerialization JSONObjectWithData:d options:NSJSONReadingMutableContainers error:nil] : nil;
+    return [o isKindOfClass:NSMutableArray.class] ? o : [NSMutableArray array];
+}
+static void expSave(NSArray *arr) {
+    NSData *d = [NSJSONSerialization dataWithJSONObject:arr options:0 error:nil];
+    if (d) [NSUserDefaults.standardUserDefaults setObject:d forKey:@"exp_json"];
+}
+static NSSet *expBigrams(NSString *t) {
+    NSMutableString *s = [NSMutableString string];
+    NSCharacterSet *skip = [NSCharacterSet characterSetWithCharactersInString:@" \t\n,.。,!?;:、“”\"'()[]【】"];
+    for (NSUInteger i = 0; i < t.length; i++) { unichar c = [t characterAtIndex:i]; if (![skip characterIsMember:c]) [s appendFormat:@"%C", c]; }
+    NSString *n = s.lowercaseString;
+    NSMutableSet *set = [NSMutableSet set];
+    if (n.length < 2) { if (n.length) [set addObject:n]; return set; }
+    for (NSUInteger i = 0; i + 1 < n.length; i++) [set addObject:[n substringWithRange:NSMakeRange(i, 2)]];
+    return set;
+}
+// 两句任务的相似度(字对的重合比例,0~1)
+static double expSim(NSString *a, NSString *b) {
+    NSSet *A = expBigrams(a ?: @""), *B = expBigrams(b ?: @"");
+    if (!A.count || !B.count) return 0;
+    NSMutableSet *I = [A mutableCopy]; [I intersectSet:B];
+    NSMutableSet *U = [A mutableCopy]; [U unionSet:B];
+    return (double)I.count / (double)U.count;
+}
+static NSMutableDictionary *expFind(NSString *task, double *score) {
+    NSMutableDictionary *best = nil; double bs = 0;
+    for (NSMutableDictionary *e in expLoad()) { double sc = expSim(task, e[@"task"]); if (sc > bs) { bs = sc; best = e; } }
+    *score = bs;
+    return best;
+}
+static NSString *expStepDesc(NSDictionary *st) {
+    NSString *a = st[@"a"] ?: @"", *t = st[@"t"] ?: @"";
+    if ([a isEqualToString:@"open_app"]) return [NSString stringWithFormat:@"打开 App「%@」", st[@"name"] ?: @""];
+    if ([a isEqualToString:@"tap"]) return t.length ? [NSString stringWithFormat:@"点击「%@」", t] : @"点击一个没有文字的图标";
+    if ([a isEqualToString:@"double_tap"]) return t.length ? [NSString stringWithFormat:@"双击「%@」", t] : @"双击";
+    if ([a isEqualToString:@"long_press"]) return t.length ? [NSString stringWithFormat:@"长按「%@」", t] : @"长按";
+    if ([a isEqualToString:@"input_text"]) return [NSString stringWithFormat:@"在%@输入「%@」", t.length ? [NSString stringWithFormat:@"「%@」", t] : @"输入框", st[@"text"] ?: @""];
+    if ([a isEqualToString:@"swipe"]) return @"滑动";
+    if ([a isEqualToString:@"home"]) return @"回主屏幕";
+    if ([a isEqualToString:@"back"]) return @"返回";
+    if ([a isEqualToString:@"ask_user"]) return [NSString stringWithFormat:@"请用户处理:%@", st[@"text"] ?: @""];
+    return a;
+}
+// 给模型的参考:最相似的两条成功经验(相似度 >= 0.3)
+static NSString *expHintFor(NSString *task) {
+    if (!expEnabled() || !task.length) return @"";
+    NSMutableArray *scored = [NSMutableArray array];
+    for (NSDictionary *e in expLoad()) {
+        double sc = expSim(task, e[@"task"]);
+        if (sc >= 0.3) [scored addObject:@{@"s": @(sc), @"e": e}];
+    }
+    [scored sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return [b[@"s"] compare:a[@"s"]]; }];
+    if (!scored.count) return @"";
+    NSMutableString *h = [NSMutableString stringWithString:@"过往成功经验(仅供参考,界面可能已经变化,一切以当前截图为准):"];
+    for (NSUInteger i = 0; i < MIN((NSUInteger)2, scored.count); i++) {
+        NSDictionary *e = scored[i][@"e"];
+        NSArray *steps = e[@"steps"];
+        NSMutableArray *ds = [NSMutableArray array];
+        for (NSUInteger k = 0; k < MIN((NSUInteger)15, steps.count); k++) [ds addObject:[NSString stringWithFormat:@"%lu) %@", (unsigned long)k + 1, expStepDesc(steps[k])]];
+        [h appendFormat:@"\n· 任务「%@」:%@", e[@"task"], [ds componentsJoinedByString:@" "]];
+    }
+    return h;
+}
+static void expRecord(NSDictionary *step) {
+    if (!gExpSteps) gExpSteps = [NSMutableArray array];
+    if (gExpSteps.count < 80) [gExpSteps addObject:step];
+}
+// 屏幕上有代表性的几段文字(用来在回放时核对“现在的屏幕和当时是不是同一个页面”)
+static NSArray *expAnchors(NSArray *items) {
+    NSArray *sorted = [items sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        int ya = [a[@"y"] intValue] / 12, yb = [b[@"y"] intValue] / 12;
+        if (ya != yb) return ya < yb ? NSOrderedAscending : NSOrderedDescending;
+        return [(NSNumber *)a[@"x"] compare:(NSNumber *)b[@"x"]];
+    }];
+    NSCharacterSet *plain = [NSCharacterSet characterSetWithCharactersInString:@"0123456789:%. "];
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSDictionary *it in sorted) {
+        NSString *t = [it[@"text"] description];
+        if (t.length < 2 || t.length > 12 || [out containsObject:t]) continue;
+        if ([t rangeOfCharacterFromSet:plain.invertedSet].location == NSNotFound) continue; // 纯数字/时间/电量
+        [out addObject:t];
+        if (out.count >= 6) break;
+    }
+    return out;
+}
+// 任务结束时存进经验库:成功完成才存;已有几乎相同的经验就合并(留步数更少的那条)
+static void expFinish(NSString *task, NSString *status) {
+    if (!expEnabled()) return;
+    NSMutableArray *all = expLoad();
+    BOOL ok = [status isEqualToString:@"已完成"];
+    NSMutableDictionary *target = nil;
+    if (gExpReplayID.length) for (NSMutableDictionary *e in all) if ([e[@"id"] isEqualToString:gExpReplayID]) target = e;
+    if (!target && ok) {
+        double sc = 0; NSMutableDictionary *best = nil;
+        for (NSMutableDictionary *e in all) { double v = expSim(task, e[@"task"]); if (v > sc) { sc = v; best = e; } }
+        if (best && sc >= 0.9) target = best;
+    }
+    if (target) {
+        if (gExpReplayAborted) target[@"fail"] = @([target[@"fail"] intValue] + 1);
+        else if (ok) target[@"ok"] = @([target[@"ok"] intValue] + 1);
+        if (ok && gExpSteps.count >= 2 && gExpSteps.count < [target[@"steps"] count]) target[@"steps"] = [gExpSteps copy];
+        if ([target[@"fail"] intValue] >= 3 && [target[@"fail"] intValue] > [target[@"ok"] intValue]) [all removeObject:target]; // 老是失效的经验自动淘汰
+    } else if (ok && gExpSteps.count >= 2 && gExpSteps.count <= 60) {
+        [all addObject:[@{@"id": [NSUUID UUID].UUIDString, @"task": task ?: @"", @"created": @([NSDate date].timeIntervalSince1970),
+                          @"used": @0, @"ok": @1, @"fail": @0, @"steps": [gExpSteps copy]} mutableCopy]];
+    }
+    while (all.count > 100) [all removeObjectAtIndex:0];
+    expSave(all);
 }
 
 static NSString *gToken;
@@ -707,7 +907,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.8.8", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.9.0", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -788,6 +988,14 @@ static void handleClient(int c) {
         gRunImages = nil; gTaskDisplay = task;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ agentRun(task, base, key, model); });
         sendJSON(c, 200, @{@"ok": @YES, @"task": task});
+    } else if ([path isEqualToString:@"/respond"]) {
+        // 回应“暂停/确认”请求:action = allow|resume(允许/继续) allowall(允许且本次不再问) deny(拒绝) stop(停止任务)
+        NSString *a = q[@"action"] ?: @"";
+        int st = ([a isEqualToString:@"allow"] || [a isEqualToString:@"resume"]) ? PAReqAllow : [a isEqualToString:@"allowall"] ? PAReqAllowAll :
+                 [a isEqualToString:@"deny"] ? PAReqDeny : [a isEqualToString:@"stop"] ? PAReqStop : 0;
+        if (!st) { sendJSON(c, 400, @{@"ok": @NO, @"error": @"action 应为 allow/resume/allowall/deny/stop"}); return; }
+        agentRespond(st);
+        sendJSON(c, 200, @{@"ok": @YES});
     } else if ([path isEqualToString:@"/stop"]) {
         gAgentRunning = NO;
         sendJSON(c, 200, @{@"ok": @YES});
@@ -795,7 +1003,7 @@ static void handleClient(int c) {
         NSArray *lines;
         @synchronized (gLock) { lines = [gAgentLog copy] ?: @[]; }
         NSUInteger n = lines.count > 15 ? lines.count - 15 : 0;
-        sendJSON(c, 200, @{@"ok": @YES, @"running": @(gAgentRunning), @"broadcast": @(broadcastAlive()),
+        sendJSON(c, 200, @{@"ok": @YES, @"running": @(gAgentRunning), @"waiting": @(gReqState == PAReqWaiting), @"broadcast": @(broadcastAlive()),
                            @"log": [lines subarrayWithRange:NSMakeRange(n, lines.count - n)]});
     } else if ([path isEqualToString:@"/ocr"]) {
         NSString *err = nil;
@@ -931,13 +1139,11 @@ static NSDictionary *callLLMOnce(NSString *base, NSString *key, NSString *model,
     // GLM-5.3 系列:思考模式始终开启,思考内容也占 max_tokens,所以要给得足够大;
     // 按智谱文档的推荐参数:temperature 1、top_p 0.95、reasoning_effort max、thinking.clear_thinking false
     BOOL glm = [model.lowercaseString hasPrefix:@"glm"];
-    NSString *systemContent = [messages.firstObject[@"content"] description] ?: @"";
-    BOOL managerRequest = [systemContent containsString:@"手机任务规划器"];
     NSDictionary *body = glm
         ? @{@"model": model, @"messages": messages, @"temperature": @1.0, @"top_p": @0.95, @"max_tokens": @16384,
             @"thinking": @{@"type": @"enabled", @"clear_thinking": @NO}, @"reasoning_effort": @"max"}
         : @{@"model": model, @"messages": messages, @"temperature": @0.1,
-            @"max_tokens": managerRequest ? @3000 : @700, @"response_format": @{ @"type": @"json_object"}};
+            @"max_tokens": @700, @"response_format": @{@"type": @"json_object"}};
     if (glm) r.timeoutInterval = 300;
     r.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
     __block NSData *data = nil; __block NSError *e = nil; __block NSInteger code = 0;
@@ -1003,7 +1209,7 @@ static NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSA
 static NSString *const kAgentSystem =
 @"你是一个控制 iPhone 的视觉智能体。每一步都会收到:任务、最近的动作历史、一张当前屏幕截图(780x1688 像素,图上叠加了红色网格线,每 100 像素一条,边缘标有像素数字),以及本地 OCR 识别出的带编号文字列表。\n"
 @"所有坐标(x,y,x2,y2,以及 OCR 列表里的坐标)都是这张截图的像素坐标:左上角 (0,0),右下角 (780,1688),x 向右,y 向下。请对照网格线和边缘数字估计位置,点击要落在目标元素的中心。\n"
-@"只输出一个 JSON 对象,不要输出其他内容。thought 不超过20个字；visible_text 只抄录关键文字且不超过120字；然后输出 action 和参数。\n"
+@"只输出一个 JSON 对象,不要输出其他内容。thought 不超过20个字；visible_text 只抄录关键文字且不超过120字；target 写这一步要点的按钮/文字名称(没有就留空);risk:如果这一步会对外产生影响或难以撤销(发送消息、发布内容、提交表单、删除、预订、退出登录、授权等),用一句话写明后果,例如“发送消息给张三:今晚吃饭吗”,否则留空；然后输出 action 和参数。\n"
 @"action 可选值:\n"
 @"- tap: 参数 id 或 x,y。点击。目标是 OCR 列表里的文字时,优先只给 id(程序会点该文字的中心,最准);没有文字的图标或空白输入框才给 x,y。\n"
 @"- long_press: 参数 id 或 x,y。长按。\n"
@@ -1014,24 +1220,30 @@ static NSString *const kAgentSystem =
 @"- set_clipboard: 参数 text,可选 app。只把文字放进剪贴板(同样会临时切到 PhoneAgent 再切回),不点击。一般直接用 input_text。\n"
 @"- wait: 等待 1.5 秒。\n"
 @"- done: 参数 text。任务已完成;text 是写给用户看的完整结果(如果任务是查询、总结、比较信息,把得到的信息完整清楚地写在这里)。\n"
-@"- stop: 参数 text。无法继续或需要人工处理。\n"
+@"- stop: 参数 text。确实无法继续时才用。\n"
+@"- ask_user: 参数 text。遇到必须由用户本人处理的情况(登录、输入验证码或密码、人机验证、人脸识别、付款、需要用户在多个选项里做选择等)时用:程序会提醒用户并暂停,用户处理完点“继续”后你会拿到新的屏幕再继续。text 写清楚需要用户做什么。\n"
 @"规则:\n"
 @"1. 有文字的目标一律用 id;只有没有文字的图标/输入框才给 x,y,并对照网格线估计。\n"
-@"2. 涉及花钱或不可逆的操作(结算、支付、提交订单、立即购买、确认付款、转账、删除重要数据)绝不自己点击,立即 stop 并说明;其余任务按要求完成。\n"
+@"2. 付款、转账、输入支付密码这类花钱环节绝不自己点击,用 ask_user 请用户本人完成;发送、发布、提交、删除等有对外影响或难以撤销的操作,必须在 risk 里写明后果(程序会先征得用户同意);其余任务按要求完成。\n"
 @"3. 每步只做一个动作。\n"
 @"4. 屏幕连续没变化就换一种办法,仍不行就 stop。\n"
 @"5. 看不到想要的内容时,先上滑或换搜索词,不要重复无效动作。\n"
-@"6. visible_text 必须如实抄录截图中的关键文字,如果看到支付密码、付款、结算、提交订单等内容,action 必须为 stop。\n"
+@"6. visible_text 必须如实抄录截图中的关键文字;如果看到输入支付密码、确认付款等付款界面,action 用 ask_user 请用户本人完成。\n"
 @"7. 找不到 App 时,先按 open_app 返回的已安装 App 列表换准确名称重试;仍找不到时程序会自动回主屏幕并左滑进入 App 资源库,这时点顶部搜索框,用 input_text 输入 App 名称搜索,再点搜索结果打开。\n"
-@"8. input_text 由程序自己完成粘贴;如果下一张截图里输入框仍是空的,再次使用 input_text,并确认 id 或 x,y 指向的是输入框。";
+@"8. input_text 由程序自己完成粘贴;如果下一张截图里输入框仍是空的,再次使用 input_text,并确认 id 或 x,y 指向的是输入框。\n"
+@"9. 遇到登录、验证码、人机验证、人脸识别、需要用户在多个选项里做选择时,用 ask_user,不要 stop。";
 
 static NSString *memoryText(void) { return [NSUserDefaults.standardUserDefaults stringForKey:@"memory_text"] ?: @""; }
 
 // 把用户的"记忆/偏好"附在系统提示词后面
 static NSString *systemPromptWithMemory(void) {
+    NSMutableString *p = [kAgentSystem mutableCopy];
     NSString *m = [memoryText() stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    if (!m.length) return kAgentSystem;
-    return [kAgentSystem stringByAppendingFormat:@"\n\n用户的偏好与记忆(执行任务时请参考;如果和本次任务的明确要求冲突,以本次任务为准):\n%@", m];
+    if (m.length) [p appendFormat:@"\n\n用户的偏好与记忆(执行任务时请参考;如果和本次任务的明确要求冲突,以本次任务为准):\n%@", m];
+    NSArray *bl = blockedApps();
+    if (bl.count) [p appendFormat:@"\n\n禁止进入的 App(绝对不要打开,也不要通过链接、搜索或分享进入;名称或包名里含有这些词的都算):%@", [bl componentsJoinedByString:@"、"]];
+    if (gExpHint.length) [p appendFormat:@"\n\n%@", gExpHint];
+    return p;
 }
 
 static NSArray *visionMessages(NSString *task, NSString *history, UIImage *img, NSString **err) {
@@ -1365,7 +1577,7 @@ static NSString *const kAGPrompt =
 @"\n"
 @"补充说明（当前设备是 iPhone）：\n"
 @"- iPhone 没有系统返回键，Back 会由程序点击左上角返回按钮来实现；Type 由程序通过剪贴板粘贴来实现，无需关心键盘。\n"
-@"- 涉及支付、转账、提交订单等花钱操作，不要自己点击，请 finish 并说明已到达该步骤；其余任务正常完成。\n"
+@"- 涉及支付、转账、输入支付密码等花钱环节，不要自己点击，用 do(action=\"Take_over\", message=\"需要你本人完成付款\") 请用户本人完成；其余任务正常完成。\n"
 @"- finish 的 message 请写成给用户看的完整结果（如果任务是查询或总结信息，把信息完整写在 message 里）。";
 
 // 已安装 App 的 bundle id -> 显示名(只查一次)
@@ -1397,7 +1609,10 @@ static NSString *agSystemPrompt(void) {
     f.dateFormat = @"yyyy年MM月dd日 EEEE";
     NSString *mem = [memoryText() stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     NSString *memPart = mem.length ? [NSString stringWithFormat:@"\n\n用户的偏好与记忆（执行任务时请参考；与本次任务冲突时以本次任务为准）：\n%@", mem] : @"";
-    return [NSString stringWithFormat:@"今天的日期是: %@\n%@%@", [f stringFromDate:[NSDate date]], kAGPrompt, memPart];
+    NSArray *bl = blockedApps();
+    NSString *blPart = bl.count ? [NSString stringWithFormat:@"\n\n禁止进入的 App（绝对不要打开）：%@", [bl componentsJoinedByString:@"、"]] : @"";
+    NSString *hintPart = gExpHint.length ? [@"\n\n" stringByAppendingString:gExpHint] : @"";
+    return [NSString stringWithFormat:@"今天的日期是: %@\n%@%@%@%@", [f stringFromDate:[NSDate date]], kAGPrompt, memPart, blPart, hintPart];
 }
 
 // 从 do(action="Tap", text="xxx") 这样的文本里取字符串参数
@@ -1593,6 +1808,216 @@ static NSString *agGoBack(NSArray *items) {
     return @"点击了左上角返回箭头的常见位置";
 }
 
+#pragma mark - 需要用户参与(暂停 / 确认)、敏感操作与禁止 App、经验库回放
+
+static void postRequestNotification(NSString *kind, NSString *text) {
+    BOOL confirm = [kind isEqualToString:@"confirm"];
+    UNMutableNotificationContent *n = [UNMutableNotificationContent new];
+    n.title = confirm ? @"PhoneAgent 需要你确认" : @"PhoneAgent 任务已暂停";
+    n.body = text;
+    n.sound = UNNotificationSound.defaultSound;
+    n.categoryIdentifier = confirm ? @"PA_CONFIRM" : @"PA_PAUSE";
+    [UNUserNotificationCenter.currentNotificationCenter addNotificationRequest:[UNNotificationRequest requestWithIdentifier:@"pa.req" content:n trigger:nil] withCompletionHandler:nil];
+}
+static void clearRequestNotification(void) {
+    UNUserNotificationCenter *c = UNUserNotificationCenter.currentNotificationCenter;
+    [c removeDeliveredNotificationsWithIdentifiers:@[@"pa.req"]];
+    [c removePendingNotificationRequestsWithIdentifiers:@[@"pa.req"]];
+}
+
+// 请用户参与:kind = "pause"(登录/验证码/付款等要用户本人处理)或 "confirm"(发送/发布/删除等敏感操作要先同意)。
+// 同时用 界面弹窗 + 通知(带按钮,不用离开当前 App)+ 语音 提醒;一直等到用户回应(最多 30 分钟)。
+// 返回:1 = 允许/继续,0 = 拒绝(跳过这一步),-1 = 停止任务
+static int agentAsk(NSString *kind, NSString *text) {
+    BOOL confirm = [kind isEqualToString:@"confirm"];
+    NSString *selfID = NSBundle.mainBundle.bundleIdentifier;
+    NSString *pausedApp = frontmostBundleID();
+    gReqKind = kind; gReqText = text; gReqState = PAReqWaiting;
+    agentSay([NSString stringWithFormat:@"%@:%@", confirm ? @"等待你确认" : @"任务已暂停,等你处理", text]);
+    [NSNotificationCenter.defaultCenter postNotificationName:@"pa.request" object:@{@"kind": kind, @"text": text}];
+    postRequestNotification(kind, text);
+    [NSNotificationCenter.defaultCenter postNotificationName:@"pa.speak"
+        object:confirm ? [NSString stringWithFormat:@"需要你确认:%@", text] : [NSString stringWithFormat:@"需要你处理:%@。处理完点继续。", text]];
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+    while (gAgentRunning && gReqState == PAReqWaiting && CFAbsoluteTimeGetCurrent() - t0 < 1800) usleep(300 * 1000);
+    int st = gReqState;
+    gReqState = PAReqNone;
+    clearRequestNotification();
+    [NSNotificationCenter.defaultCenter postNotificationName:@"pa.requestDone" object:nil];
+    if (!gAgentRunning) return -1;
+    if (st == PAReqStop) { agentSay(@"任务已被停止"); return -1; }
+    if (st == PAReqWaiting || st == PAReqNone) { agentSay(@"任务停止:等待你回应超过 30 分钟"); return -1; }
+    if (st == PAReqAllowAll) gConfirmSkipThisTask = YES;
+    // 用户可能为了点通知/弹窗切到了 PhoneAgent:回到原来的 App
+    if (pausedApp.length && ![pausedApp isEqualToString:selfID]) {
+        NSString *now = frontmostBundleID();
+        if (now.length && ![now isEqualToString:pausedApp]) { openApp(pausedApp); sleep(2); }
+    }
+    return (st == PAReqAllow || st == PAReqAllowAll) ? 1 : 0;
+}
+
+// 点击前的敏感检查:0 = 可以执行,1 = 用户拒绝/已由用户本人处理(跳过这一步,原因在 skipNote),-1 = 停止任务
+static int guardSensitiveTap(NSString *target, NSString *risk, NSArray *items, double x, double y, NSString **skipNote) {
+    int cat = 0;
+    NSString *hit = classifyAction(target, risk, items, x, y, &cat);
+    if (!hit) return 0;
+    NSString *tgt = target.length ? target : @"屏幕上的这个位置";
+    if (cat == 2) {
+        int r = agentAsk(@"pause", [NSString stringWithFormat:@"要点击「%@」,涉及付款或转账。为了安全我不会自动操作,请你本人完成;处理完点“继续”。", tgt]);
+        if (r < 0) return -1;
+        *skipNote = [NSString stringWithFormat:@"这一步涉及付款(「%@」),已由用户本人处理,没有点击;请根据新的屏幕继续", tgt];
+        return 1;
+    }
+    if (cat == 1 && !gConfirmSkipThisTask) {
+        NSString *app = agAppName(frontmostBundleID());
+        int r = agentAsk(@"confirm", [NSString stringWithFormat:@"在「%@」里要点击「%@」%@%@", app, tgt, risk.length ? @"。后果:" : @"", risk ?: @""]);
+        if (r < 0) return -1;
+        if (r == 0) { *skipNote = [NSString stringWithFormat:@"用户拒绝了点击「%@」,没有执行;请换一种方式或结束任务", tgt]; return 1; }
+    }
+    return 0;
+}
+
+// 最前台是禁止进入的 App:退回主屏幕,返回那个 App 的名字;不是就返回 nil
+static NSString *enforceBlockedFront(void) {
+    NSString *fbid = frontmostBundleID();
+    if (!fbid.length || [fbid isEqualToString:NSBundle.mainBundle.bundleIdentifier]) return nil;
+    NSString *fname = agAppName(fbid);
+    if (!isBlockedApp(fname, fbid)) return nil;
+    NSString *hn = nil;
+    goHome(&hn);
+    return fname;
+}
+
+static NSArray *agScreenItems(NSString **err) {
+    waitForStableFrame(2.0);
+    UIImage *img = takeScreenshot(err);
+    return img ? ocrImage(img, err) : nil;
+}
+
+// ---- 经验库回放 ----
+static NSDictionary *expFindItem(NSArray *items, NSString *t, double rx, double ry) {
+    if (!t.length) return nil;
+    NSDictionary *best = nil; double bd = 1e9; int bestRank = 9;
+    for (NSDictionary *it in items) {
+        NSString *x = it[@"text"];
+        if (!x.length) continue;
+        int rank = [x isEqualToString:t] ? 0 : ([x containsString:t] ? 1 : ((x.length >= 2 && [t containsString:x]) ? 2 : 9));
+        if (rank == 9) continue;
+        double d = fabs([it[@"x"] doubleValue] - rx) + fabs([it[@"y"] doubleValue] - ry);
+        if (rank < bestRank || (rank == bestRank && d < bd)) { best = it; bestRank = rank; bd = d; }
+    }
+    return best;
+}
+static int expAnchorHits(NSArray *items, NSArray *anchors) {
+    int hits = 0;
+    for (NSString *a in anchors)
+        for (NSDictionary *it in items) {
+            NSString *x = it[@"text"];
+            if ([x containsString:a] || (x.length >= 2 && [a containsString:x])) { hits++; break; }
+        }
+    return hits;
+}
+
+// 按记录的步骤快速回放;每一步先核对屏幕、用屏幕上的文字重新定位按钮,对不上就中止交给模型。
+// 返回:0 = 全部回放完,1 = 中途中止(原因在 *why),-1 = 用户停止了任务
+static int expReplay(NSDictionary *entry, NSMutableArray *history, int *done, NSString **why) {
+    NSArray *steps = entry[@"steps"];
+    CGSize sc = screenSize();
+    *done = 0;
+    for (NSUInteger i = 0; i < steps.count && gAgentRunning; i++) {
+        NSDictionary *st = steps[i];
+        NSString *a = st[@"a"] ?: @"";
+        NSString *blocked = enforceBlockedFront();
+        if (blocked) { *why = [NSString stringWithFormat:@"进入了禁止进入的 App「%@」,已退回主屏幕", blocked]; return 1; }
+        if ([a isEqualToString:@"open_app"]) {
+            NSString *name = st[@"name"] ?: @"", *info = nil;
+            NSString *bid = bundleForAppName(name, &info);
+            if (!bid) { *why = [NSString stringWithFormat:@"找不到 App「%@」", name]; return 1; }
+            if (isBlockedApp(name, nil) || isBlockedApp(agAppName(bid), bid)) { *why = [NSString stringWithFormat:@"「%@」是禁止进入的 App", name]; return 1; }
+            if (!openApp(bid)) { *why = [NSString stringWithFormat:@"打开「%@」失败", name]; return 1; }
+            gLastApp = bid;
+            sleep(3);
+        } else if ([a isEqualToString:@"tap"] || [a isEqualToString:@"long_press"] || [a isEqualToString:@"double_tap"] || [a isEqualToString:@"input_text"]) {
+            NSString *e = nil;
+            NSArray *items = agScreenItems(&e);
+            NSArray *anchors = st[@"anchors"] ?: @[];
+            if (!items.count) { *why = @"屏幕上识别不到文字,无法核对"; return 1; }
+            if (paySheetVisible(items)) {
+                int r = agentAsk(@"pause", @"看到支付/密码界面。为了安全我不会自动付款,请你本人完成;处理完点“继续”。");
+                if (r < 0) return -1;
+                *why = @"出现了支付界面,已由用户本人处理";
+                return 1;
+            }
+            if (anchors.count >= 2) {
+                int hits = expAnchorHits(items, anchors);
+                if (hits * 2 < (int)anchors.count) { *why = [NSString stringWithFormat:@"屏幕和记录时对不上(核对 %d/%lu)", hits, (unsigned long)anchors.count]; return 1; }
+            }
+            NSString *t = st[@"t"] ?: @"";
+            double rx = [st[@"x"] doubleValue], ry = [st[@"y"] doubleValue], x = rx, y = ry;
+            if (t.length) {
+                NSDictionary *it = expFindItem(items, t, rx, ry);
+                if (!it) { *why = [NSString stringWithFormat:@"屏幕上没找到「%@」", t]; return 1; }
+                x = [it[@"x"] doubleValue]; y = [it[@"y"] doubleValue];
+            } else {
+                int hits = expAnchorHits(items, anchors);
+                if (anchors.count < 3 || hits * 10 < (int)anchors.count * 7) { *why = @"这一步点的是没有文字的图标,屏幕核对不够确定"; return 1; }
+            }
+            x = MAX(0, MIN(sc.width - 1, x)); y = MAX(0, MIN(sc.height - 1, y));
+            if ([a isEqualToString:@"input_text"]) {
+                NSString *note = nil;
+                if (!agPasteText(st[@"text"] ?: @"", x, y, nil, &note)) { *why = [@"输入失败:" stringByAppendingString:note ?: @""]; return 1; }
+            } else {
+                NSString *skip = nil;
+                int g = guardSensitiveTap(t, @"", items, x, y, &skip);
+                if (g < 0) return -1;
+                if (g > 0) { *why = skip ?: @"这一步被用户拒绝或由用户本人处理"; return 1; }
+                if ([a isEqualToString:@"tap"]) doTap(x, y);
+                else if ([a isEqualToString:@"long_press"]) doLongPress(x, y, 1100);
+                else { doTap(x, y); usleep(120 * 1000); doTap(x, y); }
+                sleep(2);
+            }
+        } else if ([a isEqualToString:@"swipe"]) {
+            doSwipe([st[@"x1"] doubleValue], [st[@"y1"] doubleValue], [st[@"x2"] doubleValue], [st[@"y2"] doubleValue], 20, 350);
+            sleep(2);
+        } else if ([a isEqualToString:@"home"]) {
+            NSString *hn = nil; goHome(&hn); sleep(1);
+        } else if ([a isEqualToString:@"back"]) {
+            NSString *e = nil; NSArray *items = agScreenItems(&e);
+            agGoBack(items); sleep(2);
+        } else if ([a isEqualToString:@"ask_user"]) {
+            int r = agentAsk(@"pause", st[@"text"] ?: @"需要你处理");
+            if (r < 0) return -1;
+        }
+        (*done)++;
+        [history addObject:[NSString stringWithFormat:@"[经验回放] %lu. %@", (unsigned long)i + 1, expStepDesc(st)]];
+        expRecord(st); // 已回放的步骤也算进本次轨迹,成功后一起存
+    }
+    return gAgentRunning ? 0 : -1;
+}
+
+// 在模型开始之前调用:任务和某条经验几乎相同(相似度 >= 0.85)就先快速回放,再交给模型接手核对、读取最终内容。
+// 返回给模型看的一句说明;没有可用经验返回 nil;用户停止了任务时 *stopped = YES
+static NSString *expTryReplay(NSString *task, NSMutableArray *history, BOOL *stopped) {
+    *stopped = NO;
+    if (!expEnabled() || !expReplayEnabled()) return nil;
+    double score = 0;
+    NSMutableDictionary *e = expFind(task, &score);
+    if (!e || score < 0.85 || [e[@"steps"] count] < 2) return nil;
+    NSMutableArray *all = expLoad();
+    for (NSMutableDictionary *x in all) if ([x[@"id"] isEqualToString:e[@"id"]]) x[@"used"] = @([x[@"used"] intValue] + 1);
+    expSave(all);
+    gExpReplayID = e[@"id"];
+    agentSay([NSString stringWithFormat:@"经验库:找到几乎相同的成功经验(相似度 %.0f%%,%lu 步),先快速回放,再由模型接手核对", score * 100, (unsigned long)[e[@"steps"] count]]);
+    int done = 0; NSString *why = nil;
+    int r = expReplay(e, history, &done, &why);
+    if (r < 0) { *stopped = YES; return nil; }
+    NSString *summary;
+    if (r == 0) summary = [NSString stringWithFormat:@"经验库已回放 %d 步(全部完成)。", done];
+    else { gExpReplayAborted = YES; summary = [NSString stringWithFormat:@"经验库回放了 %d 步后中止:%@。", done, why ?: @"屏幕对不上"]; }
+    agentSay(summary);
+    return summary;
+}
+
 static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSString *model) {
     gAgentRunning = YES;
     if (!base.length || [base.lowercaseString containsString:@"deepseek"]) {
@@ -1606,6 +2031,13 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
     int same = 0, parseFails = 0;
     double lastX = -1, lastY = -1;
     agentSay([NSString stringWithFormat:@"任务开始[AutoGLM %@]:%@", model, task]);
+    int blockedHits = 0;
+    {   // 经验库:几乎相同的任务先快速回放,再交给模型
+        BOOL replayStopped = NO;
+        NSString *replaySummary = expTryReplay(gTaskDisplay.length ? gTaskDisplay : task, [NSMutableArray array], &replayStopped);
+        if (replayStopped) { agentSay(@"任务已被停止"); gAgentRunning = NO; return; }
+        if (replaySummary.length) pendingNote = [NSString stringWithFormat:@"(系统提示:%@请根据当前截图核对任务是否已经完成:没完成就继续做,完成了就 finish 并写出结果。)", replaySummary];
+    }
     for (int step = 1; gAgentRunning; step++) { // 不限步数,靠"停止任务"和卡死检测结束
         waitForStableFrame(3.0);
         NSString *err = nil;
@@ -1614,7 +2046,21 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
         // 本地 OCR 不发给模型,只用来做支付拦截和辅助动作
         UIImage *img = takeScreenshot(&err);
         NSArray *items = img ? ocrImage(img, &err) : nil;
-        if (items.count && paySheetVisible(items)) { agentSay(@"本地 OCR 看到支付/密码界面,已停止,请手动处理"); break; }
+        NSString *blockedName = enforceBlockedFront();
+        if (blockedName) {
+            agentSay([NSString stringWithFormat:@"安全:当前在禁止进入的 App「%@」,已自动退回主屏幕", blockedName]);
+            pendingNote = [NSString stringWithFormat:@"(系统提示:程序发现进入了禁止进入的 App「%@」,已退回主屏幕;不要再打开它。)", blockedName];
+            if (++blockedHits >= 4) { agentSay(@"任务停止:多次进入禁止进入的 App,已停止"); break; }
+            lastSig = @""; same = 0;
+            continue;
+        }
+        if (items.count && paySheetVisible(items)) {
+            int r = agentAsk(@"pause", @"看到支付/密码界面。为了安全我不会自动付款,请你本人完成;处理完点“继续”(或点“停止任务”)。");
+            if (r < 0) break;
+            pendingNote = @"(系统提示:出现过支付界面,用户已本人处理后点了继续,请根据当前截图继续。)";
+            lastSig = @""; same = 0;
+            continue;
+        }
         NSString *sig = agFrameSig(jpg);
         if ([sig isEqualToString:lastSig]) same++; else same = 0;
         lastSig = sig;
@@ -1668,18 +2114,24 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
 
         if ([act isEqualToString:@"tap"] || [act isEqualToString:@"long press"] || [act isEqualToString:@"double tap"]) {
             if (!hasEl) { pendingNote = @"(系统提示:动作缺少 element=[x,y] 坐标。)"; continue; }
-            if (agArg(action, @"message").length) { agentSay(@"模型要点击敏感按钮(支付/隐私),已停止,请你手动确认"); break; }
-            NSString *danger = items.count ? dangerNear(items, x, y) : nil;
-            if (danger) { agentSay([NSString stringWithFormat:@"拦截:要点击的位置是「%@」,属于支付/结算,已停止,请手动操作", danger]); break; }
+            NSString *near = nearestItemText(items, x, y);
+            NSString *risk = agArg(action, @"message").length ? @"模型标注为重要操作(支付/隐私等)" : @"";
+            NSString *skip = nil;
+            int g = guardSensitiveTap(near, risk, items.count ? items : nil, x, y, &skip);
+            if (g < 0) break;
+            if (g > 0) { agentSay([@"提示:" stringByAppendingString:skip ?: @"这一步被跳过"]); pendingNote = [NSString stringWithFormat:@"(系统提示:%@)", skip ?: @"这一步被跳过"]; continue; }
             if ([act isEqualToString:@"tap"]) doTap(x, y);
             else if ([act isEqualToString:@"long press"]) doLongPress(x, y, 1100);
             else { doTap(x, y); usleep(120 * 1000); doTap(x, y); }
             lastX = x; lastY = y;
+            expRecord(@{@"a": [act isEqualToString:@"tap"] ? @"tap" : ([act isEqualToString:@"long press"] ? @"long_press" : @"double_tap"),
+                        @"t": near, @"x": @(x), @"y": @(y), @"anchors": items.count ? expAnchors(items) : @[]});
             sleep(2);
         } else if ([act isEqualToString:@"swipe"]) {
             double sx = 0, sy = 0;
             if (!agPoint(action, @"start", &sx, &sy) || !agPoint(action, @"end", &bx, &by)) { pendingNote = @"(系统提示:Swipe 缺少 start/end 坐标。)"; continue; }
             doSwipe(sx / 1000.0 * sc.width, sy / 1000.0 * sc.height, bx / 1000.0 * sc.width, by / 1000.0 * sc.height, 20, 350);
+            expRecord(@{@"a": @"swipe", @"x1": @(sx / 1000.0 * sc.width), @"y1": @(sy / 1000.0 * sc.height), @"x2": @(bx / 1000.0 * sc.width), @"y2": @(by / 1000.0 * sc.height), @"anchors": items.count ? expAnchors(items) : @[]});
             sleep(2);
         } else if ([act isEqualToString:@"type"] || [act isEqualToString:@"type_name"]) {
             NSString *t = agArg(action, @"text") ?: @"";
@@ -1688,14 +2140,18 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
             if (!agPasteText(t, lastX, lastY, nil, &note)) {
                 agentSay([@"提示:输入失败:" stringByAppendingString:note ?: @"?"]);
                 pendingNote = [NSString stringWithFormat:@"(系统提示:Type 失败:%@。请重新点击输入框后再试。)", note ?: @""];
-            } else if (note.length) {
-                pendingNote = [NSString stringWithFormat:@"(系统提示:已执行输入,但%@。请看当前截图;输入框是空的就重新点击输入框后再 Type。)", note];
+            } else {
+                expRecord(@{@"a": @"input_text", @"text": t, @"t": nearestItemText(items, lastX, lastY), @"x": @(lastX), @"y": @(lastY), @"anchors": items.count ? expAnchors(items) : @[]});
+                if (note.length) pendingNote = [NSString stringWithFormat:@"(系统提示:已执行输入,但%@。请看当前截图;输入框是空的就重新点击输入框后再 Type。)", note];
             }
         } else if ([act isEqualToString:@"launch"]) {
             NSString *name = agArg(action, @"app") ?: @"";
             NSString *i2 = nil;
             NSString *bid = bundleForAppName(name, &i2);
-            if (bid && openApp(bid)) { gLastApp = bid; lastX = lastY = -1; }
+            if (isBlockedApp(name, nil) || (bid && isBlockedApp(agAppName(bid), bid))) {
+                agentSay([NSString stringWithFormat:@"安全:「%@」是禁止进入的 App,已拒绝打开", name]);
+                pendingNote = [NSString stringWithFormat:@"(系统提示:「%@」在用户设置的禁止进入的 App 列表里,不能打开。请换别的方式完成任务,或用 Take_over 说明。)", name];
+            } else if (bid && openApp(bid)) { gLastApp = bid; lastX = lastY = -1; expRecord(@{@"a": @"open_app", @"name": name}); }
             else {
                 agentSay([@"提示:" stringByAppendingString:i2 ?: @"打开失败"]);
                 NSString *ln = nil;
@@ -1705,19 +2161,25 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
             sleep(3);
         } else if ([act isEqualToString:@"back"]) {
             agentSay([@"返回:" stringByAppendingString:agGoBack(items)]);
+            expRecord(@{@"a": @"back"});
             sleep(2);
         } else if ([act isEqualToString:@"home"]) {
             NSString *hn = nil;
             goHome(&hn);
             lastX = lastY = -1;
+            expRecord(@{@"a": @"home"});
             sleep(1);
         } else if ([act isEqualToString:@"wait"]) {
             NSString *d = agArg(action, @"duration") ?: @"2";
             int secs = MAX(1, MIN(10, [d intValue]));
             sleep(secs);
         } else if ([act isEqualToString:@"take_over"] || [act isEqualToString:@"interact"]) {
-            agentSay([NSString stringWithFormat:@"需要你来处理:%@", agArg(action, @"message") ?: ([act isEqualToString:@"interact"] ? @"有多个选项需要你选择" : @"")]);
-            break;
+            NSString *msg = agArg(action, @"message") ?: ([act isEqualToString:@"interact"] ? @"有多个选项需要你选择" : @"需要你协助(登录、验证等)");
+            int r = agentAsk(@"pause", msg);
+            if (r < 0) break;
+            expRecord(@{@"a": @"ask_user", @"text": msg});
+            pendingNote = @"(系统提示:用户已手动处理完毕并点了继续,请根据当前截图继续任务。)";
+            lastSig = @""; same = 0;
         } else if ([act isEqualToString:@"note"] || [act isEqualToString:@"call_api"]) {
             // 记录/总结类动作:这里不需要额外操作
         } else {
@@ -1860,6 +2322,9 @@ static void requestBroadcastStop(void) {
 static void taskRunBegin(NSString *task) {
     @synchronized (gLock) { [gRunLog removeAllObjects]; gTaskStatus = @""; gTaskResultText = @""; }
     gAgentRunning = YES; // 从这里开始就算"任务进行中"(包括自动开启录屏的阶段)
+    gExpSteps = [NSMutableArray array]; gExpReplayID = nil; gExpReplayAborted = NO;
+    gConfirmSkipThisTask = NO; gReqState = PAReqNone;
+    gExpHint = expHintFor(gTaskDisplay.length ? gTaskDisplay : task); // 相似的过往经验,作为参考提示给模型
     taskAwakeStart();
 }
 
@@ -1872,6 +2337,7 @@ static void taskRunEnd(NSString *task, BOOL stopCast) {
     if (!status.length) status = @"已结束";
     if (!result.length) result = @"(模型没有给出结果文字,详见下面的执行记录)";
     NSString *shown = gTaskDisplay.length ? gTaskDisplay : task;
+    expFinish(shown, status); // 成功完成的任务存进经验库
     NSString *text = [NSString stringWithFormat:@"【任务】\n%@\n\n【状态】%@\n\n【结果】\n%@\n\n【执行记录】\n%@",
                       shown, status, result, [lines componentsJoinedByString:@"\n"]];
     gLastResultText = text;
@@ -1901,134 +2367,7 @@ static void taskRunEnd(NSString *task, BOOL stopCast) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ memoryLearn(shownCopy, resultCopy); });
 }
 
-
-#pragma mark - Mobilerun-style Manager planning mode
-
-static NSString *const kPlanManagerSystem =
-@"你是手机任务规划器。你不直接点击屏幕，也不输出坐标。\n"
-@"请把用户任务拆成最多 6 个按顺序执行的子目标。每个子目标必须包含 id、goal、success_condition 和 risk。\n"
-@"risk 只能是 low、confirm 或 blocked。涉及付款、转账、删除、发布、提交订单、隐私授权时必须使用 confirm。\n"
-@"只输出 JSON，不要输出 Markdown，不要输出解释。格式必须是："
-@"{\"plan\":[{\"id\":\"...\",\"goal\":\"...\",\"success_condition\":\"...\",\"risk\":\"low\"}],\"current_step_id\":\"...\",\"done\":false,\"stop_condition\":\"...\"}";
-
-static void agentRunDirect(NSString *task, NSString *base, NSString *key, NSString *model);
-static NSDictionary *gManagerPlan;
-
-static BOOL planLooksUsable(NSDictionary *plan) {
-    NSArray *steps = plan[@"plan"];
-    if (![steps isKindOfClass:NSArray.class] || steps.count == 0 || steps.count > 8) return NO;
-    for (NSDictionary *step in steps) {
-        if (![step isKindOfClass:NSDictionary.class] ||
-            ![step[@"goal"] isKindOfClass:NSString.class] ||
-            ![step[@"success_condition"] isKindOfClass:NSString.class]) return NO;
-    }
-    return YES;
-}
-
-static NSDictionary *makeManagerPlan(NSString *task, NSString *base, NSString *key, NSString *model, NSString **err) {
-    NSString *shotErr = nil;
-    UIImage *img = takeScreenshot(&shotErr);
-    NSArray *items = img ? (ocrImage(img, nil) ?: @[]) : @[];
-    NSMutableString *ocr = [NSMutableString string];
-    NSInteger n = 0;
-    for (NSDictionary *it in items) {
-        if (++n > 50) break;
-        NSString *t = [it[@"text"] description] ?: @"";
-        if (t.length > 50) t = [t substringToIndex:50];
-        [ocr appendFormat:@"[%ld] %@\n", (long)n, t];
-    }
-    if (!ocr.length) [ocr appendString:@"(当前页面没有识别到文字)"];
-    NSString *front = frontmostBundleID() ?: @"未知";
-    NSString *user = [NSString stringWithFormat:
-        @"用户任务：%@\n当前 App：%@\n当前页面 OCR：\n%@\n请生成执行计划。",
-        task, front, ocr];
-    NSArray *messages = @[
-        @{ @"role": @"system", @"content": kPlanManagerSystem },
-        @{ @"role": @"user", @"content": user }
-    ];
-    NSDictionary *plan = callLLM(base, key, model, messages, err);
-    if (!planLooksUsable(plan)) {
-        if (err && !*err) *err = @"规划器返回的计划格式不正确";
-        return nil;
-    }
-    return plan;
-}
-
-static NSString *taskWithManagerPlan(NSString *task, NSDictionary *plan) {
-    NSArray *steps = plan[@"plan"];
-    if (![steps isKindOfClass:NSArray.class] || !steps.count) return task;
-    NSMutableString *route = [NSMutableString string];
-    NSInteger n = 0;
-    for (NSDictionary *step in steps) {
-        NSString *goal = [step[@"goal"] description] ?: @"";
-        NSString *ok = [step[@"success_condition"] description] ?: @"";
-        NSString *risk = [step[@"risk"] description] ?: @"low";
-        if (++n > 8) break;
-        [route appendFormat:@"%ld. 目标:%@；完成判断:%@；风险:%@\n", (long)n, goal, ok, risk];
-    }
-    return [NSString stringWithFormat:
-        @"%@\n\n【Manager 只读路线图】\n%@\n【Executor 强制规则】\n路线图只是执行上下文，不是回复格式，也不是新的任务。你现在必须根据当前截图只返回一个原子动作 JSON。绝对不要返回 plan、steps 或任务计划 JSON。回复必须符合系统提示中的 action 格式；每次只执行一个动作，完成当前目标后再继续下一个。每次动作后检查页面是否满足对应的完成判断。遇到付款、转账、删除、发布或授权时必须 stop 并说明。",
-        task, route];
-}
-
-static NSDictionary *managerReplan(NSString *task, NSDictionary *oldPlan, NSArray *items,
-                                   NSString *history, NSString *base, NSString *key, NSString *model,
-                                   NSString **err) {
-    NSData *planData = [NSJSONSerialization dataWithJSONObject:oldPlan ?: @{} options:0 error:nil];
-    NSString *oldText = planData.length ? [[NSString alloc] initWithData:planData encoding:NSUTF8StringEncoding] : @"{}";
-    NSMutableString *ocr = [NSMutableString string];
-    NSInteger n = 0;
-    for (NSDictionary *it in items) {
-        if (++n > 80) break;
-        NSString *t = [it[@"text"] description] ?: @"";
-        if (t.length > 60) t = [t substringToIndex:60];
-        [ocr appendFormat:@"[%ld] %@\n", (long)n, t];
-    }
-    if (!ocr.length) [ocr appendString:@"(当前页面没有识别到文字)"];
-    NSString *user = [NSString stringWithFormat:
-        @"原始任务：%@\n当前计划：%@\n最近动作及结果：%@\n当前页面 OCR：\n%@\n\n请根据当前页面重新检查计划：如果当前子目标已完成，就把 current_step_id 移到下一个；如果路线不再适用，就修改 plan；如果整个任务完成，设置 done=true。只返回同样的计划 JSON，不要输出动作坐标。",
-        task, oldText, history.length ? history : @"(还没有)", ocr];
-    NSArray *messages = @[
-        @{ @"role": @"system", @"content": kPlanManagerSystem },
-        @{ @"role": @"user", @"content": user }
-    ];
-    NSDictionary *plan = callLLM(base, key, model, messages, err);
-    return planLooksUsable(plan) ? plan : nil;
-}
-
-static void agentRunReasoning(NSString *task, NSString *base, NSString *key, NSString *model) {
-    gAgentRunning = YES;
-    gManagerPlan = nil;
-    agentSay(@"Mobilerun 规划模式: Manager 正在生成任务计划……");
-    NSString *err = nil;
-    NSDictionary *plan = makeManagerPlan(task, base, key, model, &err);
-    if (!plan) {
-        agentSay([NSString stringWithFormat:@"规划器失败,改用直接执行:%@", err ?: @"未知错误"]);
-        if (gAgentRunning) agentRunDirect(task, base, key, model);
-        return;
-    }
-    gManagerPlan = plan;
-    NSArray *steps = plan[@"plan"];
-    agentSay([NSString stringWithFormat:@"Manager 已生成 %lu 个子目标", (unsigned long)steps.count]);
-    for (NSDictionary *step in steps) {
-        NSString *risk = [step[@"risk"] description] ?: @"low";
-        if ([risk isEqualToString:@"confirm"] || [risk isEqualToString:@"blocked"]) {
-            agentSay([NSString stringWithFormat:@"规划包含需要确认的高风险步骤:%@", step[@"goal"] ?: @""]);
-        }
-    }
-    if (gAgentRunning) agentRunDirect(task, base, key, model);
-}
-
 static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString *model) {
-    BOOL reasoning = [NSUserDefaults.standardUserDefaults boolForKey:@"reasoning_mode"];
-    if (reasoning && ![model.lowercaseString containsString:@"autoglm"]) {
-        agentRunReasoning(task, base, key, model);
-    } else {
-        agentRunDirect(task, base, key, model);
-    }
-}
-
-static void agentRunDirect(NSString *task, NSString *base, NSString *key, NSString *model) {
     if ([model.lowercaseString containsString:@"autoglm"]) { agentRunAutoGLM(task, base, key, model); return; }
     gCurrentModel = model;
     gPrevModelJPEG = nil;
@@ -2042,6 +2381,13 @@ static void agentRunDirect(NSString *task, NSString *base, NSString *key, NSStri
     NSString *lastSig = @""; int same = 0;
     CGSize sc = screenSize();
     agentSay([NSString stringWithFormat:@"任务开始:%@", task]);
+    int blockedHits = 0;
+    {   // 经验库:任务和某条成功经验几乎相同时,先快速回放,再由模型接手核对
+        BOOL replayStopped = NO;
+        NSString *replaySummary = expTryReplay(gTaskDisplay.length ? gTaskDisplay : task, history, &replayStopped);
+        if (replayStopped) { agentSay(@"任务已被停止"); gAgentRunning = NO; return; }
+        if (replaySummary.length) [history addObject:[NSString stringWithFormat:@"(%@请根据当前屏幕核对任务是否已经完成:没完成就继续做,完成了就用 done 给出结果。)", replaySummary]];
+    }
     for (int step = 1; gAgentRunning; step++) { // 不限步数,靠"停止任务"和卡死检测结束
         waitForStableFrame(3.0);
         NSString *err = nil;
@@ -2061,27 +2407,25 @@ static void agentRunDirect(NSString *task, NSString *base, NSString *key, NSStri
         if ([screen isEqualToString:lastSig]) same++; else same = 0;
         lastSig = [screen copy];
         if (same >= 4) { agentSay(@"屏幕连续多步没变化,已停止"); break; }
-        if (localOK && paySheetVisible(items)) { agentSay(@"本地 OCR 看到支付/密码界面,已停止,请手动处理"); break; }
+        NSString *blockedName = enforceBlockedFront();
+        if (blockedName) {
+            agentSay([NSString stringWithFormat:@"安全:当前在禁止进入的 App「%@」,已自动退回主屏幕", blockedName]);
+            [history addObject:[NSString stringWithFormat:@"%d. (程序发现进入了禁止进入的 App「%@」,已退回主屏幕;不要再打开它)", step, blockedName]];
+            if (++blockedHits >= 4) { agentSay(@"任务停止:多次进入禁止进入的 App,已停止"); break; }
+            continue;
+        }
+        if (localOK && paySheetVisible(items)) {
+            int r = agentAsk(@"pause", @"看到支付/密码界面。为了安全我不会自动付款,请你本人完成;处理完点“继续”(或点“停止任务”)。");
+            if (r < 0) break;
+            [history addObject:[NSString stringWithFormat:@"%d. (出现支付界面,已由用户本人处理后继续)", step]];
+            lastSig = @""; same = 0;
+            continue;
+        }
 
         NSMutableString *hist = [NSMutableString string];
         NSUInteger from = history.count > 8 ? history.count - 8 : 0;
         for (NSUInteger i = from; i < history.count; i++) [hist appendFormat:@"%@\n", history[i]];
-        NSString *executorTask = task;
-        if (gManagerPlan) {
-            NSDictionary *updated = managerReplan(task, gManagerPlan, items, hist, base, key, model, &err);
-            if (updated) {
-                gManagerPlan = updated;
-                agentSay([NSString stringWithFormat:@"Manager 已检查当前状态，当前计划 %lu 个子目标", (unsigned long)[updated[@"plan"] count]]);
-            } else if (err.length) {
-                agentSay([NSString stringWithFormat:@"Manager 本轮重规划失败，沿用上一版计划:%@", err]);
-            }
-            if ([gManagerPlan[@"done"] boolValue]) {
-                agentSay(@"Manager 判断任务已完成");
-                break;
-            }
-            executorTask = taskWithManagerPlan(task, gManagerPlan);
-        }
-        NSArray *msgs = hybridMessages(executorTask, hist, img, items, &err);
+        NSArray *msgs = hybridMessages(task, hist, img, items, &err);
         if (!msgs) { agentSay([@"截图视觉请求失败:" stringByAppendingString:err ?: @"?"]); break; }
         NSDictionary *act = callLLM(base, key, model, msgs, &err);
         if (!act && localOK) agentSay(@"OCR+截图请求失败,稍后自动重试");
@@ -2094,9 +2438,15 @@ static void agentRunDirect(NSString *task, NSString *base, NSString *key, NSStri
         if (!act) { agentSay([@"调用模型失败,任务停止:" stringByAppendingString:err ?: @"?"]); break; }
 
         NSString *visible = [act[@"visible_text"] description] ?: @"";
-        BOOL dangerous = NO;
-        for (NSString *word in kDangerWords()) if ([visible containsString:word]) { dangerous = YES; break; }
-        if (dangerous) { agentSay(@"视觉模型识别到支付/付款相关内容,任务已停止"); break; }
+        BOOL payPage = NO;
+        for (NSString *word in @[@"输入支付密码", @"请输入支付密码", @"确认付款", @"立即支付", @"确认支付", @"免密支付"]) if ([visible containsString:word]) { payPage = YES; break; }
+        if (payPage) {
+            int r = agentAsk(@"pause", @"模型识别到付款界面。为了安全我不会自动付款,请你本人完成;处理完点“继续”(或点“停止任务”)。");
+            if (r < 0) break;
+            [history addObject:[NSString stringWithFormat:@"%d. (出现付款界面,已由用户本人处理后继续)", step]];
+            lastSig = @""; same = 0;
+            continue;
+        }
 
         NSString *action = [[act[@"action"] description] lowercaseString] ?: @"";
         NSString *thought = [act[@"thought"] description] ?: @"";
@@ -2146,22 +2496,43 @@ static void agentRunDirect(NSString *task, NSString *base, NSString *key, NSStri
             agentSay([NSString stringWithFormat:@"%@:%@", [action isEqualToString:@"done"] ? @"任务完成" : @"任务停止", [act[@"text"] description] ?: @""]);
             break;
         }
+        if ([action isEqualToString:@"ask_user"]) { // 需要用户本人处理(登录/验证码/付款/选择…):提醒并暂停,处理完点“继续”
+            NSString *why = [act[@"text"] description] ?: @"需要你处理";
+            int r = agentAsk(@"pause", why);
+            if (r < 0) break;
+            expRecord(@{@"a": @"ask_user", @"text": why});
+            [history addObject:[NSString stringWithFormat:@"%d. ask_user(%@) → 用户已处理并点了继续,请根据新的屏幕继续", step, why]];
+            lastSig = @""; same = 0;
+            continue;
+        }
         NSString *result = @"已执行";
         if ([action isEqualToString:@"tap"] || [action isEqualToString:@"long_press"]) {
-            NSString *danger = localOK ? dangerNear(items, x, y) : nil;
-            if (danger) { agentSay([NSString stringWithFormat:@"拦截:要点击的位置是「%@」,属于支付/结算,已停止,请手动操作", danger]); break; }
+            NSString *tgt = usedID ? idText : ([act[@"target"] description] ?: @"");
+            NSString *risk = [act[@"risk"] description] ?: @"";
+            NSString *skip = nil;
+            int g = guardSensitiveTap(tgt, risk, localOK ? items : nil, x, y, &skip);
+            if (g < 0) break;
+            if (g > 0) {
+                [history addObject:[NSString stringWithFormat:@"%d. %@", step, skip ?: @"这一步被跳过"]];
+                agentSay([@"提示:" stringByAppendingString:skip ?: @"这一步被跳过"]);
+                continue;
+            }
             if ([action isEqualToString:@"tap"]) doTap(x, y); else doLongPress(x, y, 900);
             [history addObject:usedID ? [NSString stringWithFormat:@"%d. %@ id=%ld「%@」", step, action, (long)oid, idText] : [NSString stringWithFormat:@"%d. %@(%.0f,%.0f)", step, action, xpx, ypx]];
+            expRecord(@{@"a": action, @"t": tgt, @"x": @(x), @"y": @(y), @"anchors": localOK ? expAnchors(items) : @[]});
             sleep(2);
         } else if ([action isEqualToString:@"swipe"]) {
             doSwipe(x, y, x2, y2, 20, 350);
+            expRecord(@{@"a": @"swipe", @"x1": @(x), @"y1": @(y), @"x2": @(x2), @"y2": @(y2), @"anchors": localOK ? expAnchors(items) : @[]});
             [history addObject:[NSString stringWithFormat:@"%d. swipe(%.0f,%.0f → %.0f,%.0f)", step, xpx, ypx, x2 / kx, y2 / ky]];
             sleep(2);
         } else if ([action isEqualToString:@"open_app"]) {
             NSString *name = [act[@"name"] description] ?: @"";
             NSString *info = nil;
             NSString *bid = bundleForAppName(name, &info);
-            if (bid && openApp(bid)) { result = @"已打开"; gLastApp = bid; }
+            if (isBlockedApp(name, nil) || (bid && isBlockedApp(agAppName(bid), bid))) {
+                result = [NSString stringWithFormat:@"「%@」在用户设置的禁止进入的 App 列表里,不能打开。请换别的方式完成,或用 ask_user/stop 说明。", name];
+            } else if (bid && openApp(bid)) { result = @"已打开"; gLastApp = bid; expRecord(@{@"a": @"open_app", @"name": name}); }
             else {
                 result = info ?: @"打开失败";
                 NSString *ln = nil;
@@ -2188,6 +2559,7 @@ static void agentRunDirect(NSString *task, NSString *base, NSString *key, NSStri
                 result = note.length ? [NSString stringWithFormat:@"已尝试粘贴,但%@;请看下一张截图确认输入框里有没有文字,没有就再用 input_text", note]
                                      : @"已把文字粘贴进输入框(键盘快捷键或粘贴菜单),请看下一张截图确认";
                 [history addObject:[NSString stringWithFormat:@"%d. input_text(%@,%@)", step, usedID ? [NSString stringWithFormat:@"id=%ld", (long)oid] : [NSString stringWithFormat:@"%.0f,%.0f", xpx, ypx], text]];
+                expRecord(@{@"a": @"input_text", @"text": text, @"t": usedID ? idText : ([act[@"target"] description] ?: @""), @"x": @(x), @"y": @(y), @"anchors": localOK ? expAnchors(items) : @[]});
                 sleep(1);
             } else {
                 BOOL stranded = NO;
@@ -2210,6 +2582,7 @@ static void agentRunDirect(NSString *task, NSString *base, NSString *key, NSStri
             BOOL hok = goHome(&hn);
             result = hok ? @"已回到主屏幕" : [@"回主屏幕可能失败:" stringByAppendingString:hn ?: @""];
             [history addObject:[NSString stringWithFormat:@"%d. home → %@", step, result]];
+            expRecord(@{@"a": @"home"});
             sleep(1);
         } else if ([action isEqualToString:@"wait"]) {
             [history addObject:[NSString stringWithFormat:@"%d. wait", step]];
@@ -2219,7 +2592,6 @@ static void agentRunDirect(NSString *task, NSString *base, NSString *key, NSStri
         }
         if (![result isEqualToString:@"已执行"] && ![result isEqualToString:@"已打开"]) agentSay([@"提示:" stringByAppendingString:result]);
     }
-    gManagerPlan = nil;
     if (gAgentRunning) agentSay(@"任务结束");
     else agentSay(@"任务已被停止");
     gAgentRunning = NO;
@@ -2449,6 +2821,154 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
 - (void)viewWillDisappear:(BOOL)animated { [super viewWillDisappear:animated]; [self save]; }
 @end
 
+// ---- 安全设置:敏感操作确认、禁止进入的 App ----
+@interface SafetyVC : UIViewController
+@property (nonatomic, strong) UISwitch *sw;
+@property (nonatomic, strong) UITextView *wordsTV, *appsTV;
+@end
+@implementation SafetyVC
+- (UILabel *)lab:(NSString *)t small:(BOOL)small {
+    UILabel *l = [UILabel new];
+    l.numberOfLines = 0; l.text = t;
+    l.font = [UIFont systemFontOfSize:small ? 13 : 15 weight:small ? UIFontWeightRegular : UIFontWeightSemibold];
+    l.textColor = small ? UIColor.secondaryLabelColor : UIColor.labelColor;
+    return l;
+}
+- (UITextView *)box:(NSString *)text {
+    UITextView *tv = [UITextView new];
+    tv.font = [UIFont systemFontOfSize:16]; tv.text = text;
+    tv.autocapitalizationType = UITextAutocapitalizationTypeNone; tv.autocorrectionType = UITextAutocorrectionTypeNo;
+    tv.layer.borderWidth = 1; tv.layer.borderColor = UIColor.separatorColor.CGColor; tv.layer.cornerRadius = 8;
+    [tv.heightAnchor constraintEqualToConstant:140].active = YES;
+    return tv;
+}
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"安全设置";
+    self.view.backgroundColor = UIColor.systemBackgroundColor;
+    UILabel *swl = [self lab:@"敏感操作前先问我" small:NO];
+    self.sw = [UISwitch new]; self.sw.on = confirmEnabled();
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[swl, self.sw]];
+    row.axis = UILayoutConstraintAxisHorizontal; row.distribution = UIStackViewDistributionEqualSpacing; row.alignment = UIStackViewAlignmentCenter;
+    UILabel *h1 = [self lab:@"开启后,点击“发送/发布/提交/删除”等按钮前会先弹出确认,同时发通知(可以直接在通知里点“允许/拒绝”,不用离开当前 App)并语音提醒。付款、转账、输入支付密码永远不会自动执行,只会请你本人完成,不受这个开关影响。" small:YES];
+    self.wordsTV = [self box:[NSUserDefaults.standardUserDefaults stringForKey:@"sens_words"] ?: defaultSensitiveWords()];
+    UILabel *h2 = [self lab:@"禁止进入的 App 名称或包名里含有下面任一词,就不会被打开;如果误入了会自动退回主屏幕。" small:YES];
+    self.appsTV = [self box:[NSUserDefaults.standardUserDefaults stringForKey:@"blocked_apps"] ?: defaultBlockedApps()];
+    UIButton *rb = [UIButton buttonWithType:UIButtonTypeSystem];
+    [rb setTitle:@"恢复默认列表" forState:UIControlStateNormal];
+    [rb addTarget:self action:@selector(restore) forControlEvents:UIControlEventTouchUpInside];
+    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[row, h1,
+        [self lab:@"敏感词(每行一个;要点击的按钮名或它附近的文字含有这些词,就先确认)" small:NO], self.wordsTV,
+        [self lab:@"禁止进入的 App(每行一个)" small:NO], h2, self.appsTV, rb]];
+    st.axis = UILayoutConstraintAxisVertical; st.spacing = 12;
+    st.translatesAutoresizingMaskIntoConstraints = NO;
+    UIScrollView *sv = [UIScrollView new];
+    sv.translatesAutoresizingMaskIntoConstraints = NO;
+    sv.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
+    [self.view addSubview:sv]; [sv addSubview:st];
+    UILayoutGuide *g = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [sv.topAnchor constraintEqualToAnchor:g.topAnchor], [sv.bottomAnchor constraintEqualToAnchor:g.bottomAnchor],
+        [sv.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor], [sv.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [st.topAnchor constraintEqualToAnchor:sv.contentLayoutGuide.topAnchor constant:16],
+        [st.bottomAnchor constraintEqualToAnchor:sv.contentLayoutGuide.bottomAnchor constant:-16],
+        [st.leadingAnchor constraintEqualToAnchor:sv.frameLayoutGuide.leadingAnchor constant:16],
+        [st.trailingAnchor constraintEqualToAnchor:sv.frameLayoutGuide.trailingAnchor constant:-16]]];
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"完成" style:UIBarButtonItemStyleDone target:self action:@selector(done)];
+}
+- (void)save {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    [d setBool:self.sw.on forKey:@"confirm_on"];
+    [d setObject:self.wordsTV.text ?: @"" forKey:@"sens_words"];
+    [d setObject:self.appsTV.text ?: @"" forKey:@"blocked_apps"];
+}
+- (void)done { [self save]; [self dismissViewControllerAnimated:YES completion:nil]; }
+- (void)restore { self.wordsTV.text = defaultSensitiveWords(); self.appsTV.text = defaultBlockedApps(); }
+- (void)viewWillDisappear:(BOOL)animated { [super viewWillDisappear:animated]; [self save]; }
+@end
+
+// ---- 经验库:查看、删除、开关 ----
+@interface ExpVC : UITableViewController
+@property (nonatomic, strong) NSMutableArray *items;
+@end
+@implementation ExpVC
+- (instancetype)init { return [super initWithStyle:UITableViewStyleInsetGrouped]; }
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"经验库";
+    self.items = expLoad();
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"完成" style:UIBarButtonItemStyleDone target:self action:@selector(done)];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"清空" style:UIBarButtonItemStylePlain target:self action:@selector(clearAll)];
+}
+- (void)done { [self dismissViewControllerAnimated:YES completion:nil]; }
+- (void)clearAll {
+    if (!self.items.count) return;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"清空经验库" message:@"确定删除所有已保存的经验?" preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"清空" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        [self.items removeAllObjects]; expSave(self.items); [self.tableView reloadData];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return s == 0 ? 2 : MAX((NSInteger)self.items.count, 1); }
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
+    return s == 0 ? @"设置" : [NSString stringWithFormat:@"已保存的经验(%lu)", (unsigned long)self.items.count];
+}
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
+    return s == 0 ? @"任务成功完成后自动记录步骤。相似的任务会把过往经验作为参考提示给模型;几乎相同的任务会先快速回放(每一步都核对屏幕、用屏幕上的文字重新定位按钮,对不上就中止并交给模型)。多次回放失败的经验会自动淘汰。" : nil;
+}
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    if (ip.section == 0) {
+        UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        c.textLabel.text = ip.row == 0 ? @"记录并参考经验" : @"相同任务先快速回放";
+        UISwitch *sw = [UISwitch new];
+        sw.tag = ip.row;
+        sw.on = ip.row == 0 ? expEnabled() : expReplayEnabled();
+        [sw addTarget:self action:@selector(onSwitch:) forControlEvents:UIControlEventValueChanged];
+        c.accessoryView = sw;
+        c.selectionStyle = UITableViewCellSelectionStyleNone;
+        return c;
+    }
+    UITableViewCell *c = [tv dequeueReusableCellWithIdentifier:@"exp"] ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"exp"];
+    if (!self.items.count) {
+        c.textLabel.text = @"还没有经验。任务成功完成后会自动记录。";
+        c.textLabel.textColor = UIColor.secondaryLabelColor; c.detailTextLabel.text = nil;
+        c.accessoryType = UITableViewCellAccessoryNone;
+        return c;
+    }
+    NSDictionary *e = self.items[self.items.count - 1 - ip.row]; // 新的在前
+    c.textLabel.text = e[@"task"]; c.textLabel.numberOfLines = 2; c.textLabel.textColor = UIColor.labelColor;
+    c.detailTextLabel.text = [NSString stringWithFormat:@"%lu 步 · 成功 %d 次 · 失败 %d 次 · 回放 %d 次",
+                              (unsigned long)[e[@"steps"] count], [e[@"ok"] intValue], [e[@"fail"] intValue], [e[@"used"] intValue]];
+    c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    return c;
+}
+- (void)onSwitch:(UISwitch *)sw { [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:sw.tag == 0 ? @"exp_on" : @"exp_replay_on"]; }
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    if (ip.section != 1 || !self.items.count) return;
+    NSUInteger idx = self.items.count - 1 - ip.row;
+    NSDictionary *e = self.items[idx];
+    NSMutableString *m = [NSMutableString string];
+    NSArray *steps = e[@"steps"];
+    for (NSUInteger i = 0; i < steps.count; i++) [m appendFormat:@"%lu. %@\n", (unsigned long)i + 1, expStepDesc(steps[i])];
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:e[@"task"] message:m preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"删除这条" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        [self.items removeObjectAtIndex:idx]; expSave(self.items); [self.tableView reloadData];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+- (BOOL)tableView:(UITableView *)tv canEditRowAtIndexPath:(NSIndexPath *)ip { return ip.section == 1 && self.items.count > 0; }
+- (void)tableView:(UITableView *)tv commitEditingStyle:(UITableViewCellEditingStyle)style forRowAtIndexPath:(NSIndexPath *)ip {
+    if (style != UITableViewCellEditingStyleDelete || !self.items.count) return;
+    [self.items removeObjectAtIndex:self.items.count - 1 - ip.row];
+    expSave(self.items);
+    [tv reloadData];
+}
+@end
+
 // ---- 主界面 ----
 static NSData *attachJPEG(UIImage *img) {
     CGSize sz = img.size;
@@ -2470,6 +2990,7 @@ static NSData *attachJPEG(UIImage *img) {
 @property (nonatomic, strong) PAVoice *voice;
 @property (nonatomic, copy) NSString *voiceBase;
 @property (nonatomic, strong) UIView *closingView, *guardView;
+@property (nonatomic, strong) UIAlertController *reqAlert;
 @end
 
 @implementation VC
@@ -2542,6 +3063,8 @@ static NSData *attachJPEG(UIImage *img) {
     UIButton *stopBtn = [self btn:@"停止任务" action:@selector(onStop)];
     UIButton *memBtn = [self btn:@"记忆" action:@selector(onMemory)];
     UIButton *resBtn = [self btn:@"上次结果" action:@selector(onLastResult)];
+    UIButton *safeBtn = [self btn:@"安全设置" action:@selector(onSafety)];
+    UIButton *expBtn = [self btn:@"经验库" action:@selector(onExp)];
     UIButton *keepBtn = [self btn:@"后台保活 开/关" action:@selector(onKeep)];
     UIButton *diagBtn = [self btn:@"诊断" action:@selector(onDiag)];
 
@@ -2564,14 +3087,6 @@ static NSData *attachJPEG(UIImage *img) {
     UIStackView *acrow = [[UIStackView alloc] initWithArrangedSubviews:@[acl, acs]];
     acrow.axis = UILayoutConstraintAxisHorizontal; acrow.alignment = UIStackViewAlignmentCenter;
     acrow.distribution = UIStackViewDistributionEqualSpacing;
-    UILabel *rml = [UILabel new];
-    rml.text = @"AI规划模式(Manager→Executor)"; rml.font = [UIFont systemFontOfSize:15]; rml.numberOfLines = 0;
-    UISwitch *rms = [UISwitch new];
-    rms.on = [ud0 boolForKey:@"reasoning_mode"];
-    [rms addTarget:self action:@selector(onReasoning:) forControlEvents:UIControlEventValueChanged];
-    UIStackView *rmrow = [[UIStackView alloc] initWithArrangedSubviews:@[rml, rms]];
-    rmrow.axis = UILayoutConstraintAxisHorizontal; rmrow.alignment = UIStackViewAlignmentCenter;
-    rmrow.distribution = UIStackViewDistributionEqualSpacing;
     UILabel *ttl = [UILabel new];
     ttl.text = @"任务结果自动语音朗读"; ttl.font = [UIFont systemFontOfSize:15]; ttl.numberOfLines = 0;
     UISwitch *tts = [UISwitch new];
@@ -2593,8 +3108,8 @@ static NSData *attachJPEG(UIImage *img) {
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
         provRow, self.keyF, self.baseF, self.modelF,
         self.taskTV, [self row:@[self.micBtn, attBtn]], self.attLabel,
-        [self row:@[startBtn, stopBtn]], [self row:@[memBtn, resBtn]],
-        acrow, rmrow, ttsrow, brow, [self row:@[keepBtn, diagBtn]], tokenL, self.log]];
+        [self row:@[startBtn, stopBtn]], [self row:@[memBtn, safeBtn]], [self row:@[expBtn, resBtn]],
+        acrow, ttsrow, brow, [self row:@[keepBtn, diagBtn]], tokenL, self.log]];
     st.axis = UILayoutConstraintAxisVertical;
     st.spacing = 10;
     st.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2617,6 +3132,16 @@ static NSData *attachJPEG(UIImage *img) {
     // 通知:日志、结果窗口
     [NSNotificationCenter.defaultCenter addObserverForName:@"pa.say" object:nil queue:nil
                                                 usingBlock:^(NSNotification *n) { [wself say:[n.object description]]; }];
+    [NSNotificationCenter.defaultCenter addObserverForName:@"pa.request" object:nil queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(NSNotification *n) { [wself presentPendingRequest]; }];
+    [NSNotificationCenter.defaultCenter addObserverForName:@"pa.requestDone" object:nil queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(NSNotification *n) { [wself dismissRequestAlert]; [[PATTS shared] stop]; }];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(NSNotification *n) { [wself presentPendingRequest]; }];
+    [NSNotificationCenter.defaultCenter addObserverForName:@"pa.speak" object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+        NSUserDefaults *u = NSUserDefaults.standardUserDefaults;
+        if (!([u objectForKey:@"tts_on"] && ![u boolForKey:@"tts_on"])) [[PATTS shared] speak:[n.object description]];
+    }];
     [NSNotificationCenter.defaultCenter addObserverForName:@"pa.guard" object:nil queue:NSOperationQueue.mainQueue
                                                 usingBlock:^(NSNotification *n) { [wself setGuardOverlay:[n.object boolValue]]; }];
     [NSNotificationCenter.defaultCenter addObserverForName:@"pa.closing" object:nil queue:NSOperationQueue.mainQueue
@@ -2753,6 +3278,38 @@ static NSData *attachJPEG(UIImage *img) {
     });
 }
 // 任务结束、自动关闭录屏的几秒里盖一层遮罩,吞掉点击
+// ---- 暂停 / 确认 请求的弹窗(App 在前台时);App 在后台时靠通知,用户点开通知或回到 App 时再弹 ----
+- (void)presentPendingRequest {
+    if (gReqState != PAReqWaiting || self.reqAlert) return;
+    if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
+    BOOL confirm = [gReqKind isEqualToString:@"confirm"];
+    __weak VC *wself = self;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:confirm ? @"需要你确认" : @"任务已暂停"
+        message:confirm ? gReqText : [gReqText stringByAppendingString:@"\n\n请先去处理(必要时回到对应的 App),处理完点“继续”。"]
+        preferredStyle:UIAlertControllerStyleAlert];
+    if (confirm) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"允许" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { agentRespond(PAReqAllow); wself.reqAlert = nil; }]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"允许,本次任务不再问" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { agentRespond(PAReqAllowAll); wself.reqAlert = nil; }]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"拒绝(跳过这一步)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { agentRespond(PAReqDeny); wself.reqAlert = nil; }]];
+    } else {
+        [ac addAction:[UIAlertAction actionWithTitle:@"继续" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { agentRespond(PAReqAllow); wself.reqAlert = nil; }]];
+    }
+    [ac addAction:[UIAlertAction actionWithTitle:@"停止任务" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) { agentRespond(PAReqStop); wself.reqAlert = nil; }]];
+    self.reqAlert = ac;
+    UIViewController *top = self;
+    while (top.presentedViewController) top = top.presentedViewController;
+    [top presentViewController:ac animated:YES completion:nil];
+}
+- (void)dismissRequestAlert {
+    if (self.reqAlert) { [self.reqAlert dismissViewControllerAnimated:YES completion:nil]; self.reqAlert = nil; }
+}
+- (void)onSafety {
+    [self presentViewController:[[UINavigationController alloc] initWithRootViewController:[SafetyVC new]] animated:YES completion:nil];
+}
+- (void)onExp {
+    [self presentViewController:[[UINavigationController alloc] initWithRootViewController:[ExpVC new]] animated:YES completion:nil];
+}
+
 // 自动开启录屏的盲点期间:透明的吞点击层(盖在 PhoneAgent 自己的界面上,系统面板在它上面)
 - (void)setGuardOverlay:(BOOL)on {
     if (!on) { [self.guardView removeFromSuperview]; self.guardView = nil; return; }
@@ -2824,11 +3381,7 @@ static NSData *attachJPEG(UIImage *img) {
 }
 - (void)onTTS:(UISwitch *)sw { [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"tts_on"]; if (!sw.on) [[PATTS shared] stop]; }
 - (void)onAutoCast:(UISwitch *)sw { [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"auto_cast"]; }
-- (void)onReasoning:(UISwitch *)sw {
-    [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"reasoning_mode"];
-    [self say:sw.on ? @"已开启 AI 规划模式:任务开始时先由 Manager 生成计划" : @"已关闭 AI 规划模式:使用直接执行模式"];
-}
-- (void)onStop { gAgentRunning = NO; [self say:@"正在停止任务……"]; }
+- (void)onStop { gAgentRunning = NO; agentRespond(PAReqStop); [self say:@"正在停止任务……"]; }
 - (void)onKeep { [self say:setKeepAlive(gPlayer == nil)]; }
 - (void)onDiag { [self say:diagReport()]; }
 
@@ -2927,7 +3480,7 @@ static NSData *attachJPEG(UIImage *img) {
 }
 @end
 
-@interface AD : UIResponder <UIApplicationDelegate>
+@interface AD : UIResponder <UIApplicationDelegate, UNUserNotificationCenterDelegate>
 @property (nonatomic, strong) UIWindow *window;
 @end
 @implementation AD
@@ -2942,7 +3495,10 @@ static NSData *attachJPEG(UIImage *img) {
         [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:@"收到 phoneagent:// 请求,但 token 不对,已忽略"];
         return YES;
     }
-    if ([cmd isEqualToString:@"stop"]) { gAgentRunning = NO; return YES; }
+    if ([cmd isEqualToString:@"resume"] || [cmd isEqualToString:@"allow"]) { agentRespond(PAReqAllow); return YES; }
+    if ([cmd isEqualToString:@"allowall"]) { agentRespond(PAReqAllowAll); return YES; }
+    if ([cmd isEqualToString:@"deny"]) { agentRespond(PAReqDeny); return YES; }
+    if ([cmd isEqualToString:@"stop"]) { gAgentRunning = NO; agentRespond(PAReqStop); return YES; }
     if (![cmd isEqualToString:@"task"]) return YES;
     // 把收到的 URL 原样记到日志里(token 打码),方便排查快捷指令到底传了什么
     NSString *raw = url.absoluteString ?: @"";
@@ -2987,6 +3543,21 @@ static NSData *attachJPEG(UIImage *img) {
     return YES;
 }
 
+// 通知(带按钮):暂停/确认请求时发出,用户可以不离开当前 App,直接在通知里点“继续/允许/拒绝/停止”
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center willPresentNotification:(UNNotification *)notification
+         withCompletionHandler:(void (^)(UNNotificationPresentationOptions))completionHandler {
+    completionHandler(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionList | UNNotificationPresentationOptionSound);
+}
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center didReceiveNotificationResponse:(UNNotificationResponse *)response
+         withCompletionHandler:(void (^)(void))completionHandler {
+    NSString *a = response.actionIdentifier;
+    if ([a isEqualToString:@"allow"] || [a isEqualToString:@"resume"]) agentRespond(PAReqAllow);
+    else if ([a isEqualToString:@"allowall"]) agentRespond(PAReqAllowAll);
+    else if ([a isEqualToString:@"deny"]) agentRespond(PAReqDeny);
+    else if ([a isEqualToString:@"stop"]) agentRespond(PAReqStop);
+    completionHandler(); // 点通知本身只是打开 App,界面里会弹出对应的确认框
+}
+
 - (BOOL)application:(UIApplication *)a didFinishLaunchingWithOptions:(NSDictionary *)o {
     signal(SIGPIPE, SIG_IGN);
     gLock = [NSObject new];
@@ -2995,6 +3566,20 @@ static NSData *attachJPEG(UIImage *img) {
     gAttachImages = [NSMutableArray array];
     gAttachNames = [NSMutableArray array];
     gAttachText = [NSMutableString string];
+    gExpSteps = [NSMutableArray array];
+    {   // 通知:注册带按钮的类别并请求权限
+        UNUserNotificationCenter *nc = UNUserNotificationCenter.currentNotificationCenter;
+        nc.delegate = self;
+        UNNotificationAction *aOK = [UNNotificationAction actionWithIdentifier:@"allow" title:@"允许" options:UNNotificationActionOptionNone];
+        UNNotificationAction *aAll = [UNNotificationAction actionWithIdentifier:@"allowall" title:@"允许,本次任务不再问" options:UNNotificationActionOptionNone];
+        UNNotificationAction *aNo = [UNNotificationAction actionWithIdentifier:@"deny" title:@"拒绝(跳过这一步)" options:UNNotificationActionOptionDestructive];
+        UNNotificationAction *aStop = [UNNotificationAction actionWithIdentifier:@"stop" title:@"停止任务" options:UNNotificationActionOptionDestructive];
+        UNNotificationAction *aCont = [UNNotificationAction actionWithIdentifier:@"resume" title:@"继续" options:UNNotificationActionOptionNone];
+        UNNotificationCategory *cConfirm = [UNNotificationCategory categoryWithIdentifier:@"PA_CONFIRM" actions:@[aOK, aAll, aNo, aStop] intentIdentifiers:@[] options:UNNotificationCategoryOptionNone];
+        UNNotificationCategory *cPause = [UNNotificationCategory categoryWithIdentifier:@"PA_PAUSE" actions:@[aCont, aStop] intentIdentifiers:@[] options:UNNotificationCategoryOptionNone];
+        [nc setNotificationCategories:[NSSet setWithObjects:cConfirm, cPause, nil]];
+        [nc requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound) completionHandler:^(BOOL granted, NSError *err) {}];
+    }
     {   // 旧版本只有一套 API 设置:迁移到对应的提供商名下
         NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
         if (![d boolForKey:@"migrated_v7"]) {

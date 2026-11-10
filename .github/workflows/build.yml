@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
 jobs:
   build:
-    runs-on: macos-15-intel
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install ldid
         run: brew install ldid
       - name: Build .tipa
-        run: bash ./build.sh
+        run: ./build.sh
       - uses: actions/upload-artifact@v4
         with:
           name: PhoneAgent-tipa
