@@ -1899,7 +1899,102 @@ static void taskRunEnd(NSString *task, BOOL stopCast) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ memoryLearn(shownCopy, resultCopy); });
 }
 
+
+#pragma mark - Mobilerun-style Manager planning mode
+
+static NSString *const kPlanManagerSystem =
+@"你是手机任务规划器。你不直接点击屏幕，也不输出坐标。\n"
+@"请把用户任务拆成最多 6 个按顺序执行的子目标。每个子目标必须包含 id、goal、success_condition 和 risk。\n"
+@"risk 只能是 low、confirm 或 blocked。涉及付款、转账、删除、发布、提交订单、隐私授权时必须使用 confirm。\n"
+@"只输出 JSON，不要输出 Markdown，不要输出解释。格式必须是："
+@"{\"plan\":[{\"id\":\"...\",\"goal\":\"...\",\"success_condition\":\"...\",\"risk\":\"low\"}],\"stop_condition\":\"...\"}";
+
+static void agentRunDirect(NSString *task, NSString *base, NSString *key, NSString *model);
+
+static NSString *planJSONText(NSDictionary *plan) {
+    NSData *d = [NSJSONSerialization dataWithJSONObject:plan options:0 error:nil];
+    return d.length ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : @"";
+}
+
+static BOOL planLooksUsable(NSDictionary *plan) {
+    NSArray *steps = plan[@"plan"];
+    if (![steps isKindOfClass:NSArray.class] || steps.count == 0 || steps.count > 8) return NO;
+    for (NSDictionary *step in steps) {
+        if (![step isKindOfClass:NSDictionary.class] ||
+            ![step[@"goal"] isKindOfClass:NSString.class] ||
+            ![step[@"success_condition"] isKindOfClass:NSString.class]) return NO;
+    }
+    return YES;
+}
+
+static NSDictionary *makeManagerPlan(NSString *task, NSString *base, NSString *key, NSString *model, NSString **err) {
+    NSString *shotErr = nil;
+    UIImage *img = takeScreenshot(&shotErr);
+    NSArray *items = img ? (ocrImage(img, nil) ?: @[]) : @[];
+    NSMutableString *ocr = [NSMutableString string];
+    NSInteger n = 0;
+    for (NSDictionary *it in items) {
+        if (++n > 50) break;
+        NSString *t = [it[@"text"] description] ?: @"";
+        if (t.length > 50) t = [t substringToIndex:50];
+        [ocr appendFormat:@"[%ld] %@\n", (long)n, t];
+    }
+    if (!ocr.length) [ocr appendString:@"(当前页面没有识别到文字)"];
+    NSString *front = frontmostBundleID() ?: @"未知";
+    NSString *user = [NSString stringWithFormat:
+        @"用户任务：%@\n当前 App：%@\n当前页面 OCR：\n%@\n请生成执行计划。",
+        task, front, ocr];
+    NSArray *messages = @[
+        @{ @"role": @"system", @"content": kPlanManagerSystem },
+        @{ @"role": @"user", @"content": user }
+    ];
+    NSDictionary *plan = callLLM(base, key, model, messages, err);
+    if (!planLooksUsable(plan)) {
+        if (err && !*err) *err = @"规划器返回的计划格式不正确";
+        return nil;
+    }
+    return plan;
+}
+
+static NSString *taskWithManagerPlan(NSString *task, NSDictionary *plan) {
+    NSString *json = planJSONText(plan);
+    if (!json.length) return task;
+    return [NSString stringWithFormat:
+        @"%@\n\n【Manager 任务计划】\n%@\n\n【Executor 执行规则】\n请优先按照上述计划完成任务。每次只执行一个动作；完成当前子目标后继续下一个。每次动作后检查页面是否满足 success_condition。计划只是路线，不要为了执行计划而点击危险操作；遇到付款、转账、删除、发布或授权时必须 stop 并说明。",
+        task, json];
+}
+
+static void agentRunReasoning(NSString *task, NSString *base, NSString *key, NSString *model) {
+    gAgentRunning = YES;
+    agentSay(@"Mobilerun 规划模式: Manager 正在生成任务计划……");
+    NSString *err = nil;
+    NSDictionary *plan = makeManagerPlan(task, base, key, model, &err);
+    if (!plan) {
+        agentSay([NSString stringWithFormat:@"规划器失败,改用直接执行:%@", err ?: @"未知错误"]);
+        if (gAgentRunning) agentRunDirect(task, base, key, model);
+        return;
+    }
+    NSArray *steps = plan[@"plan"];
+    agentSay([NSString stringWithFormat:@"Manager 已生成 %lu 个子目标", (unsigned long)steps.count]);
+    for (NSDictionary *step in steps) {
+        NSString *risk = [step[@"risk"] description] ?: @"low";
+        if ([risk isEqualToString:@"confirm"] || [risk isEqualToString:@"blocked"]) {
+            agentSay([NSString stringWithFormat:@"规划包含需要确认的高风险步骤:%@", step[@"goal"] ?: @""]);
+        }
+    }
+    if (gAgentRunning) agentRunDirect(taskWithManagerPlan(task, plan), base, key, model);
+}
+
 static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString *model) {
+    BOOL reasoning = [NSUserDefaults.standardUserDefaults boolForKey:@"reasoning_mode"];
+    if (reasoning && ![model.lowercaseString containsString:@"autoglm"]) {
+        agentRunReasoning(task, base, key, model);
+    } else {
+        agentRunDirect(task, base, key, model);
+    }
+}
+
+static void agentRunDirect(NSString *task, NSString *base, NSString *key, NSString *model) {
     if ([model.lowercaseString containsString:@"autoglm"]) { agentRunAutoGLM(task, base, key, model); return; }
     gCurrentModel = model;
     gPrevModelJPEG = nil;
@@ -2419,6 +2514,14 @@ static NSData *attachJPEG(UIImage *img) {
     UIStackView *acrow = [[UIStackView alloc] initWithArrangedSubviews:@[acl, acs]];
     acrow.axis = UILayoutConstraintAxisHorizontal; acrow.alignment = UIStackViewAlignmentCenter;
     acrow.distribution = UIStackViewDistributionEqualSpacing;
+    UILabel *rml = [UILabel new];
+    rml.text = @"AI规划模式(Manager→Executor)"; rml.font = [UIFont systemFontOfSize:15]; rml.numberOfLines = 0;
+    UISwitch *rms = [UISwitch new];
+    rms.on = [ud0 boolForKey:@"reasoning_mode"];
+    [rms addTarget:self action:@selector(onReasoning:) forControlEvents:UIControlEventValueChanged];
+    UIStackView *rmrow = [[UIStackView alloc] initWithArrangedSubviews:@[rml, rms]];
+    rmrow.axis = UILayoutConstraintAxisHorizontal; rmrow.alignment = UIStackViewAlignmentCenter;
+    rmrow.distribution = UIStackViewDistributionEqualSpacing;
     UILabel *ttl = [UILabel new];
     ttl.text = @"任务结果自动语音朗读"; ttl.font = [UIFont systemFontOfSize:15]; ttl.numberOfLines = 0;
     UISwitch *tts = [UISwitch new];
@@ -2441,7 +2544,7 @@ static NSData *attachJPEG(UIImage *img) {
         provRow, self.keyF, self.baseF, self.modelF,
         self.taskTV, [self row:@[self.micBtn, attBtn]], self.attLabel,
         [self row:@[startBtn, stopBtn]], [self row:@[memBtn, resBtn]],
-        acrow, ttsrow, brow, [self row:@[keepBtn, diagBtn]], tokenL, self.log]];
+        acrow, rmrow, ttsrow, brow, [self row:@[keepBtn, diagBtn]], tokenL, self.log]];
     st.axis = UILayoutConstraintAxisVertical;
     st.spacing = 10;
     st.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2671,6 +2774,10 @@ static NSData *attachJPEG(UIImage *img) {
 }
 - (void)onTTS:(UISwitch *)sw { [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"tts_on"]; if (!sw.on) [[PATTS shared] stop]; }
 - (void)onAutoCast:(UISwitch *)sw { [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"auto_cast"]; }
+- (void)onReasoning:(UISwitch *)sw {
+    [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"reasoning_mode"];
+    [self say:sw.on ? @"已开启 AI 规划模式:任务开始时先由 Manager 生成计划" : @"已关闭 AI 规划模式:使用直接执行模式"];
+}
 - (void)onStop { gAgentRunning = NO; [self say:@"正在停止任务……"]; }
 - (void)onKeep { [self say:setKeepAlive(gPlayer == nil)]; }
 - (void)onDiag { [self say:diagReport()]; }
