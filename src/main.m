@@ -931,11 +931,13 @@ static NSDictionary *callLLMOnce(NSString *base, NSString *key, NSString *model,
     // GLM-5.3 系列:思考模式始终开启,思考内容也占 max_tokens,所以要给得足够大;
     // 按智谱文档的推荐参数:temperature 1、top_p 0.95、reasoning_effort max、thinking.clear_thinking false
     BOOL glm = [model.lowercaseString hasPrefix:@"glm"];
+    NSString *systemContent = [messages.firstObject[@"content"] description] ?: @"";
+    BOOL managerRequest = [systemContent containsString:@"手机任务规划器"];
     NSDictionary *body = glm
         ? @{@"model": model, @"messages": messages, @"temperature": @1.0, @"top_p": @0.95, @"max_tokens": @16384,
             @"thinking": @{@"type": @"enabled", @"clear_thinking": @NO}, @"reasoning_effort": @"max"}
         : @{@"model": model, @"messages": messages, @"temperature": @0.1,
-            @"max_tokens": @700, @"response_format": @{@"type": @"json_object"}};
+            @"max_tokens": managerRequest ? @3000 : @700, @"response_format": @{ @"type": @"json_object"}};
     if (glm) r.timeoutInterval = 300;
     r.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
     __block NSData *data = nil; __block NSError *e = nil; __block NSInteger code = 0;
