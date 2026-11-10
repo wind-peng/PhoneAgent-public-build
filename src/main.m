@@ -1911,11 +1911,6 @@ static NSString *const kPlanManagerSystem =
 
 static void agentRunDirect(NSString *task, NSString *base, NSString *key, NSString *model);
 
-static NSString *planJSONText(NSDictionary *plan) {
-    NSData *d = [NSJSONSerialization dataWithJSONObject:plan options:0 error:nil];
-    return d.length ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : @"";
-}
-
 static BOOL planLooksUsable(NSDictionary *plan) {
     NSArray *steps = plan[@"plan"];
     if (![steps isKindOfClass:NSArray.class] || steps.count == 0 || steps.count > 8) return NO;
@@ -1957,11 +1952,20 @@ static NSDictionary *makeManagerPlan(NSString *task, NSString *base, NSString *k
 }
 
 static NSString *taskWithManagerPlan(NSString *task, NSDictionary *plan) {
-    NSString *json = planJSONText(plan);
-    if (!json.length) return task;
+    NSArray *steps = plan[@"plan"];
+    if (![steps isKindOfClass:NSArray.class] || !steps.count) return task;
+    NSMutableString *route = [NSMutableString string];
+    NSInteger n = 0;
+    for (NSDictionary *step in steps) {
+        NSString *goal = [step[@"goal"] description] ?: @"";
+        NSString *ok = [step[@"success_condition"] description] ?: @"";
+        NSString *risk = [step[@"risk"] description] ?: @"low";
+        if (++n > 8) break;
+        [route appendFormat:@"%ld. 目标:%@；完成判断:%@；风险:%@\n", (long)n, goal, ok, risk];
+    }
     return [NSString stringWithFormat:
-        @"%@\n\n【Manager 任务计划】\n%@\n\n【Executor 执行规则】\n请优先按照上述计划完成任务。每次只执行一个动作；完成当前子目标后继续下一个。每次动作后检查页面是否满足 success_condition。计划只是路线，不要为了执行计划而点击危险操作；遇到付款、转账、删除、发布或授权时必须 stop 并说明。",
-        task, json];
+        @"%@\n\n【Manager 只读路线图】\n%@\n【Executor 强制规则】\n路线图只是执行上下文，不是回复格式，也不是新的任务。你现在必须根据当前截图只返回一个原子动作 JSON。绝对不要返回 plan、steps 或任务计划 JSON。回复必须符合系统提示中的 action 格式；每次只执行一个动作，完成当前目标后再继续下一个。每次动作后检查页面是否满足对应的完成判断。遇到付款、转账、删除、发布或授权时必须 stop 并说明。",
+        task, route];
 }
 
 static void agentRunReasoning(NSString *task, NSString *base, NSString *key, NSString *model) {
