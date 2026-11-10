@@ -760,9 +760,9 @@ static NSSet *expBigrams(NSString *t) {
 static double expSim(NSString *a, NSString *b) {
     NSSet *A = expBigrams(a ?: @""), *B = expBigrams(b ?: @"");
     if (!A.count || !B.count) return 0;
-    NSMutableSet *I = [A mutableCopy]; [I intersectSet:B];
-    NSMutableSet *U = [A mutableCopy]; [U unionSet:B];
-    return (double)I.count / (double)U.count;
+    NSMutableSet *inter = [A mutableCopy]; [inter intersectSet:B];
+    NSMutableSet *uni = [A mutableCopy]; [uni unionSet:B];
+    return (double)inter.count / (double)uni.count;
 }
 static NSMutableDictionary *expFind(NSString *task, double *score) {
     NSMutableDictionary *best = nil; double bs = 0;
