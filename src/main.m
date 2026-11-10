@@ -1907,9 +1907,10 @@ static NSString *const kPlanManagerSystem =
 @"请把用户任务拆成最多 6 个按顺序执行的子目标。每个子目标必须包含 id、goal、success_condition 和 risk。\n"
 @"risk 只能是 low、confirm 或 blocked。涉及付款、转账、删除、发布、提交订单、隐私授权时必须使用 confirm。\n"
 @"只输出 JSON，不要输出 Markdown，不要输出解释。格式必须是："
-@"{\"plan\":[{\"id\":\"...\",\"goal\":\"...\",\"success_condition\":\"...\",\"risk\":\"low\"}],\"stop_condition\":\"...\"}";
+@"{\"plan\":[{\"id\":\"...\",\"goal\":\"...\",\"success_condition\":\"...\",\"risk\":\"low\"}],\"current_step_id\":\"...\",\"done\":false,\"stop_condition\":\"...\"}";
 
 static void agentRunDirect(NSString *task, NSString *base, NSString *key, NSString *model);
+static NSDictionary *gManagerPlan;
 
 static BOOL planLooksUsable(NSDictionary *plan) {
     NSArray *steps = plan[@"plan"];
@@ -1968,8 +1969,34 @@ static NSString *taskWithManagerPlan(NSString *task, NSDictionary *plan) {
         task, route];
 }
 
+static NSDictionary *managerReplan(NSString *task, NSDictionary *oldPlan, NSArray *items,
+                                   NSString *history, NSString *base, NSString *key, NSString *model,
+                                   NSString **err) {
+    NSData *planData = [NSJSONSerialization dataWithJSONObject:oldPlan ?: @{} options:0 error:nil];
+    NSString *oldText = planData.length ? [[NSString alloc] initWithData:planData encoding:NSUTF8StringEncoding] : @"{}";
+    NSMutableString *ocr = [NSMutableString string];
+    NSInteger n = 0;
+    for (NSDictionary *it in items) {
+        if (++n > 80) break;
+        NSString *t = [it[@"text"] description] ?: @"";
+        if (t.length > 60) t = [t substringToIndex:60];
+        [ocr appendFormat:@"[%ld] %@\n", (long)n, t];
+    }
+    if (!ocr.length) [ocr appendString:@"(当前页面没有识别到文字)"];
+    NSString *user = [NSString stringWithFormat:
+        @"原始任务：%@\n当前计划：%@\n最近动作及结果：%@\n当前页面 OCR：\n%@\n\n请根据当前页面重新检查计划：如果当前子目标已完成，就把 current_step_id 移到下一个；如果路线不再适用，就修改 plan；如果整个任务完成，设置 done=true。只返回同样的计划 JSON，不要输出动作坐标。",
+        task, oldText, history.length ? history : @"(还没有)", ocr];
+    NSArray *messages = @[
+        @{ @"role": @"system", @"content": kPlanManagerSystem },
+        @{ @"role": @"user", @"content": user }
+    ];
+    NSDictionary *plan = callLLM(base, key, model, messages, err);
+    return planLooksUsable(plan) ? plan : nil;
+}
+
 static void agentRunReasoning(NSString *task, NSString *base, NSString *key, NSString *model) {
     gAgentRunning = YES;
+    gManagerPlan = nil;
     agentSay(@"Mobilerun 规划模式: Manager 正在生成任务计划……");
     NSString *err = nil;
     NSDictionary *plan = makeManagerPlan(task, base, key, model, &err);
@@ -1978,6 +2005,7 @@ static void agentRunReasoning(NSString *task, NSString *base, NSString *key, NSS
         if (gAgentRunning) agentRunDirect(task, base, key, model);
         return;
     }
+    gManagerPlan = plan;
     NSArray *steps = plan[@"plan"];
     agentSay([NSString stringWithFormat:@"Manager 已生成 %lu 个子目标", (unsigned long)steps.count]);
     for (NSDictionary *step in steps) {
@@ -1986,7 +2014,7 @@ static void agentRunReasoning(NSString *task, NSString *base, NSString *key, NSS
             agentSay([NSString stringWithFormat:@"规划包含需要确认的高风险步骤:%@", step[@"goal"] ?: @""]);
         }
     }
-    if (gAgentRunning) agentRunDirect(taskWithManagerPlan(task, plan), base, key, model);
+    if (gAgentRunning) agentRunDirect(task, base, key, model);
 }
 
 static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString *model) {
@@ -2036,7 +2064,22 @@ static void agentRunDirect(NSString *task, NSString *base, NSString *key, NSStri
         NSMutableString *hist = [NSMutableString string];
         NSUInteger from = history.count > 8 ? history.count - 8 : 0;
         for (NSUInteger i = from; i < history.count; i++) [hist appendFormat:@"%@\n", history[i]];
-        NSArray *msgs = hybridMessages(task, hist, img, items, &err);
+        NSString *executorTask = task;
+        if (gManagerPlan) {
+            NSDictionary *updated = managerReplan(task, gManagerPlan, items, hist, base, key, model, &err);
+            if (updated) {
+                gManagerPlan = updated;
+                agentSay([NSString stringWithFormat:@"Manager 已检查当前状态，当前计划 %lu 个子目标", (unsigned long)[updated[@"plan"] count]]);
+            } else if (err.length) {
+                agentSay([NSString stringWithFormat:@"Manager 本轮重规划失败，沿用上一版计划:%@", err]);
+            }
+            if ([gManagerPlan[@"done"] boolValue]) {
+                agentSay(@"Manager 判断任务已完成");
+                break;
+            }
+            executorTask = taskWithManagerPlan(task, gManagerPlan);
+        }
+        NSArray *msgs = hybridMessages(executorTask, hist, img, items, &err);
         if (!msgs) { agentSay([@"截图视觉请求失败:" stringByAppendingString:err ?: @"?"]); break; }
         NSDictionary *act = callLLM(base, key, model, msgs, &err);
         if (!act && localOK) agentSay(@"OCR+截图请求失败,稍后自动重试");
@@ -2174,6 +2217,7 @@ static void agentRunDirect(NSString *task, NSString *base, NSString *key, NSStri
         }
         if (![result isEqualToString:@"已执行"] && ![result isEqualToString:@"已打开"]) agentSay([@"提示:" stringByAppendingString:result]);
     }
+    gManagerPlan = nil;
     if (gAgentRunning) agentSay(@"任务结束");
     else agentSay(@"任务已被停止");
     gAgentRunning = NO;
