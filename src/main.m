@@ -1951,6 +1951,9 @@ static int guardSensitiveTap(NSString *target, NSString *risk, NSArray *items, d
         int r = agentAsk(@"confirm", [NSString stringWithFormat:@"在「%@」里要点击「%@」%@%@", app, tgt, risk.length ? @"。后果:" : @"", risk ?: @""]);
         if (r < 0) return -1;
         if (r == 0) { *skipNote = [NSString stringWithFormat:@"用户拒绝了点击「%@」,没有执行;请换一种方式或结束任务", tgt]; return 1; }
+        // 用户刚点击“允许”后，等待确认弹窗完全消失并把触摸焦点交还给目标 App，
+        // 避免紧接着发送的 HID 点击被系统弹窗的关闭动画吞掉。
+        usleep(1000 * 1000);
     }
     return 0;
 }
