@@ -21,6 +21,7 @@
 #import <ReplayKit/ReplayKit.h>
 #import <Speech/Speech.h>
 #import <UserNotifications/UserNotifications.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <PhotosUI/PhotosUI.h>
 #import <PDFKit/PDFKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
@@ -907,7 +908,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.9.0", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.9.1", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
@@ -1242,6 +1243,7 @@ static NSString *systemPromptWithMemory(void) {
     if (m.length) [p appendFormat:@"\n\n用户的偏好与记忆(执行任务时请参考;如果和本次任务的明确要求冲突,以本次任务为准):\n%@", m];
     NSArray *bl = blockedApps();
     if (bl.count) [p appendFormat:@"\n\n禁止进入的 App(绝对不要打开,也不要通过链接、搜索或分享进入;名称或包名里含有这些词的都算):%@", [bl componentsJoinedByString:@"、"]];
+    if (!confirmEnabled()) [p appendString:@"\n\n用户已关闭“敏感操作确认”:发送、发布、提交、删除等操作直接执行,不要为此使用 ask_user 征求用户同意,risk 留空即可;付款、转账、输入支付密码仍然要用 ask_user 请用户本人完成。"];
     if (gExpHint.length) [p appendFormat:@"\n\n%@", gExpHint];
     return p;
 }
@@ -1612,6 +1614,7 @@ static NSString *agSystemPrompt(void) {
     NSArray *bl = blockedApps();
     NSString *blPart = bl.count ? [NSString stringWithFormat:@"\n\n禁止进入的 App（绝对不要打开）：%@", [bl componentsJoinedByString:@"、"]] : @"";
     NSString *hintPart = gExpHint.length ? [@"\n\n" stringByAppendingString:gExpHint] : @"";
+    if (!confirmEnabled()) hintPart = [hintPart stringByAppendingString:@"\n\n用户已关闭“敏感操作确认”：发送、发布、提交、删除等操作直接执行，不要用 Take_over 或 Interact 征求同意，也不要给 Tap 加 message=\"重要操作\"；付款、转账、输入支付密码仍然要用 Take_over 请用户本人完成。"];
     return [NSString stringWithFormat:@"今天的日期是: %@\n%@%@%@%@", [f stringFromDate:[NSDate date]], kAGPrompt, memPart, blPart, hintPart];
 }
 
@@ -1810,6 +1813,74 @@ static NSString *agGoBack(NSArray *items) {
 
 #pragma mark - 需要用户参与(暂停 / 确认)、敏感操作与禁止 App、经验库回放
 
+// ---- 系统级弹窗:通过 CFUserNotification 让 SpringBoard 在当前任何 App 上面弹出提醒(带按钮)。
+// 需要 entitlement com.apple.springboard.show-alert;在你的系统上是否允许,我没法确认,不行时创建会失败、自动忽略(还有通知和 App 内弹窗)。
+// 返回:被点的按钮序号(0/1/2);-1 = 被取消;-2 = 创建失败(*code 是错误码);-3 = 超时或被外部取消
+static int systemAlertBlocking(NSString *title, NSString *msg, NSArray *buttons, double timeout, BOOL (^shouldCancel)(void), int *code) {
+    static void *cf; static CFTypeRef (*pCreate)(CFAllocatorRef, CFTimeInterval, CFOptionFlags, SInt32 *, CFDictionaryRef);
+    static SInt32 (*pReceive)(CFTypeRef, CFTimeInterval, CFOptionFlags *); static SInt32 (*pCancel)(CFTypeRef);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cf = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_NOW);
+        if (cf) { pCreate = dlsym(cf, "CFUserNotificationCreate"); pReceive = dlsym(cf, "CFUserNotificationReceiveResponse"); pCancel = dlsym(cf, "CFUserNotificationCancel"); }
+    });
+    if (!pCreate || !pReceive || !pCancel) { if (code) *code = -1; return -2; }
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"AlertHeader"] = title ?: @""; d[@"AlertMessage"] = msg ?: @"";
+    if (buttons.count > 0) d[@"DefaultButtonTitle"] = buttons[0];
+    if (buttons.count > 1) d[@"AlternateButtonTitle"] = buttons[1];
+    if (buttons.count > 2) d[@"OtherButtonTitle"] = buttons[2];
+    SInt32 err = 0;
+    CFTypeRef n = pCreate(kCFAllocatorDefault, 0, 0, &err, (__bridge CFDictionaryRef)d);
+    if (!n || err != 0) { if (n) CFRelease(n); if (code) *code = (int)err; return -2; }
+    int result = -3;
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+    while (CFAbsoluteTimeGetCurrent() - t0 < timeout) {
+        if (shouldCancel && shouldCancel()) break;
+        CFOptionFlags flags = 0;
+        if (pReceive(n, 1.0, &flags) == 0) { int idx = (int)(flags & 0x3); result = idx == 3 ? -1 : idx; break; }
+    }
+    pCancel(n);
+    CFRelease(n);
+    return result;
+}
+
+// 请求(暂停/确认)用的系统弹窗:确认 = 允许 / 拒绝(跳过)/ 停止任务;暂停 = 继续 / 停止任务。“本次任务不再问”在通知和 App 内弹窗里选。
+static void systemAlertForRequest(NSString *kind, NSString *text) {
+    BOOL confirm = [kind isEqualToString:@"confirm"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSArray *btn = confirm ? @[@"允许", @"拒绝(跳过这一步)", @"停止任务"] : @[@"继续", @"停止任务"];
+        int code = 0;
+        int r = systemAlertBlocking(confirm ? @"PhoneAgent 需要你确认" : @"PhoneAgent 任务已暂停",
+                                    confirm ? text : [text stringByAppendingString:@"\n\n处理完点“继续”。"], btn, 1800,
+                                    ^BOOL{ return gReqState != PAReqWaiting; }, &code);
+        if (r < 0) return;
+        if (confirm) agentRespond(r == 0 ? PAReqAllow : (r == 1 ? PAReqDeny : PAReqStop));
+        else agentRespond(r == 0 ? PAReqAllow : PAReqStop);
+    });
+}
+
+// 在“安全设置”里点“测试提醒”:5 秒后同时发通知和系统弹窗,方便你切到别的 App 看效果
+static void testReminder(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        UNUserNotificationCenter *c = UNUserNotificationCenter.currentNotificationCenter;
+        UNMutableNotificationContent *n = [UNMutableNotificationContent new];
+        n.title = @"PhoneAgent 测试提醒"; n.body = @"如果你在别的 App 里看到这条通知,说明通知可用"; n.sound = UNNotificationSound.defaultSound;
+        [c addNotificationRequest:[UNNotificationRequest requestWithIdentifier:@"pa.test" content:n trigger:nil] withCompletionHandler:nil];
+        [c getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *st) {
+            NSString *t = st.authorizationStatus == UNAuthorizationStatusAuthorized ? @"已允许" :
+                (st.authorizationStatus == UNAuthorizationStatusNotDetermined ? @"还没有选择" : @"未允许(请到 设置 → 通知 → PhoneAgent 打开)");
+            [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:[NSString stringWithFormat:@"测试提醒:通知权限 %@", t]];
+        }];
+        AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
+        int code = 0;
+        int r = systemAlertBlocking(@"PhoneAgent 测试提醒", @"如果你在别的 App 里看到这个弹窗,说明“系统弹窗”可用。点“好”关闭。", @[@"好"], 120, nil, &code);
+        NSString *res = r == -2 ? [NSString stringWithFormat:@"系统弹窗创建失败(错误码 %d):这个系统不允许,只能靠通知和 App 内弹窗", code] :
+                        r == -3 ? @"系统弹窗超时没有被点击" : @"系统弹窗可用,并且已被点击";
+        [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:[@"测试提醒:" stringByAppendingString:res]];
+    });
+}
+
 static void postRequestNotification(NSString *kind, NSString *text) {
     BOOL confirm = [kind isEqualToString:@"confirm"];
     UNMutableNotificationContent *n = [UNMutableNotificationContent new];
@@ -1818,6 +1889,11 @@ static void postRequestNotification(NSString *kind, NSString *text) {
     n.sound = UNNotificationSound.defaultSound;
     n.categoryIdentifier = confirm ? @"PA_CONFIRM" : @"PA_PAUSE";
     [UNUserNotificationCenter.currentNotificationCenter addNotificationRequest:[UNNotificationRequest requestWithIdentifier:@"pa.req" content:n trigger:nil] withCompletionHandler:nil];
+    AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
+    [UNUserNotificationCenter.currentNotificationCenter getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *st) {
+        if (st.authorizationStatus != UNAuthorizationStatusAuthorized && st.authorizationStatus != UNAuthorizationStatusProvisional)
+            agentSay(@"提示:PhoneAgent 的通知权限没有开启,在别的 App 里收不到通知。请到 设置 → 通知 → PhoneAgent 允许通知");
+    }];
 }
 static void clearRequestNotification(void) {
     UNUserNotificationCenter *c = UNUserNotificationCenter.currentNotificationCenter;
@@ -1836,6 +1912,7 @@ static int agentAsk(NSString *kind, NSString *text) {
     agentSay([NSString stringWithFormat:@"%@:%@", confirm ? @"等待你确认" : @"任务已暂停,等你处理", text]);
     [NSNotificationCenter.defaultCenter postNotificationName:@"pa.request" object:@{@"kind": kind, @"text": text}];
     postRequestNotification(kind, text);
+    systemAlertForRequest(kind, text); // 系统级弹窗:在当前任何 App 上面都能看到
     [NSNotificationCenter.defaultCenter postNotificationName:@"pa.speak"
         object:confirm ? [NSString stringWithFormat:@"需要你确认:%@", text] : [NSString stringWithFormat:@"需要你处理:%@。处理完点继续。", text]];
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
@@ -1862,6 +1939,7 @@ static int guardSensitiveTap(NSString *target, NSString *risk, NSArray *items, d
     NSString *hit = classifyAction(target, risk, items, x, y, &cat);
     if (!hit) return 0;
     NSString *tgt = target.length ? target : @"屏幕上的这个位置";
+    agentSay([NSString stringWithFormat:@"敏感操作判定:%@(依据:%@)", cat == 2 ? @"涉及付款,需要你本人处理" : @"需要你确认", hit]);
     if (cat == 2) {
         int r = agentAsk(@"pause", [NSString stringWithFormat:@"要点击「%@」,涉及付款或转账。为了安全我不会自动操作,请你本人完成;处理完点“继续”。", tgt]);
         if (r < 0) return -1;
@@ -2115,7 +2193,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
         if ([act isEqualToString:@"tap"] || [act isEqualToString:@"long press"] || [act isEqualToString:@"double tap"]) {
             if (!hasEl) { pendingNote = @"(系统提示:动作缺少 element=[x,y] 坐标。)"; continue; }
             NSString *near = nearestItemText(items, x, y);
-            NSString *risk = agArg(action, @"message").length ? @"模型标注为重要操作(支付/隐私等)" : @"";
+            NSString *risk = agArg(action, @"message").length ? @"模型标注为重要操作" : @"";
             NSString *skip = nil;
             int g = guardSensitiveTap(near, risk, items.count ? items : nil, x, y, &skip);
             if (g < 0) break;
@@ -2857,9 +2935,12 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
     UIButton *rb = [UIButton buttonWithType:UIButtonTypeSystem];
     [rb setTitle:@"恢复默认列表" forState:UIControlStateNormal];
     [rb addTarget:self action:@selector(restore) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *tb = [UIButton buttonWithType:UIButtonTypeSystem];
+    [tb setTitle:@"测试提醒(点后 5 秒内切到别的 App 看看)" forState:UIControlStateNormal];
+    [tb addTarget:self action:@selector(onTest) forControlEvents:UIControlEventTouchUpInside];
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[row, h1,
         [self lab:@"敏感词(每行一个;要点击的按钮名或它附近的文字含有这些词,就先确认)" small:NO], self.wordsTV,
-        [self lab:@"禁止进入的 App(每行一个)" small:NO], h2, self.appsTV, rb]];
+        [self lab:@"禁止进入的 App(每行一个)" small:NO], h2, self.appsTV, rb, tb]];
     st.axis = UILayoutConstraintAxisVertical; st.spacing = 12;
     st.translatesAutoresizingMaskIntoConstraints = NO;
     UIScrollView *sv = [UIScrollView new];
@@ -2884,6 +2965,12 @@ static void agentRun(NSString *task, NSString *base, NSString *key, NSString *mo
 }
 - (void)done { [self save]; [self dismissViewControllerAnimated:YES completion:nil]; }
 - (void)restore { self.wordsTV.text = defaultSensitiveWords(); self.appsTV.text = defaultBlockedApps(); }
+- (void)onTest {
+    testReminder();
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"测试提醒" message:@"5 秒后会同时发出通知和系统弹窗。请现在回到主屏幕或切到别的 App(比如微信)等着;结果会写在 PhoneAgent 的日志里。" preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
 - (void)viewWillDisappear:(BOOL)animated { [super viewWillDisappear:animated]; [self save]; }
 @end
 

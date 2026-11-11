@@ -16,5 +16,6 @@
     <string>IOSurfaceAcceleratorClient</string>
     <string>AGXDeviceUserClient</string>
   </array>
+  <key>com.apple.springboard.show-alert</key><true/>
 </dict>
 </plist>
