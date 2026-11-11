@@ -1150,11 +1150,18 @@ static NSDictionary *callLLMOnce(NSString *base, NSString *key, NSString *model,
     r.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
     __block NSData *data = nil; __block NSError *e = nil; __block NSInteger code = 0;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *er) {
+    NSURLSessionDataTask *task = [NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *er) {
         data = d; e = er; code = [(NSHTTPURLResponse *)resp statusCode];
         dispatch_semaphore_signal(sem);
-    }] resume];
-    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    }];
+    [task resume];
+    while (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC)) != 0) {
+        if (!gAgentRunning) {
+            [task cancel];
+            if (err) *err = @"用户已停止任务";
+            return nil;
+        }
+    }
     if (e || !data) { *err = [NSString stringWithFormat:@"网络错误:%@", e.localizedDescription ?: @"无数据"]; return nil; }
     if (code != 200) {
         NSString *t = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
@@ -1697,11 +1704,18 @@ static NSString *agPostOnce(NSString *base, NSString *key, NSDictionary *body, N
     r.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
     __block NSData *data = nil; __block NSError *e = nil; __block NSInteger code = 0;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *er) {
+    NSURLSessionDataTask *task = [NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *er) {
         data = d; e = er; code = [(NSHTTPURLResponse *)resp statusCode];
         dispatch_semaphore_signal(sem);
-    }] resume];
-    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    }];
+    [task resume];
+    while (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC)) != 0) {
+        if (!gAgentRunning) {
+            [task cancel];
+            if (err) *err = @"用户已停止任务";
+            return nil;
+        }
+    }
     if (e || !data) { *err = [NSString stringWithFormat:@"网络错误:%@", e.localizedDescription ?: @"无数据"]; return nil; }
     if (code != 200) {
         NSString *t = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
