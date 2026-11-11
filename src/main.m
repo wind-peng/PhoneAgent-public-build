@@ -724,7 +724,8 @@ static NSString *classifyAction(NSString *target, NSString *risk, NSArray *items
     NSString *blob = [NSString stringWithFormat:@"%@ %@ %@", target ?: @"", near, risk ?: @""];
     int cat = 0;
     NSString *w = sensitiveMatch(blob, &cat);
-    if (!w && risk.length && confirmEnabled()) { cat = 1; w = @"模型标注的风险"; }
+    // 只有安全设置中的敏感词命中时才请求确认；模型的 risk 仅用于辅助判断和日志，
+    // 不再因为模型自行填写 risk 就绕过用户的敏感词设置强制弹确认。
     *category = cat;
     return w;
 }
