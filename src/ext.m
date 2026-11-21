@@ -40,6 +40,18 @@ static NSString *postToHost(NSString *path, NSData *body) {
     return [[NSString alloc] initWithData:resp encoding:NSUTF8StringEncoding] ?: @"";
 }
 
+// 读取主 App 生成的随机暗号(App Group 共享偏好,读不到再看本机文件);都没有就返回空串,主 App 会拒绝
+static NSString *frameKey(void) {
+    NSUserDefaults *g = [[NSUserDefaults alloc] initWithSuiteName:PA_APP_GROUP];
+    NSString *k = [g stringForKey:PA_FRAME_KEY_NAME];
+    if (k.length < 16) {
+        NSString *fk = [[NSString stringWithContentsOfFile:PA_FRAME_KEY_FILE encoding:NSUTF8StringEncoding error:nil]
+                        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (fk.length >= 16) k = fk;
+    }
+    return k.length >= 16 ? k : @"";
+}
+
 // 在扩展进程里试一下能不能创建 IOSurface(用来判断这个限制是不是整个 App 都有)
 static int iosurfaceWorks(void) {
     void *h = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
@@ -63,6 +75,7 @@ static int iosurfaceWorks(void) {
     dispatch_source_t _timer;
     volatile int _inflight;
     int _isf;
+    NSString *_key;
     CVPixelBufferRef _pending;
     dispatch_queue_t _procQ;
     dispatch_source_t _flushTimer;
@@ -71,12 +84,14 @@ static int iosurfaceWorks(void) {
 - (void)broadcastStartedWithSetupInfo:(NSDictionary<NSString *, NSObject *> *)setupInfo {
     signal(SIGPIPE, SIG_IGN);
     _isf = iosurfaceWorks();
+    _key = frameKey();
     _ci = [CIContext contextWithOptions:nil];
     _q = dispatch_queue_create("pa.net", DISPATCH_QUEUE_SERIAL);
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _q);
     dispatch_source_set_timer(_timer, DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC, NSEC_PER_SEC / 2);
     dispatch_source_set_event_handler(_timer, ^{
-        NSString *resp = postToHost([NSString stringWithFormat:@"/hb?key=%s&is=%d", FRAME_KEY, self->_isf], [NSData data]);
+        if (!self->_key.length) self->_key = frameKey(); // 主 App 还没生成暗号时,之后每次心跳再读一次
+        NSString *resp = postToHost([NSString stringWithFormat:@"/hb?key=%@&is=%d", self->_key, self->_isf], [NSData data]);
         if ([resp containsString:@"\"cmd\":\"stop\""]) { // 主 App 要求结束录屏(任务已完成)
             dispatch_async(dispatch_get_main_queue(), ^{
                 NSString *msg = @"任务已结束,屏幕录制已自动关闭";
@@ -99,7 +114,7 @@ static int iosurfaceWorks(void) {
     if (_timer) { dispatch_source_cancel(_timer); _timer = nil; }
     if (_flushTimer) { dispatch_source_cancel(_flushTimer); _flushTimer = nil; }
     @synchronized (self) { if (_pending) { CVPixelBufferRelease(_pending); _pending = NULL; } }
-    postToHost(@"/bye?key=" FRAME_KEY, [NSData data]);
+    postToHost([@"/bye?key=" stringByAppendingString:_key ?: @""], [NSData data]);
 }
 
 - (void)processSampleBuffer:(CMSampleBufferRef)sb withType:(RPSampleBufferType)type {
@@ -155,8 +170,9 @@ static int iosurfaceWorks(void) {
         [pkt appendData:jpg];
         if (nv) [pkt appendData:nv];
         _inflight = 1;
+        NSString *fpath = [@"/frame?key=" stringByAppendingString:_key ?: @""];
         dispatch_async(_q, ^{
-            postToHost(@"/frame?key=" FRAME_KEY, pkt);
+            postToHost(fpath, pkt);
             self->_inflight = 0;
         });
     }

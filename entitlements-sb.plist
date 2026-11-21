@@ -8,5 +8,9 @@
   <key>com.apple.backboard.client</key><true/>
   <key>com.apple.springboard.launchapplications</key><true/>
   <key>com.apple.springboard.opensensitiveurl</key><true/>
+  <key>com.apple.security.application-groups</key>
+  <array>
+    <string>group.com.example.phoneagent.shared</string>
+  </array>
 </dict>
 </plist>
