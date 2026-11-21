@@ -1120,6 +1120,15 @@ static NSArray *trimOCRItems(NSArray *items) {
         NSString *t = [[it[@"text"] description] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         if (!t.length) continue;
         if ([it[@"y"] doubleValue] < 45) continue; // 状态栏(时间、电量)
+        if ([it[@"y"] doubleValue] < 100 && [t containsString:@"PhoneAgent"]) continue; // v0.9.9:录屏标识/返回 PhoneAgent 小字
+        if (t.length >= 4) { // v0.9.9:符号占一半以上的乱码不要
+            NSUInteger good = 0;
+            for (NSUInteger k = 0; k < t.length; k++) {
+                unichar c = [t characterAtIndex:k];
+                if ((c >= 0x4E00 && c <= 0x9FFF) || [NSCharacterSet.alphanumericCharacterSet characterIsMember:c]) good++;
+            }
+            if (good * 2 < t.length) continue;
+        }
         BOOL dup = NO;
         for (NSDictionary *o in out)
             if ([o[@"text"] isEqualToString:t] && fabs([o[@"x"] doubleValue] - [it[@"x"] doubleValue]) < 12 && fabs([o[@"y"] doubleValue] - [it[@"y"] doubleValue]) < 12) { dup = YES; break; }
@@ -1224,6 +1233,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     NSMutableArray *plan = [NSMutableArray array], *planDone = [NSMutableArray array]; // 12:子目标
     BOOL needImage = YES, lastUsedXY = NO, doneChecked = NO, doneCheckPending = NO, settled = NO;
     NSString *lastAction = @"";
+    NSString *pendingInputText = nil;      // v0.9.9:刚输入的文字,下一步用 OCR 核对(代替截图确认)
     NSString *pendingSwipeSig = nil;       // 5:上一步滑动前的屏幕签名,下一步对比确认有没有滚动
     NSMutableArray *queue = [NSMutableArray array]; NSArray *queueItems = nil; NSData *queueThumb = nil; // S7:预定的后续动作
     int adWaits = 0, popupTaps = 0, relaunches = 0, castLost = 0;
@@ -1403,7 +1413,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 int c = thumbChangedCells(queueThumb, thumbNow);
                 if (c < 0 || c > thumbTotalCells() / 4) ok = NO; // 页面已经变了,坐标不再可靠
             }
-            if (ok) { act = nx; fromQueue = YES; agentSay([NSString stringWithFormat:@"连续动作:屏幕核对通过,直接执行 %@", na]); }
+            if (ok) { act = nx; fromQueue = YES; pendingInputText = nil; agentSay([NSString stringWithFormat:@"连续动作:屏幕核对通过,直接执行 %@", na]); }
             else {
                 [queue removeAllObjects];
                 [history addObject:[NSString stringWithFormat:@"%d. (预定的后续动作因屏幕变化/上一步失败已取消)", step]];
@@ -1413,6 +1423,20 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
         if (!act) {
             while (histProg.count < history.count) [histProg addObject:progress ?: @""];
             NSMutableString *hist = [NSMutableString string];
+            // v0.9.9:上一步输入了文字 → 用 OCR 核对,对上了就不必发截图
+            if (pendingInputText.length) {
+                NSString *want = [[pendingInputText stringByReplacingOccurrencesOfString:@" " withString:@""] lowercaseString];
+                NSString *probe = want.length > 6 ? [want substringToIndex:6] : want;
+                NSString *hit = nil;
+                for (NSDictionary *it in items) {
+                    NSString *t = [[[it[@"text"] description] stringByReplacingOccurrencesOfString:@" " withString:@""] lowercaseString];
+                    if (!t.length) continue;
+                    if ([t containsString:probe] || (t.length >= 2 && [want containsString:t] && t.length * 2 >= want.length)) { hit = [it[@"text"] description]; break; }
+                }
+                if (hit) [hist appendFormat:@"(系统核对:屏幕上 OCR 到「%@」,与刚输入的「%@」一致,输入已成功,不需要再确认,直接做下一步)\n", hit, pendingInputText];
+                else { [hist appendFormat:@"(系统核对:OCR 没在屏幕上找到刚输入的「%@」,已附截图,请确认输入框状态)\n", pendingInputText]; needImage = YES; }
+                pendingInputText = nil;
+            }
             if (progress.length) [hist appendFormat:@"当前进度:%@\n", progress]; // 进度放在 8 条历史窗口之外,始终带上
             if (plan.count) {
                 [hist appendString:@"子目标:\n"];
@@ -1458,6 +1482,22 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 NSDictionary *act2 = callLLM(base, key, model, m2, &e2);
                 if (!gAgentRunning) break;
                 if (act2 && !validateAct(act2, allItems.count)) act = act2;
+            }
+            // v0.9.9:纯文字步里模型说要看截图(或因看不清而 wait)→ 本步直接补发截图重问,不浪费一步
+            if (!includeImage && act) {
+                NSString *a0 = [[act[@"action"] description] lowercaseString] ?: @"";
+                NSString *th = [act[@"thought"] description] ?: @"";
+                BOOL wantImg = [act[@"need_image"] respondsToSelector:@selector(boolValue)] && [act[@"need_image"] boolValue];
+                BOOL unsure = NO;
+                for (NSString *w in @[@"截图", @"确认", @"不明", @"乱码", @"看不", @"不清", @"无法判断", @"不确定"]) if ([th containsString:w]) { unsure = YES; break; }
+                if ([a0 isEqualToString:@"wait"] && (wantImg || unsure)) {
+                    agentSay(@"提示:模型需要看截图,本步补发截图重新询问");
+                    NSString *e3 = nil;
+                    NSArray *m3 = hybridMessages2(task, hist, img, hq ? nil : jpgPre, prevForModel, allItems, YES, hq, &e3);
+                    NSDictionary *act3 = m3 ? callLLM(base, key, model, m3, &e3) : nil;
+                    if (!gAgentRunning) break;
+                    if (act3 && !validateAct(act3, allItems.count)) act = act3;
+                }
             }
             prevImg = img;
             if ([act[@"need_image"] respondsToSelector:@selector(boolValue)] && [act[@"need_image"] boolValue]) needImage = YES;
@@ -1681,8 +1721,10 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                     sleep(1);
                     continue;
                 }
-                result = note.length ? [NSString stringWithFormat:@"已尝试粘贴,但%@;请看下一张截图确认输入框里有没有文字,没有就再用 input_text", note]
-                                     : @"已把文字粘贴进输入框(键盘快捷键或粘贴菜单),请看下一张截图确认";
+                result = note.length ? [NSString stringWithFormat:@"已尝试粘贴,但%@;下一步会附截图,请确认输入框里有没有文字,没有就再用 input_text", note]
+                                     : @"已把文字粘贴进输入框;下一步系统会用 OCR 核对输入框里的文字,一致就不用再确认";
+                pendingInputText = text;
+                if (note.length) needImage = YES;
                 [history addObject:[NSString stringWithFormat:@"%d. input_text(%@,%@)", step, usedID ? [NSString stringWithFormat:@"id=%ld", (long)oid] : [NSString stringWithFormat:@"%.0f,%.0f", xpx, ypx], text]];
                 expRecord(@{@"a": @"input_text", @"text": text, @"t": usedID ? (usedIcon ? @"" : idText) : ([act[@"target"] description] ?: @""), @"x": @(x), @"y": @(y), @"anchors": localOK ? expAnchors(items) : @[]});
                 afterAction(0.2, 1.5, 1); settled = YES;
@@ -1767,6 +1809,8 @@ void agentRun(NSString *task, NSString *base, NSString *key, NSString *model) {
         if (ensureBroadcast(&n)) agentSay(@"屏幕录制已自动开启");
         else { agentSay([NSString stringWithFormat:@"任务停止:自动开启屏幕录制失败(%@),请手动开启屏幕广播后再开始", n ?: @""]); proceed = NO; }
     }
+    tokReset();
     if (proceed && gAgentRunning) agentRunCore(task, base, key, model);
+    { NSString *ts = tokSummary(NO); if (ts.length) agentSay(ts); }
     taskRunEnd(task, autoCast);
 }

@@ -156,3 +156,9 @@ NSArray *hybridMessages2(NSString *task, NSString *history, UIImage *img, NSData
 extern BOOL gOCRGuardTripped;
 BOOL ocrCrashGuardCheck(void);
 BOOL ocrAccurateOn(void);
+
+// v0.9.9 Token 统计
+void tokAdd(id usage);
+void tokReset(void);
+NSString *tokSummary(BOOL total);
+void tokClearTotal(void);
