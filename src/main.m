@@ -1692,7 +1692,7 @@ static NSString *agFrameSig(NSData *d) {
 }
 
 // 直接把一个完整请求体发给 /chat/completions,返回第一条回复的文字
-static NSString *agPostOnce(NSString *base, NSString *key, NSDictionary *body, NSString **err) {
+static NSString *agPostOnce(NSString *base, NSString *key, NSDictionary *body, BOOL honorStop, NSString **err) {
     while ([base hasSuffix:@"/"]) base = [base substringToIndex:base.length - 1];
     NSURL *url = [NSURL URLWithString:[base stringByAppendingString:@"/chat/completions"]];
     if (!url) { *err = @"接口地址格式不对"; return nil; }
@@ -1710,7 +1710,7 @@ static NSString *agPostOnce(NSString *base, NSString *key, NSDictionary *body, N
     }];
     [task resume];
     while (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC)) != 0) {
-        if (!gAgentRunning) {
+        if (honorStop && !gAgentRunning) {
             [task cancel];
             if (err) *err = @"用户已停止任务";
             return nil;
@@ -1734,7 +1734,7 @@ static NSString *agPostRetry(NSString *base, NSString *key, NSDictionary *body, 
     NSString *last = nil;
     for (int attempt = 1; attempt <= 5; attempt++) {
         NSString *e = nil;
-        NSString *r = agPostOnce(base, key, body, &e);
+        NSString *r = agPostOnce(base, key, body, honorStop, &e);
         if (r.length) return r;
         if (r && !r.length) e = @"模型没有输出答案";
         last = e;
