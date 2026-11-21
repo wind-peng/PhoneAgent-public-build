@@ -238,6 +238,7 @@ static NSDictionary *agPostFull(NSString *base, NSString *key, NSDictionary *bod
         return nil;
     }
     NSDictionary *j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if ([j isKindOfClass:NSDictionary.class]) tokAdd(j[@"usage"]);
     NSDictionary *msg = nil;
     @try { msg = j[@"choices"][0][@"message"]; } @catch (NSException *ex) {}
     if (![msg isKindOfClass:NSDictionary.class]) { *err = @"接口返回格式不认识"; return nil; }
@@ -257,6 +258,52 @@ NSString *agPostOnce(NSString *base, NSString *key, NSDictionary *body, BOOL hon
     if ([content isKindOfClass:NSNull.class] || !content) content = @"";
     if (![content isKindOfClass:NSString.class]) { *err = @"接口返回格式不认识"; return nil; }
     return content;
+}
+
+#pragma mark - Token 统计(v0.9.9)
+static long long gTokIn, gTokOut, gTokCache, gTokReason; static int gTokCalls;
+static long long numOf(id v) { return [v respondsToSelector:@selector(longLongValue)] ? [v longLongValue] : 0; }
+void tokAdd(id usage) {
+    if (![usage isKindOfClass:NSDictionary.class]) return;
+    NSDictionary *u = usage;
+    long long in = numOf(u[@"prompt_tokens"]), out = numOf(u[@"completion_tokens"]);
+    long long cache = numOf(u[@"prompt_cache_hit_tokens"]); // DeepSeek
+    id pd = u[@"prompt_tokens_details"];
+    if (!cache && [pd isKindOfClass:NSDictionary.class]) cache = numOf(pd[@"cached_tokens"]); // GLM / OpenAI 格式
+    long long reason = 0;
+    id cd = u[@"completion_tokens_details"];
+    if ([cd isKindOfClass:NSDictionary.class]) reason = numOf(cd[@"reasoning_tokens"]);
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    @synchronized (NSUserDefaults.class) {
+        gTokIn += in; gTokOut += out; gTokCache += cache; gTokReason += reason; gTokCalls++;
+        [ud setObject:@([[ud objectForKey:@"tok_total_in"] longLongValue] + in) forKey:@"tok_total_in"];
+        [ud setObject:@([[ud objectForKey:@"tok_total_out"] longLongValue] + out) forKey:@"tok_total_out"];
+        [ud setObject:@([[ud objectForKey:@"tok_total_cache"] longLongValue] + cache) forKey:@"tok_total_cache"];
+        [ud setObject:@([[ud objectForKey:@"tok_total_calls"] longLongValue] + 1) forKey:@"tok_total_calls"];
+    }
+}
+void tokReset(void) { @synchronized (NSUserDefaults.class) { gTokIn = gTokOut = gTokCache = gTokReason = 0; gTokCalls = 0; } }
+static NSString *fmtTok(long long n) { return n >= 10000 ? [NSString stringWithFormat:@"%.1f 万", n / 10000.0] : [NSString stringWithFormat:@"%lld", n]; }
+NSString *tokSummary(BOOL total) {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    long long in, out, cache, calls, reason = 0;
+    @synchronized (NSUserDefaults.class) {
+        if (total) {
+            in = [[ud objectForKey:@"tok_total_in"] longLongValue]; out = [[ud objectForKey:@"tok_total_out"] longLongValue];
+            cache = [[ud objectForKey:@"tok_total_cache"] longLongValue]; calls = [[ud objectForKey:@"tok_total_calls"] longLongValue];
+        } else { in = gTokIn; out = gTokOut; cache = gTokCache; calls = gTokCalls; reason = gTokReason; }
+    }
+    if (!calls) return total ? @"累计还没有调用记录" : @"";
+    NSMutableString *s = [NSMutableString stringWithFormat:@"%@Token:输入 %@", total ? @"累计 " : @"本次 ", fmtTok(in)];
+    if (cache > 0) [s appendFormat:@"(缓存命中 %@,%.0f%%)", fmtTok(cache), in > 0 ? cache * 100.0 / in : 0];
+    [s appendFormat:@",输出 %@", fmtTok(out)];
+    if (reason > 0) [s appendFormat:@"(其中思考 %@)", fmtTok(reason)];
+    [s appendFormat:@",共 %lld 次调用", calls];
+    return s;
+}
+void tokClearTotal(void) {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    for (NSString *k in @[@"tok_total_in", @"tok_total_out", @"tok_total_cache", @"tok_total_calls"]) [ud removeObjectForKey:k];
 }
 
 #pragma mark - 函数调用(tools)

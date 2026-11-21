@@ -151,3 +151,9 @@ NSString *effectiveModel(NSString *model);
 NSData *encodeForModel(UIImage *img, BOOL hq);
 NSArray *hybridMessages2(NSString *task, NSString *history, UIImage *img, NSData *jpgPre, UIImage *prevImg, NSArray *items,
                          BOOL includeImage, BOOL hq, NSString **err);
+
+// v0.9.6r Token 统计
+void tokAdd(id usage);
+void tokReset(void);
+NSString *tokSummary(BOOL total);
+void tokClearTotal(void);

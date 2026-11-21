@@ -207,6 +207,7 @@
 - (void)done { [self save]; [self dismissViewControllerAnimated:YES completion:nil]; }
 - (void)clearAll { self.tv.text = @""; }
 - (void)viewWillDisappear:(BOOL)animated { [super viewWillDisappear:animated]; [self save]; }
+- (void)onTokClear { tokClearTotal(); self.tokL.text = tokSummary(YES); }
 @end
 
 // ---- 安全设置:敏感操作确认、禁止进入的 App ----
@@ -506,6 +507,7 @@ static NSData *attachJPEG(UIImage *img) {
 @interface AdvancedVC : UIViewController
 @property (nonatomic, strong) UITextView *popupTV;
 @property (nonatomic, strong) UITextField *bBase, *bKey, *bModel;
+@property (nonatomic, strong) UILabel *tokL;
 @end
 @implementation AdvancedVC
 - (UIStackView *)sw:(NSString *)title key:(NSString *)key def:(BOOL)def {
@@ -536,7 +538,7 @@ static NSData *attachJPEG(UIImage *img) {
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"高级设置(v0.9.6)";
+    self.title = @"高级设置(v0.9.17)";
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
     self.popupTV = [UITextView new];
@@ -550,7 +552,15 @@ static NSData *attachJPEG(UIImage *img) {
     UIButton *cal = [UIButton buttonWithType:UIButtonTypeSystem];
     [cal setTitle:@"打开触摸校准页" forState:UIControlStateNormal];
     [cal addTarget:self action:@selector(onCalib) forControlEvents:UIControlEventTouchUpInside];
+    self.tokL = [UILabel new];
+    self.tokL.numberOfLines = 0; self.tokL.font = [UIFont systemFontOfSize:14];
+    self.tokL.text = tokSummary(YES);
+    UIButton *tokClr = [UIButton buttonWithType:UIButtonTypeSystem];
+    [tokClr setTitle:@"累计清零" forState:UIControlStateNormal];
+    [tokClr addTarget:self action:@selector(onTokClear) forControlEvents:UIControlEventTouchUpInside];
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
+        [self hdr:@"Token 统计(每次任务结束也会在执行记录里显示本次用量)"],
+        self.tokL, tokClr,
         [self hdr:@"模型请求"],
         [self sw:@"用函数调用(tools)输出动作(GLM/DeepSeek;不支持时自动退回 JSON)" key:@"use_tool_calls" def:YES],
         [self sw:@"DeepSeek 分档:常规步骤 deepseek-flash,卡住/规划/完成自检用 deepseek-v4-pro" key:@"ds_tiering" def:YES],

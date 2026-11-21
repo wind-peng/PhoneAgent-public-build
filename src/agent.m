@@ -1226,7 +1226,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     NSString *lastAction = @"";
     NSString *pendingSwipeSig = nil;       // 5:上一步滑动前的屏幕签名,下一步对比确认有没有滚动
     NSMutableArray *queue = [NSMutableArray array]; NSArray *queueItems = nil; NSData *queueThumb = nil; // S7:预定的后续动作
-    int adWaits = 0, popupTaps = 0, relaunches = 0, castLost = 0;
+    int adWaits = 0, popupTaps = 0, relaunches = 0, castLost = 0, selfBlocks = 0; // selfBlocks:v0.9.17 拦截点 PhoneAgent 自己界面的次数
     NSString *lastPopupKey = nil;
     NSString *taskApp = nil; BOOL expectHome = NO;
     UIImage *prevImg = nil;
@@ -1301,6 +1301,8 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
         NSString *screen = localOK ? sigText : thumbSig(thumbNow);
         // 9:前台 App 意外变化(崩溃回到主屏 / 跳到别的 App)
         NSString *front = frontmostBundleID();
+        // v0.9.17:前台是 PhoneAgent 自己(自动开录屏后会回到这里)。任务已经在跑,不能让模型去点“开始任务”
+        BOOL onSelf = front.length ? [front isEqualToString:selfID] : (appStateNow() == UIApplicationStateActive);
         if (front.length) {
             BOOL third = ![front isEqualToString:@"com.apple.springboard"] && ![front isEqualToString:selfID];
             if (third) {
@@ -1426,6 +1428,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             } else if (planning && paOn(@"subgoal_plan", YES)) {
                 [hist appendString:@"(这是第 1 步:请同时在 plan 字段里给出 3-6 个简短的子目标。)\n"];
             }
+            if (onSelf) [hist appendString:@"(系统提示:当前屏幕是 PhoneAgent 自己的界面,也就是正在控制手机执行你这个任务的程序。任务已经开始运行,不需要、也不允许点“开始任务”或这个界面上的任何按钮、输入框。请直接用 open_app 打开完成任务需要的 App;子目标里不要写“点击开始任务”。)\n"];
             if (same >= 2) [hist appendString:@"(系统提示:最近几步操作后屏幕都没有变化,请换一种办法,例如换个位置点、先返回再进、或用别的入口。)\n"];
             NSUInteger from = history.count > 8 ? history.count - 8 : 0;
             if (from > 0) {
@@ -1467,6 +1470,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 [plan removeAllObjects]; [planDone removeAllObjects];
                 for (id p in pl) {
                     if (![p isKindOfClass:NSString.class] || ![p length]) continue;
+                    if ([p containsString:@"开始任务"]) continue; // v0.9.17:任务已经在运行,这一条子目标不要
                     [plan addObject:[p length] > 30 ? [p substringToIndex:30] : p];
                     [planDone addObject:@NO];
                     if (plan.count >= 6) break;
@@ -1510,6 +1514,24 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             NSString *p = [pg isKindOfClass:NSString.class] ? [pg stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] : @"";
             if (p.length > 60) p = [p substringToIndex:60];
             if (p.length) progress = p;
+        }
+        // v0.9.17:前台是 PhoneAgent 自己时,不执行点击/输入/滑动/返回(会点到“开始任务”等按钮),提示模型改用 open_app;
+        // 连续被拦 2 次说明模型还是想点,就回主屏幕让它从主屏幕打开 App
+        if (onSelf && [@[@"tap", @"double_tap", @"double tap", @"long_press", @"long press", @"input_text", @"swipe", @"back"] containsObject:action]) {
+            selfBlocks++;
+            [queue removeAllObjects];
+            agentSay([NSString stringWithFormat:@"第%d步:%@ → %@(已拦截:当前是 PhoneAgent 自己的界面,任务已在运行,不点这里)", step, thought, action]);
+            if (selfBlocks >= 2) {
+                NSString *hn = nil; goHome(&hn);
+                afterAction(0.8, 3.0, 2); settled = YES;
+                agentSay(@"模型连续两次想点 PhoneAgent 界面,已回到主屏幕");
+                [history addObject:[NSString stringWithFormat:@"%d. (你又想点 PhoneAgent 自己的界面,程序已拦截并回到主屏幕。任务已在运行,请从主屏幕用 open_app 打开需要的 App)", step]];
+                selfBlocks = 0;
+            } else {
+                [history addObject:[NSString stringWithFormat:@"%d. (%@ 未执行:当前是 PhoneAgent 自己的界面,任务已经在运行,不要点“开始任务”或这里的任何按钮;请用 open_app 打开需要的 App)", step, action]];
+            }
+            lastSig = @""; same = 0; failedLast = NO;
+            continue;
         }
         // 模型给的是 780x1688 截图的像素坐标,换算成屏幕 pt;有 id 就直接用 OCR 文字的中心(已经是 pt)
         double kx = sc.width / MODEL_W, ky = sc.height / MODEL_H;
@@ -1767,6 +1789,8 @@ void agentRun(NSString *task, NSString *base, NSString *key, NSString *model) {
         if (ensureBroadcast(&n)) agentSay(@"屏幕录制已自动开启");
         else { agentSay([NSString stringWithFormat:@"任务停止:自动开启屏幕录制失败(%@),请手动开启屏幕广播后再开始", n ?: @""]); proceed = NO; }
     }
+    tokReset();
     if (proceed && gAgentRunning) agentRunCore(task, base, key, model);
+    { NSString *ts = tokSummary(NO); if (ts.length) agentSay(ts); }
     taskRunEnd(task, autoCast);
 }
