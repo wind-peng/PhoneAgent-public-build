@@ -144,7 +144,9 @@ static NSDictionary *callLLMOnce(NSString *base, NSString *key, NSString *model,
     // GLM-5.3 系列:思考模式始终开启,思考内容也占 max_tokens。
     // 平时用 reasoning_effort=medium + 8192,省时省钱;上一步失败或屏幕没变化(gEscalate)时升到 max + 16384。
     BOOL glm = [model.lowercaseString hasPrefix:@"glm"];
-    BOOL esc = gEscalate;
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    BOOL adaptive = [ud objectForKey:@"glm_adaptive_effort"] ? [ud boolForKey:@"glm_adaptive_effort"] : YES; // 设置里可关:关掉就一直用 max + 16384(旧行为)
+    BOOL esc = !adaptive || gEscalate;
     NSDictionary *body = glm
         ? @{@"model": model, @"messages": messages, @"temperature": @1.0, @"top_p": @0.95, @"max_tokens": esc ? @16384 : @8192,
             @"thinking": @{@"type": @"enabled", @"clear_thinking": @NO}, @"reasoning_effort": esc ? @"max" : @"medium"}
@@ -296,7 +298,9 @@ NSArray *hybridMessages(NSString *task, NSString *history, UIImage *img, NSArray
     gPrevModelJPEG = jpg;
     NSMutableArray *content = [NSMutableArray arrayWithObject:@{ @"type": @"text", @"text": text }];
     NSArray *atts = gRunImages; // 用户随任务附带的图片(参考资料):只在第 1 次请求时发送,之后用一行文字代替,省流量和 token
-    if (atts.count && gRunImagesSent) {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    BOOL firstOnly = [ud objectForKey:@"attach_first_only"] ? [ud boolForKey:@"attach_first_only"] : YES; // 设置里可关:关掉就每步都发(旧行为)
+    if (atts.count && gRunImagesSent && firstOnly) {
         [content addObject:@{ @"type": @"text", @"text": [NSString stringWithFormat:@"(任务附带了 %lu 张参考图片,第 1 步已发送)", (unsigned long)atts.count] }];
         atts = nil;
     } else if (atts.count) {

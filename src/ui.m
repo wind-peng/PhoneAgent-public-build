@@ -492,6 +492,8 @@ static NSData *attachJPEG(UIImage *img) {
     UIStackView *ttsrow = [[UIStackView alloc] initWithArrangedSubviews:@[ttl, tts]];
     ttsrow.axis = UILayoutConstraintAxisHorizontal; ttsrow.alignment = UIStackViewAlignmentCenter;
     ttsrow.distribution = UIStackViewDistributionEqualSpacing;
+    UIStackView *glmrow = [self switchRow:@"GLM 省时思考(平时中等,卡住时自动升到最高)" key:@"glm_adaptive_effort" action:@selector(onGLMAdaptive:)];
+    UIStackView *attrow = [self switchRow:@"附件图只在第一步发送(省流量)" key:@"attach_first_only" action:@selector(onAttachFirstOnly:)];
     UIStackView *brow = [[UIStackView alloc] initWithArrangedSubviews:@[bl, pv]];
     brow.axis = UILayoutConstraintAxisHorizontal; brow.spacing = 10; brow.alignment = UIStackViewAlignmentCenter;
 
@@ -506,7 +508,7 @@ static NSData *attachJPEG(UIImage *img) {
         provRow, self.keyF, self.baseF, self.modelF,
         self.taskTV, [self row:@[self.micBtn, attBtn]], self.attLabel,
         [self row:@[startBtn, stopBtn]], [self row:@[memBtn, safeBtn]], [self row:@[expBtn, resBtn]],
-        acrow, ttsrow, brow, [self row:@[keepBtn, diagBtn]], tokenL, self.log]];
+        acrow, ttsrow, glmrow, attrow, brow, [self row:@[keepBtn, diagBtn]], tokenL, self.log]];
     st.axis = UILayoutConstraintAxisVertical;
     st.spacing = 10;
     st.translatesAutoresizingMaskIntoConstraints = NO;
@@ -778,6 +780,23 @@ static NSData *attachJPEG(UIImage *img) {
 }
 - (void)onTTS:(UISwitch *)sw { [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"tts_on"]; if (!sw.on) [[PATTS shared] stop]; }
 - (void)onAutoCast:(UISwitch *)sw { [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"auto_cast"]; }
+- (void)onGLMAdaptive:(UISwitch *)sw { [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"glm_adaptive_effort"]; }
+- (void)onAttachFirstOnly:(UISwitch *)sw { [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"attach_first_only"]; }
+// 一行“文字 + 开关”,开关状态存在 NSUserDefaults 的 key 里(没存过时默认开)
+- (UIStackView *)switchRow:(NSString *)title key:(NSString *)key action:(SEL)action {
+    UILabel *l = [UILabel new];
+    l.text = title; l.font = [UIFont systemFontOfSize:15]; l.numberOfLines = 0;
+    [l setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+    UISwitch *sw = [UISwitch new];
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    sw.on = [ud objectForKey:key] ? [ud boolForKey:key] : YES;
+    [sw setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [sw setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [sw addTarget:self action:action forControlEvents:UIControlEventValueChanged];
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[l, sw]];
+    row.axis = UILayoutConstraintAxisHorizontal; row.alignment = UIStackViewAlignmentCenter; row.spacing = 10;
+    return row;
+}
 - (void)onStop { gAgentRunning = NO; agentRespond(PAReqStop); [self say:@"正在停止任务……"]; }
 - (void)onKeep { [self say:setKeepAlive(gPlayer == nil)]; }
 - (void)onDiag { [self say:diagReport()]; }
