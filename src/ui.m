@@ -575,7 +575,7 @@ static NSData *attachJPEG(UIImage *img) {
         [self sw:@"检测无文字小图标(×、返回箭头等)" key:@"icon_detect" def:YES],
         [self sw:@"合并同一行相邻的 OCR 碎片" key:@"ocr_merge" def:YES],
         [self sw:@"右上角小字放大再识别一次" key:@"ocr_corner" def:YES],
-        [self sw:@"OCR 精确模式(较慢;未在 iOS 16.1 真机验证)" key:@"ocr_accurate" def:NO],
+        [self sw:@"OCR 精确模式(较慢;闪退会自动关闭)" key:@"ocr_accurate" def:NO],
         [self hdr:@"自我恢复与长任务"],
         [self sw:@"目标 App 意外退出时自动重新打开" key:@"auto_relaunch" def:YES],
         [self sw:@"录屏画面卡住时暂停提醒" key:@"stale_frame_check" def:YES],
@@ -1047,6 +1047,7 @@ static NSData *attachJPEG(UIImage *img) {
     static BOOL asked;
     if (asked) return;
     asked = YES;
+    if (gOCRGuardTripped) [self say:@"上次 OCR 精确模式运行中闪退了,已自动关闭精确模式(可在高级设置里重新打开)"];
     if (gAgentRunning) return;
     NSDictionary *cp = cpLoad();
     if (!cp) return;
@@ -1243,6 +1244,7 @@ static NSData *attachJPEG(UIImage *img) {
 
 - (BOOL)application:(UIApplication *)a didFinishLaunchingWithOptions:(NSDictionary *)o {
     signal(SIGPIPE, SIG_IGN);
+    gOCRGuardTripped = ocrCrashGuardCheck(); // 上次精确 OCR 中途闪退 → 自动关闭精确模式
     gLock = [NSObject new];
     gAgentLog = [NSMutableArray array];
     gRunLog = [NSMutableArray array];

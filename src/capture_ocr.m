@@ -210,51 +210,98 @@ static UIImage *prepareOCRImage(UIImage *src) {
 // iOS 16.1 的 Vision Revision 3 模型在本项目环境中会触发
 // "Semaphore object deallocated while in use"，因此固定使用稳定的 Revision 1/Fast。
 // rect:这张图对应的屏幕区域(pt);整屏传 CGRectZero
-static NSArray *ocrWithHandlerRect(VNImageRequestHandler *h, CGRect rect, NSString **err) {
-    if (!h) { if (err) *err = @"Vision 请求处理器为空"; return nil; }
+// v0.9.7:精确模式闪退的原因(崩溃日志确认):iOS 16.1 里 Vision 销毁精确识别引擎(CREngineAccurate)时,
+// 另一个线程正在用它识别,系统直接 SIGTRAP("Semaphore object deallocated while in use"),@try 拦不住。
+// 对策:1) 所有 OCR 串行(一把递归锁);2) 用一个常驻的 VNSequenceRequestHandler + 每种模式一个常驻请求,
+// 识别引擎创建后不再销毁;3) 精确模式下不做角落二次识别,避免两种配置来回切换;
+// 4) 识别前后打标记,如果精确模式中途闪退,下次启动自动关掉精确模式。
+static NSRecursiveLock *ocrLock(void) {
+    static NSRecursiveLock *l; static dispatch_once_t once;
+    dispatch_once(&once, ^{ l = [NSRecursiveLock new]; });
+    return l;
+}
+static VNSequenceRequestHandler *gOCRSeq;
+static VNRecognizeTextRequest *gReqFast, *gReqAccurate;
+
+BOOL gOCRGuardTripped;
+BOOL ocrAccurateOn(void) { return [NSUserDefaults.standardUserDefaults boolForKey:@"ocr_accurate"]; }
+
+// 启动时调用:上次精确识别没结束就闪退了 → 自动关闭精确模式,返回 YES
+BOOL ocrCrashGuardCheck(void) {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    if (![ud boolForKey:@"ocr_accurate_inflight"]) return NO;
+    [ud setBool:NO forKey:@"ocr_accurate_inflight"];
+    if (![ud boolForKey:@"ocr_accurate"]) return NO;
+    [ud setBool:NO forKey:@"ocr_accurate"];
+    return YES;
+}
+
+// cg 或 pb 二选一;rect:这张图对应的屏幕区域(pt),整屏传 CGRectZero
+static NSArray *ocrRun(CGImageRef cg, CVPixelBufferRef pb, CGRect rect, NSString **err) {
+    if (!cg && !pb) { if (err) *err = @"OCR 没有图片"; return nil; }
     CGSize s0 = screenSize();
     if (CGRectIsEmpty(rect)) rect = CGRectMake(0, 0, s0.width, s0.height);
     CGSize s = rect.size;
-    VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] init];
-    // v0.9.6:设置里可开“OCR 精确模式”(Revision 2 + Accurate + 语言校正,默认关:iOS 16.1 上 Revision 3 曾经崩溃,Revision 2 未在真机验证)
-    BOOL accurate = [NSUserDefaults.standardUserDefaults boolForKey:@"ocr_accurate"];
-    if (accurate) {
-        req.revision = VNRecognizeTextRequestRevision2;
-        req.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
-        req.usesLanguageCorrection = YES;
-    } else {
-        req.revision = VNRecognizeTextRequestRevision1;
-        req.recognitionLevel = VNRequestTextRecognitionLevelFast;
-        req.usesLanguageCorrection = NO;
-    }
-    req.recognitionLanguages = @[@"zh-Hans", @"en-US"];
-    req.usesCPUOnly = YES;
-    NSError *e = nil;
-    BOOL ok = NO;
-    @try { ok = [h performRequests:@[req] error:&e]; }
-    @catch (NSException *ex) {
-        if (err) *err = [NSString stringWithFormat:@"Vision 异常:%@", ex.reason ?: @"未知异常"];
-        return nil;
-    }
-    if (!ok) {
-        if (err) *err = e.localizedDescription ?: @"Vision 识别失败";
-        return nil;
-    }
+    BOOL accurate = ocrAccurateOn();
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     NSMutableArray *out = [NSMutableArray array];
-    for (VNRecognizedTextObservation *o in req.results) {
-        VNRecognizedText *t = [[o topCandidates:1] firstObject];
-        if (!t.string.length) continue;
-        CGRect bb = o.boundingBox;
-        [out addObject:@{
-            @"text": t.string,
-            @"x": @((int)round(rect.origin.x + (bb.origin.x + bb.size.width / 2) * s.width)),
-            @"y": @((int)round(rect.origin.y + (1 - bb.origin.y - bb.size.height / 2) * s.height)),
-            @"w": @((int)round(bb.size.width * s.width)),
-            @"h": @((int)round(bb.size.height * s.height))}];
+    NSRecursiveLock *lk = ocrLock();
+    [lk lock];
+    @try {
+        if (!gOCRSeq) gOCRSeq = [VNSequenceRequestHandler new];
+        VNRecognizeTextRequest *req;
+        if (accurate) {
+            if (!gReqAccurate) {
+                gReqAccurate = [VNRecognizeTextRequest new];
+                gReqAccurate.revision = VNRecognizeTextRequestRevision2;
+                gReqAccurate.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+                gReqAccurate.usesLanguageCorrection = YES;
+                gReqAccurate.recognitionLanguages = @[@"zh-Hans", @"en-US"];
+                gReqAccurate.usesCPUOnly = YES;
+            }
+            req = gReqAccurate;
+            [ud setBool:YES forKey:@"ocr_accurate_inflight"];
+            [ud synchronize];
+        } else {
+            if (!gReqFast) {
+                gReqFast = [VNRecognizeTextRequest new];
+                gReqFast.revision = VNRecognizeTextRequestRevision1;
+                gReqFast.recognitionLevel = VNRequestTextRecognitionLevelFast;
+                gReqFast.usesLanguageCorrection = NO;
+                gReqFast.recognitionLanguages = @[@"zh-Hans", @"en-US"];
+                gReqFast.usesCPUOnly = YES;
+            }
+            req = gReqFast;
+        }
+        NSError *e = nil;
+        BOOL ok = cg ? [gOCRSeq performRequests:@[req] onCGImage:cg error:&e]
+                     : [gOCRSeq performRequests:@[req] onCVPixelBuffer:pb error:&e];
+        if (accurate) [ud setBool:NO forKey:@"ocr_accurate_inflight"];
+        if (!ok) {
+            if (err) *err = e.localizedDescription ?: @"Vision 识别失败";
+            out = nil;
+        } else {
+            for (VNRecognizedTextObservation *o in req.results) {
+                VNRecognizedText *t = [[o topCandidates:1] firstObject];
+                if (!t.string.length) continue;
+                CGRect bb = o.boundingBox;
+                [out addObject:@{
+                    @"text": t.string,
+                    @"x": @((int)round(rect.origin.x + (bb.origin.x + bb.size.width / 2) * s.width)),
+                    @"y": @((int)round(rect.origin.y + (1 - bb.origin.y - bb.size.height / 2) * s.height)),
+                    @"w": @((int)round(bb.size.width * s.width)),
+                    @"h": @((int)round(bb.size.height * s.height))}];
+            }
+        }
+    } @catch (NSException *ex) {
+        if (accurate) [ud setBool:NO forKey:@"ocr_accurate_inflight"];
+        if (err) *err = [NSString stringWithFormat:@"Vision 异常:%@", ex.reason ?: @"未知异常"];
+        out = nil;
+    } @finally {
+        [lk unlock];
     }
     return out;
 }
-static NSArray *ocrWithHandler(VNImageRequestHandler *h, NSString **err) { return ocrWithHandlerRect(h, CGRectZero, err); }
 
 // v0.9.6:把同一行、水平紧挨着的碎片合并成一条(Vision 常把一个按钮/一句话切成几段)
 static BOOL isLatinish(NSString *t) {
@@ -320,7 +367,7 @@ static NSArray *cornerPass(UIImage *src, NSArray *have) {
     }];
     if (!up.CGImage) return have;
     NSString *e = nil;
-    NSArray *extra = ocrWithHandlerRect([[VNImageRequestHandler alloc] initWithCGImage:up.CGImage options:@{}], ptRect, &e);
+    NSArray *extra = ocrRun(up.CGImage, NULL, ptRect, &e);
     if (!extra.count) return have;
     NSMutableArray *out = [have mutableCopy];
     for (NSDictionary *x in extra) {
@@ -338,7 +385,7 @@ static NSArray *postOCR(UIImage *src, NSArray *r) {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     BOOL merge = [d objectForKey:@"ocr_merge"] ? [d boolForKey:@"ocr_merge"] : YES;
     BOOL corner = [d objectForKey:@"ocr_corner"] ? [d boolForKey:@"ocr_corner"] : YES;
-    if (corner) { @try { r = cornerPass(src, r); } @catch (NSException *ex) {} }
+    if (corner && !ocrAccurateOn()) { @try { r = cornerPass(src, r); } @catch (NSException *ex) {} }
     if (merge) r = mergeFragments(r);
     return r;
 }
@@ -401,8 +448,7 @@ static NSArray *ocrNV12(NSString **err) {
     }
     for (size_t i = 0; i < ch; i++) memcpy(cd + i * crb, src + i * cw * 2, cw * 2);
     CVPixelBufferUnlockBaseAddress(pb, 0);
-    VNImageRequestHandler *h2 = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pb options:@{}];
-    NSArray *out = ocrWithHandler(h2, err);
+    NSArray *out = ocrRun(NULL, pb, CGRectZero, err);
     CVPixelBufferRelease(pb);
     return out;
 }
@@ -416,8 +462,7 @@ NSArray *ocrImage(UIImage *img, NSString **err) {
     // 直接把它交给 Vision 在部分设备上会触发 CoreVideo/Vision 原生崩溃；
     // 已经校验并解码的 JPEG 是稳定路径，先用它完成 OCR。
     NSString *e2 = nil;
-    VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCGImage:ocrImg.CGImage options:@{}];
-    NSArray *r = ocrWithHandler(h, &e2);
+    NSArray *r = ocrRun(ocrImg.CGImage, NULL, CGRectZero, &e2);
     if (r) return postOCR(img, r);
     [notes appendFormat:@"[图片路径]%@", e2];
     // JPEG OCR 失败时，才尝试经过完整校验的 NV12；失败只作为普通错误返回。

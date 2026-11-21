@@ -151,3 +151,8 @@ NSString *effectiveModel(NSString *model);
 NSData *encodeForModel(UIImage *img, BOOL hq);
 NSArray *hybridMessages2(NSString *task, NSString *history, UIImage *img, NSData *jpgPre, UIImage *prevImg, NSArray *items,
                          BOOL includeImage, BOOL hq, NSString **err);
+
+// v0.9.7 OCR 精确模式闪退保护
+extern BOOL gOCRGuardTripped;
+BOOL ocrCrashGuardCheck(void);
+BOOL ocrAccurateOn(void);
