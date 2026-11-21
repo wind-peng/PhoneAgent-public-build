@@ -142,14 +142,14 @@ NSString *agPostOnce(NSString *base, NSString *key, NSDictionary *body, BOOL hon
 
 static NSDictionary *callLLMOnce(NSString *base, NSString *key, NSString *model, NSArray *messages, NSString **err) {
     // GLM-5.3 系列:思考模式始终开启,思考内容也占 max_tokens。
-    // 平时用 reasoning_effort=medium + 8192,省时省钱;上一步失败或屏幕没变化(gEscalate)时升到 max + 16384。
+    // 平时用 reasoning_effort=high(GLM 只接受 low/high/max) + 8192,省时省钱;上一步失败或屏幕没变化(gEscalate)时升到 max + 16384。
     BOOL glm = [model.lowercaseString hasPrefix:@"glm"];
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     BOOL adaptive = [ud objectForKey:@"glm_adaptive_effort"] ? [ud boolForKey:@"glm_adaptive_effort"] : YES; // 设置里可关:关掉就一直用 max + 16384(旧行为)
     BOOL esc = !adaptive || gEscalate;
     NSDictionary *body = glm
         ? @{@"model": model, @"messages": messages, @"temperature": @1.0, @"top_p": @0.95, @"max_tokens": esc ? @16384 : @8192,
-            @"thinking": @{@"type": @"enabled", @"clear_thinking": @NO}, @"reasoning_effort": esc ? @"max" : @"medium"}
+            @"thinking": @{@"type": @"enabled", @"clear_thinking": @NO}, @"reasoning_effort": esc ? @"max" : @"high"}
         : @{@"model": model, @"messages": messages, @"temperature": @0.1,
             @"max_tokens": @700, @"response_format": @{@"type": @"json_object"}};
     NSString *fr = nil;

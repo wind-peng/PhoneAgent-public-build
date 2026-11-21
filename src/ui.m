@@ -492,7 +492,7 @@ static NSData *attachJPEG(UIImage *img) {
     UIStackView *ttsrow = [[UIStackView alloc] initWithArrangedSubviews:@[ttl, tts]];
     ttsrow.axis = UILayoutConstraintAxisHorizontal; ttsrow.alignment = UIStackViewAlignmentCenter;
     ttsrow.distribution = UIStackViewDistributionEqualSpacing;
-    UIStackView *glmrow = [self switchRow:@"GLM 省时思考(平时中等,卡住时自动升到最高)" key:@"glm_adaptive_effort" action:@selector(onGLMAdaptive:)];
+    UIStackView *glmrow = [self switchRow:@"GLM 省时思考(平时 high,卡住时自动升到最高)" key:@"glm_adaptive_effort" action:@selector(onGLMAdaptive:)];
     UIStackView *attrow = [self switchRow:@"附件图只在第一步发送(省流量)" key:@"attach_first_only" action:@selector(onAttachFirstOnly:)];
     UIStackView *brow = [[UIStackView alloc] initWithArrangedSubviews:@[bl, pv]];
     brow.axis = UILayoutConstraintAxisHorizontal; brow.spacing = 10; brow.alignment = UIStackViewAlignmentCenter;
