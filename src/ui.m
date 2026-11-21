@@ -569,7 +569,7 @@ static NSData *attachJPEG(UIImage *img) {
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"高级设置(v0.9.19)";
+    self.title = @"高级设置(v0.9.20)";
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
     self.popupTV = [UITextView new];
@@ -623,6 +623,7 @@ static NSData *attachJPEG(UIImage *img) {
         [self sw:@"检测无文字小图标(×、返回箭头等)" key:@"icon_detect" def:YES],
         [self sw:@"合并同一行相邻的 OCR 碎片" key:@"ocr_merge" def:YES],
         [self sw:@"右上角小字放大再识别一次" key:@"ocr_corner" def:YES],
+        [self sw:@"OCR 用 Live Text(相册同款引擎,能认中文;失败自动退回)" key:@"ocr_livetext" def:YES],
         [self sw:@"OCR 精确模式(较慢;闪退会自动关闭)" key:@"ocr_accurate" def:NO],
         [self hdr:@"自我恢复与长任务"],
         [self sw:@"目标 App 意外退出时自动重新打开" key:@"auto_relaunch" def:YES],

@@ -488,6 +488,96 @@ static NSArray *ocrNV12(NSString **err) {
     return out;
 }
 
+#pragma mark - v0.9.20 Live Text OCR(VisionKit,相册"识别文字"同一引擎;精确 Vision 在本机进程里坏了)
+
+@interface PALiveText : NSObject
++ (NSString *)transcript:(UIImage *)img timeout:(double)t;
++ (void)setProbe:(BOOL)b;
++ (NSObject *)analysisObject:(UIImage *)img timeout:(double)t error:(NSString **)e;
+@end
+
+static id paIvar(id o, const char *name) {
+    if (!o) return nil;
+    for (Class c = object_getClass(o); c; c = class_getSuperclass(c)) {
+        Ivar iv = class_getInstanceVariable(c, name);
+        if (iv) { const char *t = ivar_getTypeEncoding(iv); if (t && t[0] == '@') return object_getIvar(o, iv); return nil; }
+    }
+    return nil;
+}
+static void paWalkCR(id r, NSMutableArray *lines, int depth) {
+    if (!r || depth > 8) return;
+    NSString *cn = NSStringFromClass(object_getClass(r));
+    if ([cn isEqualToString:@"CRLineOutputRegion"]) {
+        @try {
+            NSString *t = [r valueForKey:@"text"];
+            id q = [r valueForKey:@"boundingQuad"];
+            NSValue *bv = [q valueForKey:@"boundingBox"];
+            if ([t isKindOfClass:NSString.class] && t.length && bv) [lines addObject:@{@"text": t, @"bb": bv}];
+        } @catch (NSException *e) {}
+        return;
+    }
+    id kids = paIvar(r, "_children");
+    if ([kids isKindOfClass:NSArray.class]) for (id k in kids) paWalkCR(k, lines, depth + 1);
+}
+// 返回 [{text, bb(NSValue CGRect, 归一化)}]
+static NSArray *liveLinesRaw(UIImage *img, NSString **err) {
+    Class lc = NSClassFromString(@"PALiveText");
+    if (!lc) { if (err) *err = @"LiveText 模块缺失"; return nil; }
+    NSString *e = nil;
+    NSObject *vk = [lc analysisObject:img timeout:8 error:&e];
+    if (!vk) { if (err) *err = e ?: @"LiveText 失败"; return nil; }
+    id res = nil;
+    @try { res = [vk valueForKey:@"imageAnalysisResult"]; } @catch (NSException *x) {}
+    if (!res) res = paIvar(vk, "_imageAnalysisResult");
+    id doc = paIvar(res, "_sourceDocument");
+    if (!doc) { if (err) *err = @"LiveText 结果里没有 sourceDocument"; return nil; }
+    NSMutableArray *lines = [NSMutableArray array];
+    paWalkCR(doc, lines, 0);
+    return lines;
+}
+static UIImage *liveCalibImage(void) {
+    CGSize sz = CGSizeMake(600, 400);
+    UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat]; f.scale = 1;
+    return [[[UIGraphicsImageRenderer alloc] initWithSize:sz format:f] imageWithActions:^(UIGraphicsImageRendererContext *c) {
+        [UIColor.whiteColor setFill]; UIRectFill(CGRectMake(0, 0, sz.width, sz.height));
+        [@"淘宝搜索" drawAtPoint:CGPointMake(30, 30) withAttributes:@{NSFontAttributeName: [UIFont systemFontOfSize:56]}];
+    }];
+}
+// 坐标原点:用一张"字在左上角"的图测一次,1=左上原点,0=左下原点,-1=测不出(当左上)
+static int gLiveTopLeft = -2;
+static BOOL liveTopLeft(void) {
+    if (gLiveTopLeft == -2) {
+        NSArray *ls = liveLinesRaw(liveCalibImage(), NULL);
+        gLiveTopLeft = -1;
+        for (NSDictionary *d in ls) { CGRect b = [d[@"bb"] CGRectValue]; gLiveTopLeft = CGRectGetMidY(b) < 0.5 ? 1 : 0; break; }
+    }
+    return gLiveTopLeft != 0;
+}
+BOOL gLiveFailedNoted;
+// 和 ocrRun 一样返回 [{text,x,y,w,h}](屏幕 pt,x/y 为中心)
+NSArray *ocrLive(UIImage *img, NSString **err) {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    if ([ud objectForKey:@"ocr_livetext"] && ![ud boolForKey:@"ocr_livetext"]) { if (err) *err = @"Live Text 已关闭"; return nil; }
+    NSArray *ls = nil;
+    [ocrLock() lock];
+    @try { BOOL tl = liveTopLeft(); ls = liveLinesRaw(img, err);
+        if (ls) {
+            CGSize s = screenSize();
+            NSMutableArray *out = [NSMutableArray array];
+            for (NSDictionary *d in ls) {
+                CGRect b = [d[@"bb"] CGRectValue];
+                double cy = tl ? CGRectGetMidY(b) : 1 - CGRectGetMidY(b);
+                [out addObject:@{@"text": d[@"text"],
+                    @"x": @((int)round(CGRectGetMidX(b) * s.width)), @"y": @((int)round(cy * s.height)),
+                    @"w": @((int)round(b.size.width * s.width)), @"h": @((int)round(b.size.height * s.height))}];
+            }
+            ls = out;
+        }
+    } @catch (NSException *x) { ls = nil; if (err) *err = [NSString stringWithFormat:@"LiveText 异常 %@", x.reason]; }
+    @finally { [ocrLock() unlock]; }
+    return ls;
+}
+
 NSArray *ocrImage(UIImage *img, NSString **err) {
     if (!img.CGImage) { if (err) *err = @"截图没有有效图像"; return nil; }
     // 先放大、灰度化并提高对比度，再交给稳定的 Revision 1/Fast，改善小字识别。
@@ -497,6 +587,11 @@ NSArray *ocrImage(UIImage *img, NSString **err) {
     // 直接把它交给 Vision 在部分设备上会触发 CoreVideo/Vision 原生崩溃；
     // 已经校验并解码的 JPEG 是稳定路径，先用它完成 OCR。
     NSString *e2 = nil;
+    // v0.9.20:先用 Live Text(能认中文);失败再退回原来的 Vision 快速识别(只认英文)
+    NSString *le = nil;
+    NSArray *lr = ocrLive(img, &le);
+    if (lr.count) return lr;
+    if (!gLiveFailedNoted) { gLiveFailedNoted = YES; [notes appendFormat:@"[LiveText]%@ ", le ?: @"没识别到文字"]; }
     NSArray *r = ocrRun(ocrImg.CGImage, NULL, CGRectZero, &e2);
     if (r) return postOCR(img, r);
     [notes appendFormat:@"[图片路径]%@", e2];
@@ -565,10 +660,7 @@ NSString *diagReport(void) {
 #pragma mark - v0.9.18 OCR 自检
 
 // Swift 写的 Live Text(VisionKit ImageAnalyzer,iOS 16,就是相册"长按识别文字"的引擎),见 src/livetext.swift
-@interface PALiveText : NSObject
-+ (NSString *)transcript:(UIImage *)img timeout:(double)t;
-+ (void)setProbe:(BOOL)b;
-@end
+
 
 static NSString *paCacheDir(void) {
     return [@"/var/mobile/Library/Caches" stringByAppendingPathComponent:NSBundle.mainBundle.bundleIdentifier];
@@ -678,7 +770,13 @@ NSString *ocrSelfTest(void (^progress)(NSString *soFar)) {
     add([@"2 精确 Rev2 CPU:" stringByAppendingString:selfTestOCR(ti.CGImage, VNRecognizeTextRequestRevision2, YES, YES)]);
     add([@"3 精确 Rev2 非CPU:" stringByAppendingString:selfTestOCR(ti.CGImage, VNRecognizeTextRequestRevision2, YES, NO)]);
     add([@"4 Live Text:" stringByAppendingString:selfTestLive(ti)]);
-    { Class lc = NSClassFromString(@"PALiveText"); if (lc) { [lc setProbe:YES]; add([@"4b 探测:" stringByAppendingString:[lc transcript:ti timeout:20] ?: @""]); [lc setProbe:NO]; } }
+    {
+        NSString *le = nil; NSArray *ls = liveLinesRaw(ti, &le);
+        NSMutableString *x = [NSMutableString stringWithFormat:@"4c Live Text 带位置(原点%@):", liveTopLeft() ? @"左上" : @"左下"];
+        if (!ls) [x appendString:le ?: @"失败"];
+        for (NSDictionary *d in ls) { CGRect b = [d[@"bb"] CGRectValue]; [x appendFormat:@" 「%@」(%.2f,%.2f %.2fx%.2f)", d[@"text"], b.origin.x, b.origin.y, b.size.width, b.size.height]; }
+        add(x);
+    }
     NSString *se = nil;
     UIImage *shot = takeScreenshot(&se);
     if (shot.CGImage) {

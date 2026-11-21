@@ -59,6 +59,28 @@ func paDump(_ v: Any, _ label: String, _ depth: Int, _ out: inout [String]) {
 
 @objc(PALiveText) public final class PALiveText: NSObject {
     @objc public static var probe = false
+    nonisolated(unsafe) static var shared: AnyObject?
+    // v0.9.20:返回底层的 VKCImageAnalysis(ObjC 对象),由 capture_ocr.m 从里面取每行文字和位置
+    @objc(analysisObject:timeout:error:) public static func analysisObject(_ img: UIImage, timeout: Double, error errOut: AutoreleasingUnsafeMutablePointer<NSString?>?) -> NSObject? {
+        guard #available(iOS 16.0, *) else { errOut?.pointee = "需要 iOS 16"; return nil }
+        if !ImageAnalyzer.isSupported { errOut?.pointee = "本机不支持 ImageAnalyzer"; return nil }
+        final class Out: @unchecked Sendable { var o: NSObject?; var e: String = "超时" }
+        let out = Out()
+        let sem = DispatchSemaphore(value: 0)
+        Task.detached {
+            do {
+                let a: ImageAnalyzer
+                if let sh = PALiveText.shared as? ImageAnalyzer { a = sh } else { a = ImageAnalyzer(); PALiveText.shared = a }
+                let r = try await a.analyze(img, configuration: ImageAnalyzer.Configuration([.text]))
+                for ch in Mirror(reflecting: r).children { if let o = ch.value as? NSObject { out.o = o; break } }
+                if out.o == nil { out.e = "没找到内部对象" }
+            } catch { out.e = "\(error)" }
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + timeout) == .timedOut { errOut?.pointee = "超时"; return nil }
+        if out.o == nil { errOut?.pointee = out.e as NSString }
+        return out.o
+    }
     @objc(transcript:timeout:) public static func transcript(_ img: UIImage, timeout: Double) -> String {
         guard #available(iOS 16.0, *) else { return "需要 iOS 16" }
         if !ImageAnalyzer.isSupported { return "本机不支持 ImageAnalyzer" }
