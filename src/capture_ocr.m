@@ -1,5 +1,7 @@
 // PhoneAgent:截屏、OCR、诊断
 #import "pa_internal.h"
+#import <objc/runtime.h>
+#import <dlfcn.h>
 
 #pragma mark - 截屏(多种方法依次尝试,并记录每种的结果)
 
@@ -224,7 +226,40 @@ static VNSequenceRequestHandler *gOCRSeq;
 static VNRecognizeTextRequest *gReqFast, *gReqAccurate;
 
 BOOL gOCRGuardTripped;
-BOOL ocrAccurateOn(void) { return [NSUserDefaults.standardUserDefaults boolForKey:@"ocr_accurate"]; }
+
+// v0.9.8:第二份崩溃日志显示,系统在识别过程中自己替换精确识别引擎,
+// 销毁旧模型(CRTextSequenceRecognizerModelEspresso)时 iOS 16.1 必崩。
+// 对策:把这个私有类的 dealloc 换成"什么都不做"——旧模型直接泄漏,不销毁就不会崩。
+// 每次泄漏几十 MB,所以计数,超过上限本次运行就退回快速模式,防止内存爆掉。
+static volatile int gLeakedModels;
+static BOOL gLeakPatchOK;
+static void paLeakDealloc(__unsafe_unretained id self, SEL _cmd) { gLeakedModels++; }
+static void installOCRLeakPatch(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dlopen("/System/Library/PrivateFrameworks/TextRecognition.framework/TextRecognition", RTLD_NOW);
+        const char *names[] = {"CRTextSequenceRecognizerModelEspresso", NULL};
+        for (int i = 0; names[i]; i++) {
+            Class c = objc_getClass(names[i]);
+            if (!c) continue;
+            Method m = class_getInstanceMethod(c, sel_registerName("dealloc"));
+            if (!m) continue;
+            // 只替换该类自己实现的 dealloc(不动父类)
+            if (!class_addMethod(c, sel_registerName("dealloc"), (IMP)paLeakDealloc, method_getTypeEncoding(m)))
+                method_setImplementation(m, (IMP)paLeakDealloc);
+            gLeakPatchOK = YES;
+        }
+    });
+}
+#define PA_MAX_LEAKED_MODELS 10
+
+BOOL ocrAccurateOn(void) {
+    if (![NSUserDefaults.standardUserDefaults boolForKey:@"ocr_accurate"]) return NO;
+    installOCRLeakPatch();
+    if (!gLeakPatchOK) return NO;                       // 找不到私有类:不冒险,用快速模式
+    if (gLeakedModels >= PA_MAX_LEAKED_MODELS) return NO; // 泄漏太多:本次运行退回快速模式
+    return YES;
+}
 
 // 启动时调用:上次精确识别没结束就闪退了 → 自动关闭精确模式,返回 YES
 BOOL ocrCrashGuardCheck(void) {
