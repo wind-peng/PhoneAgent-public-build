@@ -209,14 +209,25 @@ static UIImage *prepareOCRImage(UIImage *src) {
 // 返回 [{text,x,y,w,h}],坐标是屏幕点(pt),x/y 为中心点。
 // iOS 16.1 的 Vision Revision 3 模型在本项目环境中会触发
 // "Semaphore object deallocated while in use"，因此固定使用稳定的 Revision 1/Fast。
-static NSArray *ocrWithHandler(VNImageRequestHandler *h, NSString **err) {
+// rect:这张图对应的屏幕区域(pt);整屏传 CGRectZero
+static NSArray *ocrWithHandlerRect(VNImageRequestHandler *h, CGRect rect, NSString **err) {
     if (!h) { if (err) *err = @"Vision 请求处理器为空"; return nil; }
-    CGSize s = screenSize();
+    CGSize s0 = screenSize();
+    if (CGRectIsEmpty(rect)) rect = CGRectMake(0, 0, s0.width, s0.height);
+    CGSize s = rect.size;
     VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] init];
-    req.revision = VNRecognizeTextRequestRevision1;
-    req.recognitionLevel = VNRequestTextRecognitionLevelFast;
+    // v0.9.6:设置里可开“OCR 精确模式”(Revision 2 + Accurate + 语言校正,默认关:iOS 16.1 上 Revision 3 曾经崩溃,Revision 2 未在真机验证)
+    BOOL accurate = [NSUserDefaults.standardUserDefaults boolForKey:@"ocr_accurate"];
+    if (accurate) {
+        req.revision = VNRecognizeTextRequestRevision2;
+        req.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+        req.usesLanguageCorrection = YES;
+    } else {
+        req.revision = VNRecognizeTextRequestRevision1;
+        req.recognitionLevel = VNRequestTextRecognitionLevelFast;
+        req.usesLanguageCorrection = NO;
+    }
     req.recognitionLanguages = @[@"zh-Hans", @"en-US"];
-    req.usesLanguageCorrection = NO;
     req.usesCPUOnly = YES;
     NSError *e = nil;
     BOOL ok = NO;
@@ -236,12 +247,100 @@ static NSArray *ocrWithHandler(VNImageRequestHandler *h, NSString **err) {
         CGRect bb = o.boundingBox;
         [out addObject:@{
             @"text": t.string,
-            @"x": @((int)round((bb.origin.x + bb.size.width / 2) * s.width)),
-            @"y": @((int)round((1 - bb.origin.y - bb.size.height / 2) * s.height)),
+            @"x": @((int)round(rect.origin.x + (bb.origin.x + bb.size.width / 2) * s.width)),
+            @"y": @((int)round(rect.origin.y + (1 - bb.origin.y - bb.size.height / 2) * s.height)),
             @"w": @((int)round(bb.size.width * s.width)),
             @"h": @((int)round(bb.size.height * s.height))}];
     }
     return out;
+}
+static NSArray *ocrWithHandler(VNImageRequestHandler *h, NSString **err) { return ocrWithHandlerRect(h, CGRectZero, err); }
+
+// v0.9.6:把同一行、水平紧挨着的碎片合并成一条(Vision 常把一个按钮/一句话切成几段)
+static BOOL isLatinish(NSString *t) {
+    if (!t.length) return NO;
+    unichar c = [t characterAtIndex:t.length - 1];
+    return c < 0x2E80;
+}
+static NSArray *mergeFragments(NSArray *items) {
+    NSMutableArray *a = [NSMutableArray array];
+    for (NSDictionary *it in items) [a addObject:[it mutableCopy]];
+    BOOL changed = YES;
+    int guard = 0;
+    while (changed && guard++ < 6) {
+        changed = NO;
+        [a sortUsingComparator:^NSComparisonResult(NSDictionary *p, NSDictionary *q) {
+            double xp = [p[@"x"] doubleValue] - [p[@"w"] doubleValue] / 2, xq = [q[@"x"] doubleValue] - [q[@"w"] doubleValue] / 2;
+            return xp < xq ? NSOrderedAscending : (xp > xq ? NSOrderedDescending : NSOrderedSame);
+        }];
+        for (NSUInteger i = 0; i < a.count && !changed; i++) {
+            NSMutableDictionary *p = a[i];
+            double px = [p[@"x"] doubleValue], py = [p[@"y"] doubleValue], pw = [p[@"w"] doubleValue], ph = [p[@"h"] doubleValue];
+            for (NSUInteger j = 0; j < a.count; j++) {
+                if (j == i) continue;
+                NSMutableDictionary *q = a[j];
+                double qx = [q[@"x"] doubleValue], qy = [q[@"y"] doubleValue], qw = [q[@"w"] doubleValue], qh = [q[@"h"] doubleValue];
+                double mh = MAX(ph, qh);
+                if (mh <= 0 || fabs(py - qy) > mh * 0.35) continue;
+                if (ph / MAX(1.0, qh) > 1.6 || qh / MAX(1.0, ph) > 1.6) continue;
+                double gap = (qx - qw / 2) - (px + pw / 2);
+                if (gap < -2 || gap > (ph + qh) / 2 * 0.6) continue;
+                NSString *pt = p[@"text"], *qt = q[@"text"];
+                NSString *joined = (isLatinish(pt) && qt.length && [qt characterAtIndex:0] < 0x2E80) ? [NSString stringWithFormat:@"%@ %@", pt, qt] : [pt stringByAppendingString:qt];
+                double l = MIN(px - pw / 2, qx - qw / 2), r = MAX(px + pw / 2, qx + qw / 2);
+                double t = MIN(py - ph / 2, qy - qh / 2), b = MAX(py + ph / 2, qy + qh / 2);
+                p[@"text"] = joined;
+                p[@"x"] = @((int)round((l + r) / 2)); p[@"y"] = @((int)round((t + b) / 2));
+                p[@"w"] = @((int)round(r - l)); p[@"h"] = @((int)round(b - t));
+                [a removeObjectAtIndex:j];
+                changed = YES;
+                break;
+            }
+        }
+    }
+    return a;
+}
+
+// v0.9.6:右上角区域(跳过/关闭这类小字)放大 2 倍再识别一次,补上第一次漏掉的短文字
+static NSArray *cornerPass(UIImage *src, NSArray *have) {
+    if (!src.CGImage) return have;
+    CGSize sc = screenSize();
+    CGRect ptRect = CGRectMake(sc.width * 0.55, sc.height * 0.03, sc.width * 0.45, sc.height * 0.14);
+    double k = src.size.width / sc.width;
+    CGRect pxRect = CGRectMake(ptRect.origin.x * k, ptRect.origin.y * k, ptRect.size.width * k, ptRect.size.height * k);
+    CGImageRef crop = CGImageCreateWithImageInRect(src.CGImage, pxRect);
+    if (!crop) return have;
+    UIImage *ci = [UIImage imageWithCGImage:crop scale:1 orientation:UIImageOrientationUp];
+    CGImageRelease(crop);
+    CGSize big = CGSizeMake(ptRect.size.width * 6, ptRect.size.height * 6); // 约等于原始像素的 2 倍
+    UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat];
+    f.scale = 1; f.opaque = YES;
+    UIImage *up = [[[UIGraphicsImageRenderer alloc] initWithSize:big format:f] imageWithActions:^(UIGraphicsImageRendererContext *c) {
+        [ci drawInRect:CGRectMake(0, 0, big.width, big.height)];
+    }];
+    if (!up.CGImage) return have;
+    NSString *e = nil;
+    NSArray *extra = ocrWithHandlerRect([[VNImageRequestHandler alloc] initWithCGImage:up.CGImage options:@{}], ptRect, &e);
+    if (!extra.count) return have;
+    NSMutableArray *out = [have mutableCopy];
+    for (NSDictionary *x in extra) {
+        NSString *t = x[@"text"];
+        if (t.length > 8) continue;
+        BOOL dup = NO;
+        for (NSDictionary *o in have)
+            if (fabs([o[@"x"] doubleValue] - [x[@"x"] doubleValue]) < 20 && fabs([o[@"y"] doubleValue] - [x[@"y"] doubleValue]) < 14) { dup = YES; break; }
+        if (!dup) [out addObject:x];
+    }
+    return out;
+}
+
+static NSArray *postOCR(UIImage *src, NSArray *r) {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    BOOL merge = [d objectForKey:@"ocr_merge"] ? [d boolForKey:@"ocr_merge"] : YES;
+    BOOL corner = [d objectForKey:@"ocr_corner"] ? [d boolForKey:@"ocr_corner"] : YES;
+    if (corner) { @try { r = cornerPass(src, r); } @catch (NSException *ex) {} }
+    if (merge) r = mergeFragments(r);
+    return r;
 }
 
 // 用广播扩展送来的原始 NV12 数据建一个"不带 IOSurface"的 CVPixelBuffer 直接交给 Vision
@@ -319,7 +418,7 @@ NSArray *ocrImage(UIImage *img, NSString **err) {
     NSString *e2 = nil;
     VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCGImage:ocrImg.CGImage options:@{}];
     NSArray *r = ocrWithHandler(h, &e2);
-    if (r) return r;
+    if (r) return postOCR(img, r);
     [notes appendFormat:@"[图片路径]%@", e2];
     // JPEG OCR 失败时，才尝试经过完整校验的 NV12；失败只作为普通错误返回。
     if ([gShotMethod isEqualToString:@"R"]) {

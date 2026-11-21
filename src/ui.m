@@ -379,6 +379,242 @@ static NSData *attachJPEG(UIImage *img) {
     return UIImageJPEGRepresentation(out, 0.85);
 }
 
+#pragma mark - v0.9.6 高级设置 / 触摸校准
+
+@interface PATouchView : UIView
+@property (nonatomic, copy) void (^onTouch)(CGPoint p);
+@end
+@implementation PATouchView
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    UITouch *t = touches.anyObject;
+    if (t && self.onTouch) self.onTouch([t locationInView:nil]);
+}
+@end
+
+@interface CalibVC : UIViewController
+@property (nonatomic, strong) PATouchView *tv;
+@property (nonatomic, strong) UILabel *info;
+@property (nonatomic, strong) UIView *target;
+@property (nonatomic, strong) NSMutableArray *got;
+@property (nonatomic, assign) CGPoint expect;
+@property (nonatomic, assign) BOOL manual;
+@property (nonatomic, assign) int manualIdx;
+@property (nonatomic, strong) NSMutableArray *manualRes;
+@end
+@implementation CalibVC
+- (NSArray *)points {
+    CGSize s = screenSize();
+    return @[[NSValue valueWithCGPoint:CGPointMake(s.width * 0.2, s.height * 0.25)], [NSValue valueWithCGPoint:CGPointMake(s.width * 0.8, s.height * 0.25)],
+             [NSValue valueWithCGPoint:CGPointMake(s.width * 0.5, s.height * 0.5)], [NSValue valueWithCGPoint:CGPointMake(s.width * 0.2, s.height * 0.8)],
+             [NSValue valueWithCGPoint:CGPointMake(s.width * 0.8, s.height * 0.8)]];
+}
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = UIColor.systemBackgroundColor;
+    self.got = [NSMutableArray array];
+    self.tv = [[PATouchView alloc] initWithFrame:self.view.bounds];
+    self.tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    __weak CalibVC *ws = self;
+    self.tv.onTouch = ^(CGPoint p) { [ws touched:p]; };
+    [self.view addSubview:self.tv];
+    self.target = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 24, 24)];
+    self.target.layer.cornerRadius = 12; self.target.layer.borderWidth = 2; self.target.layer.borderColor = UIColor.systemRedColor.CGColor;
+    self.target.userInteractionEnabled = NO; self.target.hidden = YES;
+    [self.view addSubview:self.target];
+    self.info = [[UILabel alloc] initWithFrame:CGRectMake(16, 60, self.view.bounds.size.width - 32, 260)];
+    self.info.numberOfLines = 0; self.info.font = [UIFont systemFontOfSize:14]; self.info.userInteractionEnabled = NO;
+    self.info.text = @"触摸校准\n· 自检:程序在 5 个已知位置注入点击,测量这个页面实际收到的位置。\n· 手动:依次点红圈中心,测量你手指的偏差。\n结果会保存;在高级设置里打开“应用触摸校准偏移”才会用于实际操作。";
+    [self.view addSubview:self.info];
+    UIButton *b1 = [UIButton buttonWithType:UIButtonTypeSystem]; [b1 setTitle:@"开始自检" forState:UIControlStateNormal];
+    [b1 addTarget:self action:@selector(selfTest) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *b2 = [UIButton buttonWithType:UIButtonTypeSystem]; [b2 setTitle:@"手动校准" forState:UIControlStateNormal];
+    [b2 addTarget:self action:@selector(manualStart) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *b3 = [UIButton buttonWithType:UIButtonTypeSystem]; [b3 setTitle:@"关闭" forState:UIControlStateNormal];
+    [b3 addTarget:self action:@selector(close) forControlEvents:UIControlEventTouchUpInside];
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[b1, b2, b3]];
+    row.axis = UILayoutConstraintAxisHorizontal; row.distribution = UIStackViewDistributionFillEqually;
+    row.frame = CGRectMake(16, self.view.bounds.size.height - 110, self.view.bounds.size.width - 32, 44);
+    row.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleWidth;
+    [self.view addSubview:row];
+}
+- (void)close { [self dismissViewControllerAnimated:YES completion:nil]; }
+- (void)touched:(CGPoint)p {
+    if (self.manual) {
+        CGPoint e = self.expect;
+        [self.manualRes addObject:@[@(p.x - e.x), @(p.y - e.y)]];
+        self.manualIdx++;
+        [self manualNext];
+        return;
+    }
+    @synchronized (self.got) { [self.got addObject:[NSValue valueWithCGPoint:p]]; }
+}
+- (void)saveOffsetX:(double)ox y:(double)oy n:(int)n title:(NSString *)t lines:(NSString *)lines {
+    if (n > 0) {
+        NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+        [d setDouble:ox forKey:@"touch_offset_x"]; [d setDouble:oy forKey:@"touch_offset_y"];
+    }
+    self.info.text = [NSString stringWithFormat:@"%@\n%@\n平均偏移:dx=%.1f pt, dy=%.1f pt(%d 个有效点)\n%@", t, lines,
+                      ox, oy, n, n ? @"已保存。偏移在 ±3pt 以内可以忽略;要用于实际操作,在高级设置里打开“应用触摸校准偏移”。" : @"没有有效数据,未保存。"];
+}
+- (void)selfTest {
+    self.manual = NO; self.target.hidden = YES;
+    self.info.text = @"自检中,请不要触摸屏幕……";
+    NSArray *pts = [self points];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSMutableString *lines = [NSMutableString string];
+        double sx = 0, sy = 0; int n = 0;
+        usleep(600 * 1000);
+        for (NSValue *v in pts) {
+            CGPoint e = v.CGPointValue;
+            @synchronized (self.got) { [self.got removeAllObjects]; }
+            doTapRaw(e.x, e.y);
+            usleep(600 * 1000);
+            NSValue *g = nil;
+            @synchronized (self.got) { g = self.got.firstObject; }
+            if (g) {
+                CGPoint p = g.CGPointValue;
+                sx += p.x - e.x; sy += p.y - e.y; n++;
+                [lines appendFormat:@"注入 (%.0f,%.0f) → 收到 (%.1f,%.1f)\n", e.x, e.y, p.x, p.y];
+            } else [lines appendFormat:@"注入 (%.0f,%.0f) → 没收到(HID 注入可能不可用)\n", e.x, e.y];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self saveOffsetX:n ? sx / n : 0 y:n ? sy / n : 0 n:n title:@"自检结果" lines:lines];
+        });
+    });
+}
+- (void)manualStart {
+    self.manual = YES; self.manualIdx = 0; self.manualRes = [NSMutableArray array];
+    [self manualNext];
+}
+- (void)manualNext {
+    NSArray *pts = [self points];
+    if (self.manualIdx >= (int)pts.count) {
+        self.manual = NO; self.target.hidden = YES;
+        double sx = 0, sy = 0; NSMutableString *lines = [NSMutableString string];
+        for (NSArray *r in self.manualRes) { sx += [r[0] doubleValue]; sy += [r[1] doubleValue]; [lines appendFormat:@"偏差 (%.1f,%.1f)\n", [r[0] doubleValue], [r[1] doubleValue]]; }
+        int n = (int)self.manualRes.count;
+        // 手动校准量的是手指偏差,仅供参考,不覆盖自检得到的注入偏移
+        self.info.text = [NSString stringWithFormat:@"手动校准结果(手指偏差,仅供参考,不保存)\n%@平均:dx=%.1f, dy=%.1f", lines, n ? sx / n : 0, n ? sy / n : 0];
+        return;
+    }
+    self.expect = [pts[self.manualIdx] CGPointValue];
+    self.target.center = self.expect; self.target.hidden = NO;
+    self.info.text = [NSString stringWithFormat:@"手动校准 %d/%lu:请点红圈中心", self.manualIdx + 1, (unsigned long)pts.count];
+}
+@end
+
+@interface AdvancedVC : UIViewController
+@property (nonatomic, strong) UITextView *popupTV;
+@property (nonatomic, strong) UITextField *bBase, *bKey, *bModel;
+@end
+@implementation AdvancedVC
+- (UIStackView *)sw:(NSString *)title key:(NSString *)key def:(BOOL)def {
+    UILabel *l = [UILabel new];
+    l.text = title; l.font = [UIFont systemFontOfSize:15]; l.numberOfLines = 0;
+    [l setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+    UISwitch *s = [UISwitch new];
+    s.on = paOn(key, def);
+    s.accessibilityIdentifier = key;
+    [s setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [s setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [s addTarget:self action:@selector(onSw:) forControlEvents:UIControlEventValueChanged];
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[l, s]];
+    row.axis = UILayoutConstraintAxisHorizontal; row.alignment = UIStackViewAlignmentCenter; row.spacing = 10;
+    return row;
+}
+- (void)onSw:(UISwitch *)s { [NSUserDefaults.standardUserDefaults setBool:s.on forKey:s.accessibilityIdentifier]; }
+- (UILabel *)hdr:(NSString *)t {
+    UILabel *l = [UILabel new]; l.text = t; l.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold]; l.textColor = UIColor.secondaryLabelColor; l.numberOfLines = 0;
+    return l;
+}
+- (UITextField *)tf:(NSString *)ph key:(NSString *)k secure:(BOOL)sec {
+    UITextField *f = [UITextField new];
+    f.placeholder = ph; f.borderStyle = UITextBorderStyleRoundedRect; f.secureTextEntry = sec;
+    f.autocapitalizationType = UITextAutocapitalizationTypeNone; f.autocorrectionType = UITextAutocorrectionTypeNo;
+    f.text = [NSUserDefaults.standardUserDefaults stringForKey:k] ?: @"";
+    return f;
+}
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"高级设置(v0.9.6)";
+    self.view.backgroundColor = UIColor.systemBackgroundColor;
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
+    self.popupTV = [UITextView new];
+    self.popupTV.font = [UIFont systemFontOfSize:15];
+    self.popupTV.layer.borderWidth = 1; self.popupTV.layer.borderColor = UIColor.separatorColor.CGColor; self.popupTV.layer.cornerRadius = 8;
+    self.popupTV.text = [NSUserDefaults.standardUserDefaults stringForKey:@"popup_words"] ?: defaultPopupWords();
+    [self.popupTV.heightAnchor constraintEqualToConstant:100].active = YES;
+    self.bBase = [self tf:@"备用接口地址(留空 = 同主模型)" key:@"backup_base" secure:NO];
+    self.bKey = [self tf:@"备用 API Key(留空 = 同主模型)" key:@"backup_key" secure:YES];
+    self.bModel = [self tf:@"备用模型名(留空 = 不启用)" key:@"backup_model" secure:NO];
+    UIButton *cal = [UIButton buttonWithType:UIButtonTypeSystem];
+    [cal setTitle:@"打开触摸校准页" forState:UIControlStateNormal];
+    [cal addTarget:self action:@selector(onCalib) forControlEvents:UIControlEventTouchUpInside];
+    UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
+        [self hdr:@"模型请求"],
+        [self sw:@"用函数调用(tools)输出动作(GLM/DeepSeek;不支持时自动退回 JSON)" key:@"use_tool_calls" def:YES],
+        [self sw:@"DeepSeek 分档:常规步骤 deepseek-flash,卡住/规划/完成自检用 deepseek-v4-pro" key:@"ds_tiering" def:YES],
+        [self sw:@"常规步骤用低思考强度(更快更省)" key:@"easy_low_effort" def:YES],
+        [self sw:@"文字步骤:OCR 足够时不发截图(更快更省)" key:@"text_only_steps" def:YES],
+        [self sw:@"允许模型一次给出多个连续动作(逐个核对屏幕)" key:@"multi_action" def:YES],
+        [self sw:@"子目标规划 + 完成前自检" key:@"subgoal_plan" def:YES],
+        [self sw:@"经验宏回放(相同任务先本地回放,OCR 核对)" key:@"macro_replay" def:YES],
+        [self hdr:@"备用模型(主模型连续限流/出错/格式错误时切换;DeepSeek 会自动在 flash 和 v4-pro 之间切换,无需填写)"],
+        self.bBase, self.bKey, self.bModel,
+        [self hdr:@"动作执行"],
+        [self sw:@"智能等待:动作后等画面稳定(代替固定等待)" key:@"smart_settle" def:YES],
+        [self sw:@"点击没反应时在旁边自动重试一次(敏感按钮除外)" key:@"tap_retry" def:YES],
+        [self sw:@"新滑动方式(60Hz 匀速、抬手前停顿防甩动)" key:@"smooth_swipe" def:YES],
+        [self sw:@"应用触摸校准偏移(先在校准页自检)" key:@"apply_touch_offset" def:NO],
+        cal,
+        [self hdr:@"本地处理"],
+        [self sw:@"广告倒计时时本地等待(不调用模型)" key:@"local_ad_wait" def:YES],
+        [self sw:@"弹窗规则:自动点掉下面列表里的按钮" key:@"auto_popup" def:NO],
+        self.popupTV,
+        [self hdr:@"识别"],
+        [self sw:@"检测无文字小图标(×、返回箭头等)" key:@"icon_detect" def:YES],
+        [self sw:@"合并同一行相邻的 OCR 碎片" key:@"ocr_merge" def:YES],
+        [self sw:@"右上角小字放大再识别一次" key:@"ocr_corner" def:YES],
+        [self sw:@"OCR 精确模式(较慢;未在 iOS 16.1 真机验证)" key:@"ocr_accurate" def:NO],
+        [self hdr:@"自我恢复与长任务"],
+        [self sw:@"目标 App 意外退出时自动重新打开" key:@"auto_relaunch" def:YES],
+        [self sw:@"录屏画面卡住时暂停提醒" key:@"stale_frame_check" def:YES],
+        [self sw:@"断点续跑(每步保存进度,2 小时内可继续)" key:@"checkpoint_on" def:YES],
+        [self sw:@"任务期间后台保活" key:@"keep_alive" def:YES],
+        [self sw:@"发热/低电量时提醒并放慢" key:@"health_guard" def:YES]]];
+    st.axis = UILayoutConstraintAxisVertical; st.spacing = 10;
+    st.translatesAutoresizingMaskIntoConstraints = NO;
+    UIScrollView *sv = [UIScrollView new];
+    sv.translatesAutoresizingMaskIntoConstraints = NO;
+    sv.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
+    [self.view addSubview:sv];
+    [sv addSubview:st];
+    UILayoutGuide *g = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [sv.topAnchor constraintEqualToAnchor:g.topAnchor], [sv.bottomAnchor constraintEqualToAnchor:g.bottomAnchor],
+        [sv.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor], [sv.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [st.topAnchor constraintEqualToAnchor:sv.contentLayoutGuide.topAnchor constant:16],
+        [st.bottomAnchor constraintEqualToAnchor:sv.contentLayoutGuide.bottomAnchor constant:-16],
+        [st.leadingAnchor constraintEqualToAnchor:sv.frameLayoutGuide.leadingAnchor constant:20],
+        [st.trailingAnchor constraintEqualToAnchor:sv.frameLayoutGuide.trailingAnchor constant:-20]]];
+}
+- (void)save {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    NSCharacterSet *ws = NSCharacterSet.whitespaceAndNewlineCharacterSet;
+    [d setObject:self.popupTV.text ?: @"" forKey:@"popup_words"];
+    [d setObject:[self.bBase.text stringByTrimmingCharactersInSet:ws] ?: @"" forKey:@"backup_base"];
+    [d setObject:[self.bKey.text stringByTrimmingCharactersInSet:ws] ?: @"" forKey:@"backup_key"];
+    [d setObject:[self.bModel.text stringByTrimmingCharactersInSet:ws] ?: @"" forKey:@"backup_model"];
+}
+- (void)done { [self save]; [self dismissViewControllerAnimated:YES completion:nil]; }
+- (void)viewWillDisappear:(BOOL)animated { [super viewWillDisappear:animated]; [self save]; }
+- (void)onCalib {
+    CalibVC *c = [CalibVC new];
+    c.modalPresentationStyle = UIModalPresentationFullScreen;
+    [self presentViewController:c animated:YES completion:nil];
+}
+@end
+
 @interface VC : UIViewController <UITextViewDelegate, PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
 @property (nonatomic, strong) UIButton *provBtn, *micBtn;
 @property (nonatomic, strong) UITextField *keyF, *baseF, *modelF;
@@ -464,6 +700,7 @@ static NSData *attachJPEG(UIImage *img) {
     UIButton *expBtn = [self btn:@"经验库" action:@selector(onExp)];
     UIButton *keepBtn = [self btn:@"后台保活 开/关" action:@selector(onKeep)];
     UIButton *diagBtn = [self btn:@"诊断" action:@selector(onDiag)];
+    UIButton *advBtn = [self btn:@"高级设置" action:@selector(onAdvanced)];
 
     // 屏幕广播(截屏必需)
     UILabel *bl = [UILabel new];
@@ -508,7 +745,7 @@ static NSData *attachJPEG(UIImage *img) {
         provRow, self.keyF, self.baseF, self.modelF,
         self.taskTV, [self row:@[self.micBtn, attBtn]], self.attLabel,
         [self row:@[startBtn, stopBtn]], [self row:@[memBtn, safeBtn]], [self row:@[expBtn, resBtn]],
-        acrow, ttsrow, glmrow, attrow, brow, [self row:@[keepBtn, diagBtn]], tokenL, self.log]];
+        acrow, ttsrow, glmrow, attrow, brow, [self row:@[keepBtn, diagBtn]], [self row:@[advBtn]], tokenL, self.log]];
     st.axis = UILayoutConstraintAxisVertical;
     st.spacing = 10;
     st.translatesAutoresizingMaskIntoConstraints = NO;
@@ -800,6 +1037,36 @@ static NSData *attachJPEG(UIImage *img) {
 - (void)onStop { gAgentRunning = NO; agentRespond(PAReqStop); [self say:@"正在停止任务……"]; }
 - (void)onKeep { [self say:setKeepAlive(gPlayer == nil)]; }
 - (void)onDiag { [self say:diagReport()]; }
+- (void)onAdvanced {
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[AdvancedVC new]];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+// 11:启动时发现 2 小时内没跑完的任务:询问是否继续
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    static BOOL asked;
+    if (asked) return;
+    asked = YES;
+    if (gAgentRunning) return;
+    NSDictionary *cp = cpLoad();
+    if (!cp) return;
+    NSString *shown = [cp[@"display"] length] ? cp[@"display"] : cp[@"task"];
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"继续上次任务?"
+        message:[NSString stringWithFormat:@"上次的任务没有完成(做到第 %@ 步):\n%@", cp[@"step"], shown.length > 120 ? [shown substringToIndex:120] : shown]
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"继续上次任务" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+        if (gAgentRunning) return;
+        NSString *key = nil, *base = nil, *model = nil;
+        loadLLMConfig(&key, &base, &model);
+        if (!key.length || !base.length || !model.length) { [self say:@"请先填写当前所选模型的 API 设置"]; return; }
+        gResumeCP = cp; gTaskDisplay = shown; gRunImages = nil;
+        if (!gPlayer) setKeepAlive(YES);
+        NSString *task = cp[@"task"];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ agentRun(task, base, key, model); });
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"放弃" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) { cpClear(); }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
 
 // ---- 语音 ----
 - (void)onMic {

@@ -256,3 +256,30 @@ void expFinish(NSString *task, NSString *status) {
     while (all.count > 100) [all removeObjectAtIndex:0];
     expSave(all);
 }
+
+// ---- v0.9.6 失败教训:任务停止/失败时存一句“在哪个页面、什么办法不管用”,相似任务开始时作为提示 ----
+static NSMutableArray *lessonLoad(void) {
+    NSData *d = [NSUserDefaults.standardUserDefaults dataForKey:@"exp_lessons"];
+    id o = d ? [NSJSONSerialization JSONObjectWithData:d options:NSJSONReadingMutableContainers error:nil] : nil;
+    return [o isKindOfClass:NSMutableArray.class] ? o : [NSMutableArray array];
+}
+void lessonSave(NSString *task, NSString *lesson) {
+    if (!expEnabled() || !task.length || !lesson.length) return;
+    if (lesson.length > 220) lesson = [lesson substringToIndex:220];
+    NSMutableArray *all = lessonLoad();
+    for (NSDictionary *e in all) if ([e[@"lesson"] isEqualToString:lesson]) return;
+    [all addObject:@{@"task": task, @"lesson": lesson, @"t": @([NSDate date].timeIntervalSince1970)}];
+    while (all.count > 40) [all removeObjectAtIndex:0];
+    NSData *d = [NSJSONSerialization dataWithJSONObject:all options:0 error:nil];
+    if (d) [NSUserDefaults.standardUserDefaults setObject:d forKey:@"exp_lessons"];
+}
+NSString *lessonHintFor(NSString *task) {
+    if (!expEnabled() || !task.length) return @"";
+    NSMutableArray *hits = [NSMutableArray array];
+    for (NSDictionary *e in lessonLoad().reverseObjectEnumerator) {
+        if (expSim(task, e[@"task"]) >= 0.35) [hits addObject:[NSString stringWithFormat:@"· %@", e[@"lesson"]]];
+        if (hits.count >= 3) break;
+    }
+    if (!hits.count) return @"";
+    return [@"相似任务以前失败过的教训(避免重复同样的无效做法):\n" stringByAppendingString:[hits componentsJoinedByString:@"\n"]];
+}
