@@ -285,6 +285,26 @@ BOOL ocrCrashGuardCheck(void) {
 }
 
 // cg 或 pb 二选一;rect:这张图对应的屏幕区域(pt),整屏传 CGRectZero
+// v0.9.15 精确 OCR 备选设置
+static int gAccVariant; static BOOL gAccAllFailSaid;
+static NSString *accVariantName(int v) {
+    switch (v) { case 0: return @"Rev2 只用CPU"; case 1: return @"Rev2 不限CPU"; case 2: return @"Rev2 新处理器"; default: return @"Rev3 新处理器"; }
+}
+static VNRecognizeTextRequest *accVariantRequest(int v) {
+    static VNRecognizeTextRequest *r1, *r2, *r3;
+    VNRecognizeTextRequest **slot = v == 1 ? &r1 : v == 2 ? &r2 : &r3;
+    if (*slot) return *slot;
+    NSUInteger rev = v == 3 ? 3 : VNRecognizeTextRequestRevision2;
+    if (![[VNRecognizeTextRequest supportedRevisions] containsIndex:rev]) return nil;
+    VNRecognizeTextRequest *r = [VNRecognizeTextRequest new];
+    r.revision = rev;
+    r.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+    r.usesLanguageCorrection = YES;
+    r.recognitionLanguages = @[@"zh-Hans", @"en-US"];
+    r.usesCPUOnly = (v == 2);
+    *slot = r;
+    return r;
+}
 // v0.9.14 诊断:最近一次识别的情况(只记录,不改逻辑)
 static int gDiagObs = -1, gDiagRebuild0; static double gDiagMs; static BOOL gDiagAcc; static NSString *gDiagErr; static int gDiagImgW, gDiagImgH;
 static NSArray *ocrRun(CGImageRef cg, CVPixelBufferRef pb, CGRect rect, NSString **err) {
@@ -326,8 +346,54 @@ static NSArray *ocrRun(CGImageRef cg, CVPixelBufferRef pb, CGRect rect, NSString
         NSError *e = nil;
         CFAbsoluteTime dt0 = CFAbsoluteTimeGetCurrent(); int rb0 = gLeakedModels;
         gDiagAcc = accurate; gDiagImgW = cg ? (int)CGImageGetWidth(cg) : 0; gDiagImgH = cg ? (int)CGImageGetHeight(cg) : 0;
-        BOOL ok = cg ? [gOCRSeq performRequests:@[req] onCGImage:cg error:&e]
-                     : [gOCRSeq performRequests:@[req] onCVPixelBuffer:pb error:&e];
+        BOOL ok = NO;
+        if (accurate) {
+            // v0.9.15:实测默认设置(Rev2+只用CPU)每次都报 Vision 内部错误(code 11)。
+            // 失败时用同一张图依次试其他设置,记住能用的那种;全失败就这一步用快速模式。
+            NSMutableString *tried = [NSMutableString string];
+            for (int k = 0; k < 4 && !ok; k++) {
+                int v = (gAccVariant + k) % 4;
+                VNRecognizeTextRequest *r2 = (v == 0) ? req : accVariantRequest(v);
+                if (!r2) { [tried appendFormat:@" 方式%d不支持", v]; continue; }
+                NSError *ev = nil;
+                @try {
+                    if (v == 2 || v == 3) { // 每次新建处理器,不用序列处理器
+                        VNImageRequestHandler *h = cg ? [[VNImageRequestHandler alloc] initWithCGImage:cg options:@{}]
+                                                      : [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pb options:@{}];
+                        ok = [h performRequests:@[r2] error:&ev];
+                    } else {
+                        ok = cg ? [gOCRSeq performRequests:@[r2] onCGImage:cg error:&ev]
+                                : [gOCRSeq performRequests:@[r2] onCVPixelBuffer:pb error:&ev];
+                    }
+                } @catch (NSException *ex) { ok = NO; [tried appendFormat:@" 方式%d异常:%@", v, ex.reason ?: @"?"]; continue; }
+                if (ok) {
+                    req = r2;
+                    if (v != gAccVariant) agentSay([NSString stringWithFormat:@"提示:精确 OCR 改用方式%d(%@)成功;之前失败:%@", v, accVariantName(v), tried.length ? tried : @"无"]);
+                    gAccVariant = v;
+                } else {
+                    e = ev;
+                    [tried appendFormat:@" 方式%d(%@)失败:code %ld", v, accVariantName(v), (long)ev.code];
+                }
+            }
+            if (!ok) {
+                if (!gAccAllFailSaid) { gAccAllFailSaid = YES; agentSay([NSString stringWithFormat:@"提示:精确 OCR 四种方式都失败(%@),这些步改用快速模式,中文会认不出", tried]); }
+                if (!gReqFast) {
+                    gReqFast = [VNRecognizeTextRequest new];
+                    gReqFast.revision = VNRecognizeTextRequestRevision1;
+                    gReqFast.recognitionLevel = VNRequestTextRecognitionLevelFast;
+                    gReqFast.usesLanguageCorrection = NO;
+                    gReqFast.recognitionLanguages = @[@"zh-Hans", @"en-US"];
+                    gReqFast.usesCPUOnly = YES;
+                }
+                NSError *ef = nil;
+                ok = cg ? [gOCRSeq performRequests:@[gReqFast] onCGImage:cg error:&ef]
+                        : [gOCRSeq performRequests:@[gReqFast] onCVPixelBuffer:pb error:&ef];
+                if (ok) { req = gReqFast; gDiagAcc = NO; } else e = ef;
+            }
+        } else {
+            ok = cg ? [gOCRSeq performRequests:@[req] onCGImage:cg error:&e]
+                    : [gOCRSeq performRequests:@[req] onCVPixelBuffer:pb error:&e];
+        }
         if (accurate) { [ud setBool:NO forKey:@"ocr_accurate_inflight"]; gLastOCRTime = CFAbsoluteTimeGetCurrent(); }
         gDiagMs = (CFAbsoluteTimeGetCurrent() - dt0) * 1000; gDiagRebuild0 = gLeakedModels - rb0;
         gDiagObs = ok ? (int)req.results.count : -1;
