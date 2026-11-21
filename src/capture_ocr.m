@@ -1,5 +1,7 @@
 // PhoneAgent:截屏、OCR、诊断
 #import "pa_internal.h"
+#import <objc/runtime.h>
+#import <dlfcn.h>
 
 #pragma mark - 截屏(多种方法依次尝试,并记录每种的结果)
 
@@ -210,51 +212,131 @@ static UIImage *prepareOCRImage(UIImage *src) {
 // iOS 16.1 的 Vision Revision 3 模型在本项目环境中会触发
 // "Semaphore object deallocated while in use"，因此固定使用稳定的 Revision 1/Fast。
 // rect:这张图对应的屏幕区域(pt);整屏传 CGRectZero
-static NSArray *ocrWithHandlerRect(VNImageRequestHandler *h, CGRect rect, NSString **err) {
-    if (!h) { if (err) *err = @"Vision 请求处理器为空"; return nil; }
+// v0.9.7:精确模式闪退的原因(崩溃日志确认):iOS 16.1 里 Vision 销毁精确识别引擎(CREngineAccurate)时,
+// 另一个线程正在用它识别,系统直接 SIGTRAP("Semaphore object deallocated while in use"),@try 拦不住。
+// 对策:1) 所有 OCR 串行(一把递归锁);2) 用一个常驻的 VNSequenceRequestHandler + 每种模式一个常驻请求,
+// 识别引擎创建后不再销毁;3) 精确模式下不做角落二次识别,避免两种配置来回切换;
+// 4) 识别前后打标记,如果精确模式中途闪退,下次启动自动关掉精确模式。
+static NSRecursiveLock *ocrLock(void) {
+    static NSRecursiveLock *l; static dispatch_once_t once;
+    dispatch_once(&once, ^{ l = [NSRecursiveLock new]; });
+    return l;
+}
+static VNSequenceRequestHandler *gOCRSeq;
+static VNRecognizeTextRequest *gReqFast, *gReqAccurate;
+
+BOOL gOCRGuardTripped;
+
+// v0.9.8:第二份崩溃日志显示,系统在识别过程中自己替换精确识别引擎,
+// 销毁旧模型(CRTextSequenceRecognizerModelEspresso)时 iOS 16.1 必崩。
+// 对策:把这个私有类的 dealloc 换成"什么都不做"——旧模型直接泄漏,不销毁就不会崩。
+// 每次泄漏几十 MB,所以计数,超过上限本次运行就退回快速模式,防止内存爆掉。
+static volatile int gLeakedModels;
+static BOOL gLeakPatchOK;
+static void paLeakDealloc(__unsafe_unretained id self, SEL _cmd) { gLeakedModels++; }
+static void installOCRLeakPatch(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dlopen("/System/Library/PrivateFrameworks/TextRecognition.framework/TextRecognition", RTLD_NOW);
+        const char *names[] = {"CRTextSequenceRecognizerModelEspresso", NULL};
+        for (int i = 0; names[i]; i++) {
+            Class c = objc_getClass(names[i]);
+            if (!c) continue;
+            Method m = class_getInstanceMethod(c, sel_registerName("dealloc"));
+            if (!m) continue;
+            // 只替换该类自己实现的 dealloc(不动父类)
+            if (!class_addMethod(c, sel_registerName("dealloc"), (IMP)paLeakDealloc, method_getTypeEncoding(m)))
+                method_setImplementation(m, (IMP)paLeakDealloc);
+            gLeakPatchOK = YES;
+        }
+    });
+}
+#define PA_MAX_LEAKED_MODELS 10
+
+BOOL ocrAccurateOn(void) {
+    if (![NSUserDefaults.standardUserDefaults boolForKey:@"ocr_accurate"]) return NO;
+    installOCRLeakPatch();
+    if (!gLeakPatchOK) return NO;                       // 找不到私有类:不冒险,用快速模式
+    if (gLeakedModels >= PA_MAX_LEAKED_MODELS) return NO; // 泄漏太多:本次运行退回快速模式
+    return YES;
+}
+
+// 启动时调用:上次精确识别没结束就闪退了 → 自动关闭精确模式,返回 YES
+BOOL ocrCrashGuardCheck(void) {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    if (![ud boolForKey:@"ocr_accurate_inflight"]) return NO;
+    [ud setBool:NO forKey:@"ocr_accurate_inflight"];
+    if (![ud boolForKey:@"ocr_accurate"]) return NO;
+    [ud setBool:NO forKey:@"ocr_accurate"];
+    return YES;
+}
+
+// cg 或 pb 二选一;rect:这张图对应的屏幕区域(pt),整屏传 CGRectZero
+static NSArray *ocrRun(CGImageRef cg, CVPixelBufferRef pb, CGRect rect, NSString **err) {
+    if (!cg && !pb) { if (err) *err = @"OCR 没有图片"; return nil; }
     CGSize s0 = screenSize();
     if (CGRectIsEmpty(rect)) rect = CGRectMake(0, 0, s0.width, s0.height);
     CGSize s = rect.size;
-    VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] init];
-    // v0.9.6:设置里可开“OCR 精确模式”(Revision 2 + Accurate + 语言校正,默认关:iOS 16.1 上 Revision 3 曾经崩溃,Revision 2 未在真机验证)
-    BOOL accurate = [NSUserDefaults.standardUserDefaults boolForKey:@"ocr_accurate"];
-    if (accurate) {
-        req.revision = VNRecognizeTextRequestRevision2;
-        req.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
-        req.usesLanguageCorrection = YES;
-    } else {
-        req.revision = VNRecognizeTextRequestRevision1;
-        req.recognitionLevel = VNRequestTextRecognitionLevelFast;
-        req.usesLanguageCorrection = NO;
-    }
-    req.recognitionLanguages = @[@"zh-Hans", @"en-US"];
-    req.usesCPUOnly = YES;
-    NSError *e = nil;
-    BOOL ok = NO;
-    @try { ok = [h performRequests:@[req] error:&e]; }
-    @catch (NSException *ex) {
-        if (err) *err = [NSString stringWithFormat:@"Vision 异常:%@", ex.reason ?: @"未知异常"];
-        return nil;
-    }
-    if (!ok) {
-        if (err) *err = e.localizedDescription ?: @"Vision 识别失败";
-        return nil;
-    }
+    BOOL accurate = ocrAccurateOn();
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     NSMutableArray *out = [NSMutableArray array];
-    for (VNRecognizedTextObservation *o in req.results) {
-        VNRecognizedText *t = [[o topCandidates:1] firstObject];
-        if (!t.string.length) continue;
-        CGRect bb = o.boundingBox;
-        [out addObject:@{
-            @"text": t.string,
-            @"x": @((int)round(rect.origin.x + (bb.origin.x + bb.size.width / 2) * s.width)),
-            @"y": @((int)round(rect.origin.y + (1 - bb.origin.y - bb.size.height / 2) * s.height)),
-            @"w": @((int)round(bb.size.width * s.width)),
-            @"h": @((int)round(bb.size.height * s.height))}];
+    NSRecursiveLock *lk = ocrLock();
+    [lk lock];
+    @try {
+        if (!gOCRSeq) gOCRSeq = [VNSequenceRequestHandler new];
+        VNRecognizeTextRequest *req;
+        if (accurate) {
+            if (!gReqAccurate) {
+                gReqAccurate = [VNRecognizeTextRequest new];
+                gReqAccurate.revision = VNRecognizeTextRequestRevision2;
+                gReqAccurate.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+                gReqAccurate.usesLanguageCorrection = YES;
+                gReqAccurate.recognitionLanguages = @[@"zh-Hans", @"en-US"];
+                gReqAccurate.usesCPUOnly = YES;
+            }
+            req = gReqAccurate;
+            [ud setBool:YES forKey:@"ocr_accurate_inflight"];
+            [ud synchronize];
+        } else {
+            if (!gReqFast) {
+                gReqFast = [VNRecognizeTextRequest new];
+                gReqFast.revision = VNRecognizeTextRequestRevision1;
+                gReqFast.recognitionLevel = VNRequestTextRecognitionLevelFast;
+                gReqFast.usesLanguageCorrection = NO;
+                gReqFast.recognitionLanguages = @[@"zh-Hans", @"en-US"];
+                gReqFast.usesCPUOnly = YES;
+            }
+            req = gReqFast;
+        }
+        NSError *e = nil;
+        BOOL ok = cg ? [gOCRSeq performRequests:@[req] onCGImage:cg error:&e]
+                     : [gOCRSeq performRequests:@[req] onCVPixelBuffer:pb error:&e];
+        if (accurate) [ud setBool:NO forKey:@"ocr_accurate_inflight"];
+        if (!ok) {
+            if (err) *err = e.localizedDescription ?: @"Vision 识别失败";
+            out = nil;
+        } else {
+            for (VNRecognizedTextObservation *o in req.results) {
+                VNRecognizedText *t = [[o topCandidates:1] firstObject];
+                if (!t.string.length) continue;
+                CGRect bb = o.boundingBox;
+                [out addObject:@{
+                    @"text": t.string,
+                    @"x": @((int)round(rect.origin.x + (bb.origin.x + bb.size.width / 2) * s.width)),
+                    @"y": @((int)round(rect.origin.y + (1 - bb.origin.y - bb.size.height / 2) * s.height)),
+                    @"w": @((int)round(bb.size.width * s.width)),
+                    @"h": @((int)round(bb.size.height * s.height))}];
+            }
+        }
+    } @catch (NSException *ex) {
+        if (accurate) [ud setBool:NO forKey:@"ocr_accurate_inflight"];
+        if (err) *err = [NSString stringWithFormat:@"Vision 异常:%@", ex.reason ?: @"未知异常"];
+        out = nil;
+    } @finally {
+        [lk unlock];
     }
     return out;
 }
-static NSArray *ocrWithHandler(VNImageRequestHandler *h, NSString **err) { return ocrWithHandlerRect(h, CGRectZero, err); }
 
 // v0.9.6:把同一行、水平紧挨着的碎片合并成一条(Vision 常把一个按钮/一句话切成几段)
 static BOOL isLatinish(NSString *t) {
@@ -320,7 +402,7 @@ static NSArray *cornerPass(UIImage *src, NSArray *have) {
     }];
     if (!up.CGImage) return have;
     NSString *e = nil;
-    NSArray *extra = ocrWithHandlerRect([[VNImageRequestHandler alloc] initWithCGImage:up.CGImage options:@{}], ptRect, &e);
+    NSArray *extra = ocrRun(up.CGImage, NULL, ptRect, &e);
     if (!extra.count) return have;
     NSMutableArray *out = [have mutableCopy];
     for (NSDictionary *x in extra) {
@@ -338,7 +420,7 @@ static NSArray *postOCR(UIImage *src, NSArray *r) {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     BOOL merge = [d objectForKey:@"ocr_merge"] ? [d boolForKey:@"ocr_merge"] : YES;
     BOOL corner = [d objectForKey:@"ocr_corner"] ? [d boolForKey:@"ocr_corner"] : YES;
-    if (corner) { @try { r = cornerPass(src, r); } @catch (NSException *ex) {} }
+    if (corner && !ocrAccurateOn()) { @try { r = cornerPass(src, r); } @catch (NSException *ex) {} }
     if (merge) r = mergeFragments(r);
     return r;
 }
@@ -401,8 +483,7 @@ static NSArray *ocrNV12(NSString **err) {
     }
     for (size_t i = 0; i < ch; i++) memcpy(cd + i * crb, src + i * cw * 2, cw * 2);
     CVPixelBufferUnlockBaseAddress(pb, 0);
-    VNImageRequestHandler *h2 = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pb options:@{}];
-    NSArray *out = ocrWithHandler(h2, err);
+    NSArray *out = ocrRun(NULL, pb, CGRectZero, err);
     CVPixelBufferRelease(pb);
     return out;
 }
@@ -416,8 +497,7 @@ NSArray *ocrImage(UIImage *img, NSString **err) {
     // 直接把它交给 Vision 在部分设备上会触发 CoreVideo/Vision 原生崩溃；
     // 已经校验并解码的 JPEG 是稳定路径，先用它完成 OCR。
     NSString *e2 = nil;
-    VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCGImage:ocrImg.CGImage options:@{}];
-    NSArray *r = ocrWithHandler(h, &e2);
+    NSArray *r = ocrRun(ocrImg.CGImage, NULL, CGRectZero, &e2);
     if (r) return postOCR(img, r);
     [notes appendFormat:@"[图片路径]%@", e2];
     // JPEG OCR 失败时，才尝试经过完整校验的 NV12；失败只作为普通错误返回。
@@ -480,4 +560,144 @@ NSString *diagReport(void) {
         if (sf) CFRelease(sf);
     }
     return r;
+}
+
+#pragma mark - v0.9.18 OCR 自检
+
+// Swift 写的 Live Text(VisionKit ImageAnalyzer,iOS 16,就是相册"长按识别文字"的引擎),见 src/livetext.swift
+@interface PALiveText : NSObject
++ (NSString *)transcript:(UIImage *)img timeout:(double)t;
+@end
+
+static NSString *paCacheDir(void) {
+    return [@"/var/mobile/Library/Caches" stringByAppendingPathComponent:NSBundle.mainBundle.bundleIdentifier];
+}
+
+static UIImage *selfTestImage(void) {
+    CGSize sz = CGSizeMake(700, 260);
+    UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat]; f.scale = 1;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:sz format:f];
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *c) {
+        [UIColor.whiteColor setFill]; UIRectFill(CGRectMake(0, 0, sz.width, sz.height));
+        NSDictionary *a = @{NSFontAttributeName: [UIFont systemFontOfSize:48 weight:UIFontWeightMedium], NSForegroundColorAttributeName: UIColor.blackColor};
+        [@"淘宝 大风衣 搜索" drawAtPoint:CGPointMake(30, 40) withAttributes:a];
+        [@"京东 价格 128.5元 Buy" drawAtPoint:CGPointMake(30, 140) withAttributes:a];
+    }];
+}
+
+static NSString *selfTestOCR(CGImageRef cg, NSInteger rev, BOOL accurate, BOOL cpu) {
+    if (!cg) return @"没有图片";
+    installOCRLeakPatch();
+    VNRecognizeTextRequest *r = [VNRecognizeTextRequest new];
+    r.revision = rev;
+    r.recognitionLevel = accurate ? VNRequestTextRecognitionLevelAccurate : VNRequestTextRecognitionLevelFast;
+    r.usesLanguageCorrection = accurate;
+    r.recognitionLanguages = @[@"zh-Hans", @"en-US"];
+    r.usesCPUOnly = cpu;
+    VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCGImage:cg options:@{}];
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    NSError *e = nil; BOOL ok = NO; NSString *exc = nil;
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+    [ocrLock() lock];
+    if (accurate) { [ud setBool:YES forKey:@"ocr_accurate_inflight"]; [ud synchronize]; }
+    @try { ok = [h performRequests:@[r] error:&e]; }
+    @catch (NSException *ex) { exc = ex.reason ?: ex.name; }
+    if (accurate) [ud setBool:NO forKey:@"ocr_accurate_inflight"];
+    [ocrLock() unlock];
+    int ms = (int)((CFAbsoluteTimeGetCurrent() - t0) * 1000);
+    if (exc) return [NSString stringWithFormat:@"异常 %@ (%dms)", exc, ms];
+    if (!ok) return [NSString stringWithFormat:@"失败 %@ code=%ld %@ (%dms)", e.domain, (long)e.code, e.localizedDescription, ms];
+    NSMutableArray *ts = [NSMutableArray array];
+    for (VNRecognizedTextObservation *o in r.results) { NSString *s = [[o topCandidates:1] firstObject].string; if (s.length) [ts addObject:s]; }
+    NSString *j = [ts componentsJoinedByString:@" | "];
+    if (j.length > 120) j = [[j substringToIndex:120] stringByAppendingString:@"…"];
+    return [NSString stringWithFormat:@"成功 %lu 段 (%dms):%@", (unsigned long)ts.count, ms, j];
+}
+
+static NSString *selfTestLive(UIImage *img) {
+    Class c = NSClassFromString(@"PALiveText");
+    if (!c) return @"LiveText 模块没编进来";
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+    NSString *s = [c transcript:img timeout:20] ?: @"(空)";
+    s = [s stringByReplacingOccurrencesOfString:@"\n" withString:@" | "];
+    if (s.length > 120) s = [[s substringToIndex:120] stringByAppendingString:@"…"];
+    return [NSString stringWithFormat:@"(%dms) %@", (int)((CFAbsoluteTimeGetCurrent() - t0) * 1000), s];
+}
+
+static NSString *cacheListing(void) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSMutableString *m = [NSMutableString string];
+    NSString *sysCaches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+    [m appendFormat:@"系统给的缓存目录:%@\n临时目录:%@\n", sysCaches, NSTemporaryDirectory()];
+    NSString *dir = paCacheDir();
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:dir isDirectory:&isDir]) { [m appendFormat:@"%@ 不存在\n", dir]; }
+    else {
+        unsigned long long total = 0; int n = 0;
+        NSDirectoryEnumerator *en = [fm enumeratorAtPath:dir];
+        NSMutableString *lines = [NSMutableString string];
+        for (NSString *p in en) {
+            NSDictionary *at = en.fileAttributes;
+            unsigned long long sz = [at[NSFileSize] unsignedLongLongValue];
+            BOOL d = [at[NSFileType] isEqualToString:NSFileTypeDirectory];
+            if (!d) total += sz;
+            if (n < 40 && (d ? en.level <= 3 : sz > 100 * 1024)) { [lines appendFormat:@"  %@%@ %@\n", p, d ? @"/" : @"", d ? @"" : [NSString stringWithFormat:@"%.1fMB", sz / 1048576.0]]; n++; }
+        }
+        [m appendFormat:@"%@ 共 %.1fMB:\n%@", dir, total / 1048576.0, lines];
+    }
+    NSArray *all = [fm contentsOfDirectoryAtPath:@"/var/mobile/Library/Caches" error:nil];
+    NSMutableArray *rel = [NSMutableArray array];
+    for (NSString *x in all) { NSString *l = x.lowercaseString; if ([l containsString:@"phoneagent"] || [l containsString:@"vision"] || [l containsString:@"e5rt"] || [l containsString:@"espresso"] || [l containsString:@"textrecognition"]) [rel addObject:x]; }
+    [m appendFormat:@"Caches 下相关目录:%@\n", rel.count ? [rel componentsJoinedByString:@", "] : @"无"];
+    return m;
+}
+
+NSString *ocrSelfTest(void (^progress)(NSString *soFar)) {
+    NSMutableString *m = [NSMutableString string];
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    void (^add)(NSString *) = ^(NSString *s) {
+        [m appendString:s]; [m appendString:@"\n"];
+        [ud setObject:m forKey:@"ocr_selftest_last"]; [ud synchronize]; // 中途闪退也能看到做到哪一步
+        if (progress) progress(m);
+    };
+    UIDevice *dv = UIDevice.currentDevice;
+    add([NSString stringWithFormat:@"PhoneAgent %@ / iOS %@ / 防闪退补丁 %@ / 已泄漏模型 %d",
+         [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"], dv.systemVersion,
+         (installOCRLeakPatch(), gLeakPatchOK) ? @"已装" : @"没装上", gLeakedModels]);
+    add(cacheListing());
+    {
+        VNRecognizeTextRequest *r = [VNRecognizeTextRequest new];
+        r.revision = VNRecognizeTextRequestRevision2; r.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+        NSError *e = nil; NSArray *langs = [r supportedRecognitionLanguagesAndReturnError:&e];
+        add([NSString stringWithFormat:@"精确 Rev2 支持的语言:%@", langs ? [langs componentsJoinedByString:@","] : [NSString stringWithFormat:@"出错 %@", e]]);
+    }
+    UIImage *ti = selfTestImage();
+    add(@"【内置中文图:淘宝 大风衣 搜索 / 京东 价格 128.5元 Buy】");
+    add([@"1 快速 Rev1:" stringByAppendingString:selfTestOCR(ti.CGImage, VNRecognizeTextRequestRevision1, NO, YES)]);
+    add([@"2 精确 Rev2 CPU:" stringByAppendingString:selfTestOCR(ti.CGImage, VNRecognizeTextRequestRevision2, YES, YES)]);
+    add([@"3 精确 Rev2 非CPU:" stringByAppendingString:selfTestOCR(ti.CGImage, VNRecognizeTextRequestRevision2, YES, NO)]);
+    add([@"4 Live Text:" stringByAppendingString:selfTestLive(ti)]);
+    NSString *se = nil;
+    UIImage *shot = takeScreenshot(&se);
+    if (shot.CGImage) {
+        add(@"【当前屏幕截图】");
+        add([@"5 精确 Rev2 CPU:" stringByAppendingString:selfTestOCR(shot.CGImage, VNRecognizeTextRequestRevision2, YES, YES)]);
+        add([@"6 Live Text:" stringByAppendingString:selfTestLive(shot)]);
+    } else add([NSString stringWithFormat:@"【截图】拿不到(录屏没开?):%@", se ?: @""]);
+    if (@available(iOS 16.0, *)) {
+        add([@"7 精确 Rev3 非CPU(内置图,最后测,曾闪退):" stringByAppendingString:selfTestOCR(ti.CGImage, VNRecognizeTextRequestRevision3, YES, NO)]);
+    }
+    add(@"自检结束");
+    return m;
+}
+
+// 把 PhoneAgent 自己的缓存目录改名备份(不删除,可恢复),下次识别时系统会重新生成
+NSString *ocrClearCache(void) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *dir = paCacheDir(), *bak = [dir stringByAppendingString:@".bak"];
+    if (![fm fileExistsAtPath:dir]) return [NSString stringWithFormat:@"%@ 不存在,没有可清的", dir];
+    [fm removeItemAtPath:bak error:nil];
+    NSError *e = nil;
+    if (![fm moveItemAtPath:dir toPath:bak error:&e]) return [NSString stringWithFormat:@"改名失败:%@", e.localizedDescription];
+    return [NSString stringWithFormat:@"已把 %@ 改名为 .bak。请从后台划掉 PhoneAgent 再打开,然后再做一次自检。", dir];
 }

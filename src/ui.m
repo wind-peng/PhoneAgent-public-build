@@ -503,6 +503,38 @@ static NSData *attachJPEG(UIImage *img) {
 }
 @end
 
+// v0.9.18 OCR 自检页:结果可选中复制
+@interface OCRTestVC : UIViewController
+@property (nonatomic, strong) UITextView *tv;
+@end
+@implementation OCRTestVC
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"OCR 自检";
+    self.view.backgroundColor = UIColor.systemBackgroundColor;
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"复制" style:UIBarButtonItemStylePlain target:self action:@selector(onCopy)];
+    self.tv = [UITextView new];
+    self.tv.editable = NO; self.tv.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+    self.tv.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:self.tv];
+    [NSLayoutConstraint activateConstraints:@[
+        [self.tv.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
+        [self.tv.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor],
+        [self.tv.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:8],
+        [self.tv.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-8]]];
+    NSString *last = [NSUserDefaults.standardUserDefaults stringForKey:@"ocr_selftest_last"];
+    self.tv.text = [NSString stringWithFormat:@"自检中,约半分钟,别切走……\n\n上一次自检记录(如果上次中途闪退,看最后一行做到哪):\n%@", last ?: @"无"];
+    __weak OCRTestVC *ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        ocrSelfTest(^(NSString *soFar) {
+            NSString *t = [soFar copy];
+            dispatch_async(dispatch_get_main_queue(), ^{ ws.tv.text = t; });
+        });
+    });
+}
+- (void)onCopy { UIPasteboard.generalPasteboard.string = self.tv.text; self.navigationItem.rightBarButtonItem.title = @"已复制"; }
+@end
+
 @interface AdvancedVC : UIViewController
 @property (nonatomic, strong) UITextView *popupTV;
 @property (nonatomic, strong) UITextField *bBase, *bKey, *bModel;
@@ -537,7 +569,7 @@ static NSData *attachJPEG(UIImage *img) {
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"高级设置(v0.9.17)";
+    self.title = @"高级设置(v0.9.18)";
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
     self.popupTV = [UITextView new];
@@ -557,7 +589,14 @@ static NSData *attachJPEG(UIImage *img) {
     UIButton *tokClr = [UIButton buttonWithType:UIButtonTypeSystem];
     [tokClr setTitle:@"累计清零" forState:UIControlStateNormal];
     [tokClr addTarget:self action:@selector(onTokClear) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *ocrT = [UIButton buttonWithType:UIButtonTypeSystem];
+    [ocrT setTitle:@"OCR 自检(中文识别是否正常)" forState:UIControlStateNormal];
+    [ocrT addTarget:self action:@selector(onOCRTest) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *ocrC = [UIButton buttonWithType:UIButtonTypeSystem];
+    [ocrC setTitle:@"清除 PhoneAgent 的识别缓存(改名备份)" forState:UIControlStateNormal];
+    [ocrC addTarget:self action:@selector(onOCRClear) forControlEvents:UIControlEventTouchUpInside];
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
+        [self hdr:@"OCR 诊断"], ocrT, ocrC,
         [self hdr:@"Token 统计(每次任务结束也会在执行记录里显示本次用量)"],
         self.tokL, tokClr,
         [self hdr:@"模型请求"],
@@ -584,7 +623,7 @@ static NSData *attachJPEG(UIImage *img) {
         [self sw:@"检测无文字小图标(×、返回箭头等)" key:@"icon_detect" def:YES],
         [self sw:@"合并同一行相邻的 OCR 碎片" key:@"ocr_merge" def:YES],
         [self sw:@"右上角小字放大再识别一次" key:@"ocr_corner" def:YES],
-        [self sw:@"OCR 精确模式(较慢;未在 iOS 16.1 真机验证)" key:@"ocr_accurate" def:NO],
+        [self sw:@"OCR 精确模式(较慢;闪退会自动关闭)" key:@"ocr_accurate" def:NO],
         [self hdr:@"自我恢复与长任务"],
         [self sw:@"目标 App 意外退出时自动重新打开" key:@"auto_relaunch" def:YES],
         [self sw:@"录屏画面卡住时暂停提醒" key:@"stale_frame_check" def:YES],
@@ -618,6 +657,17 @@ static NSData *attachJPEG(UIImage *img) {
 - (void)done { [self save]; [self dismissViewControllerAnimated:YES completion:nil]; }
 - (void)viewWillDisappear:(BOOL)animated { [super viewWillDisappear:animated]; [self save]; }
 - (void)onTokClear { tokClearTotal(); self.tokL.text = tokSummary(YES); }
+- (void)onOCRTest { [self.navigationController pushViewController:[OCRTestVC new] animated:YES]; }
+- (void)onOCRClear {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"清除识别缓存" message:@"只把 /var/mobile/Library/Caches/本App 目录改名为 .bak,不动设置和 Key。之后需要从后台划掉 PhoneAgent 再打开。" preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+        UIAlertController *b = [UIAlertController alertControllerWithTitle:@"结果" message:ocrClearCache() preferredStyle:UIAlertControllerStyleAlert];
+        [b addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:b animated:YES completion:nil];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
 - (void)onCalib {
     CalibVC *c = [CalibVC new];
     c.modalPresentationStyle = UIModalPresentationFullScreen;
@@ -1057,6 +1107,7 @@ static NSData *attachJPEG(UIImage *img) {
     static BOOL asked;
     if (asked) return;
     asked = YES;
+    if (gOCRGuardTripped) [self say:@"上次 OCR 精确模式运行中闪退了,已自动关闭精确模式(可在高级设置里重新打开)"];
     if (gAgentRunning) return;
     NSDictionary *cp = cpLoad();
     if (!cp) return;
@@ -1253,6 +1304,7 @@ static NSData *attachJPEG(UIImage *img) {
 
 - (BOOL)application:(UIApplication *)a didFinishLaunchingWithOptions:(NSDictionary *)o {
     signal(SIGPIPE, SIG_IGN);
+    gOCRGuardTripped = ocrCrashGuardCheck(); // 上次精确 OCR 中途闪退 → 自动关闭精确模式
     gLock = [NSObject new];
     gAgentLog = [NSMutableArray array];
     gRunLog = [NSMutableArray array];

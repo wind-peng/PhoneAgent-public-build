@@ -157,3 +157,10 @@ void tokAdd(id usage);
 void tokReset(void);
 NSString *tokSummary(BOOL total);
 void tokClearTotal(void);
+// v0.9.7 OCR 精确模式闪退保护
+extern BOOL gOCRGuardTripped;
+BOOL ocrCrashGuardCheck(void);
+BOOL ocrAccurateOn(void);
+// v0.9.18 OCR 自检
+NSString *ocrSelfTest(void (^progress)(NSString *soFar));
+NSString *ocrClearCache(void);
