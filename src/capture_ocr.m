@@ -234,22 +234,32 @@ BOOL gOCRGuardTripped;
 // 每次泄漏几十 MB,所以计数,超过上限本次运行就退回快速模式,防止内存爆掉。
 static volatile int gLeakedModels;
 static BOOL gLeakPatchOK;
-static void paLeakDealloc(__unsafe_unretained id self, SEL _cmd) { gLeakedModels++; }
+// v0.9.16:v0.9.8 的做法(把 dealloc 换成空函数)跳过了系统的清理(弱引用不清、成员不释放),
+// 实测导致精确识别每次都报内部错误(code 11),而系统“实况文本”同样的中文模型是好的。
+// 改为:模型对象一创建就多 retain 一次,永远走不到 dealloc——不崩、对象完整有效,只是不回收内存(低于 250MB 退回快速)。
+static Class gModelClass;
+typedef void *(*PAAllocFn)(id, SEL, void *);
+static PAAllocFn gOrigAlloc;
+static void *paModelAlloc(id cls, SEL sel, void *zone) {
+    void *o = gOrigAlloc(cls, sel, zone);
+    if (o) { CFRetain(o); gLeakedModels++; }
+    return o;
+}
 static void installOCRLeakPatch(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         dlopen("/System/Library/PrivateFrameworks/TextRecognition.framework/TextRecognition", RTLD_NOW);
-        const char *names[] = {"CRTextSequenceRecognizerModelEspresso", NULL};
-        for (int i = 0; names[i]; i++) {
-            Class c = objc_getClass(names[i]);
-            if (!c) continue;
-            Method m = class_getInstanceMethod(c, sel_registerName("dealloc"));
-            if (!m) continue;
-            // 只替换该类自己实现的 dealloc(不动父类)
-            if (!class_addMethod(c, sel_registerName("dealloc"), (IMP)paLeakDealloc, method_getTypeEncoding(m)))
-                method_setImplementation(m, (IMP)paLeakDealloc);
-            gLeakPatchOK = YES;
-        }
+        Class c = objc_getClass("CRTextSequenceRecognizerModelEspresso");
+        if (!c) return;
+        Class meta = object_getClass(c);
+        SEL sel = sel_registerName("allocWithZone:");
+        Method m = class_getClassMethod(c, sel);
+        if (!m) return;
+        gOrigAlloc = (PAAllocFn)method_getImplementation(m);
+        if (!class_addMethod(meta, sel, (IMP)paModelAlloc, method_getTypeEncoding(m)))
+            method_setImplementation(class_getClassMethod(c, sel), (IMP)paModelAlloc);
+        gModelClass = c;
+        gLeakPatchOK = YES;
     });
 }
 // v0.9.10:Vision 会在空闲几秒后自动回收识别引擎(每步等模型回复时就空闲了),
@@ -376,6 +386,7 @@ static NSArray *ocrRun(CGImageRef cg, CVPixelBufferRef pb, CGRect rect, NSString
                 }
             }
             if (!ok) {
+                gAccurateFellBack = YES; // 四种都失败:本次运行不再每步重试(省时间)
                 if (!gAccAllFailSaid) { gAccAllFailSaid = YES; agentSay([NSString stringWithFormat:@"提示:精确 OCR 四种方式都失败(%@),这些步改用快速模式,中文会认不出", tried]); }
                 if (!gReqFast) {
                     gReqFast = [VNRecognizeTextRequest new];
