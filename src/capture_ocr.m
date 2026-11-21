@@ -285,6 +285,8 @@ BOOL ocrCrashGuardCheck(void) {
 }
 
 // cg 或 pb 二选一;rect:这张图对应的屏幕区域(pt),整屏传 CGRectZero
+// v0.9.14 诊断:最近一次识别的情况(只记录,不改逻辑)
+static int gDiagObs = -1, gDiagRebuild0; static double gDiagMs; static BOOL gDiagAcc; static NSString *gDiagErr; static int gDiagImgW, gDiagImgH;
 static NSArray *ocrRun(CGImageRef cg, CVPixelBufferRef pb, CGRect rect, NSString **err) {
     if (!cg && !pb) { if (err) *err = @"OCR 没有图片"; return nil; }
     CGSize s0 = screenSize();
@@ -322,9 +324,14 @@ static NSArray *ocrRun(CGImageRef cg, CVPixelBufferRef pb, CGRect rect, NSString
             req = gReqFast;
         }
         NSError *e = nil;
+        CFAbsoluteTime dt0 = CFAbsoluteTimeGetCurrent(); int rb0 = gLeakedModels;
+        gDiagAcc = accurate; gDiagImgW = cg ? (int)CGImageGetWidth(cg) : 0; gDiagImgH = cg ? (int)CGImageGetHeight(cg) : 0;
         BOOL ok = cg ? [gOCRSeq performRequests:@[req] onCGImage:cg error:&e]
                      : [gOCRSeq performRequests:@[req] onCVPixelBuffer:pb error:&e];
         if (accurate) { [ud setBool:NO forKey:@"ocr_accurate_inflight"]; gLastOCRTime = CFAbsoluteTimeGetCurrent(); }
+        gDiagMs = (CFAbsoluteTimeGetCurrent() - dt0) * 1000; gDiagRebuild0 = gLeakedModels - rb0;
+        gDiagObs = ok ? (int)req.results.count : -1;
+        gDiagErr = ok ? nil : [NSString stringWithFormat:@"%@(%@ %ld)", e.localizedDescription ?: @"?", e.domain ?: @"", (long)e.code];
         if (!ok) {
             if (err) *err = e.localizedDescription ?: @"Vision 识别失败";
             out = nil;
@@ -342,6 +349,7 @@ static NSArray *ocrRun(CGImageRef cg, CVPixelBufferRef pb, CGRect rect, NSString
             }
         }
     } @catch (NSException *ex) {
+        gDiagObs = -2; gDiagErr = [NSString stringWithFormat:@"异常 %@", ex.reason ?: @"?"];
         if (accurate) [ud setBool:NO forKey:@"ocr_accurate_inflight"];
         if (err) *err = [NSString stringWithFormat:@"Vision 异常:%@", ex.reason ?: @"未知异常"];
         out = nil;
@@ -501,6 +509,12 @@ static NSArray *ocrNV12(NSString **err) {
     return out;
 }
 
+static int gDiagRaw = -1, gDiagPost = -1;
+NSString *ocrDiagLine(void) {
+    return [NSString stringWithFormat:@"%@ 图%dx%d 观测%d 原始%d 合并后%d 耗时%.0fms 本次重建%d 累计重建%d 剩余%dMB%@",
+            gDiagAcc ? @"精确" : @"快速", gDiagImgW, gDiagImgH, gDiagObs, gDiagRaw, gDiagPost, gDiagMs, gDiagRebuild0, gLeakedModels,
+            (int)(os_proc_available_memory() / 1024 / 1024), gDiagErr.length ? [@" 错误:" stringByAppendingString:gDiagErr] : @""];
+}
 NSArray *ocrImage(UIImage *img, NSString **err) {
     if (!img.CGImage) { if (err) *err = @"截图没有有效图像"; return nil; }
     // 先放大、灰度化并提高对比度，再交给稳定的 Revision 1/Fast，改善小字识别。
@@ -511,7 +525,9 @@ NSArray *ocrImage(UIImage *img, NSString **err) {
     // 已经校验并解码的 JPEG 是稳定路径，先用它完成 OCR。
     NSString *e2 = nil;
     NSArray *r = ocrRun(ocrImg.CGImage, NULL, CGRectZero, &e2);
-    if (r) return postOCR(img, r);
+    gDiagRaw = r ? (int)r.count : -1;
+    if (r) { NSArray *pr = postOCR(img, r); gDiagPost = (int)pr.count; return pr; }
+    gDiagPost = -1;
     [notes appendFormat:@"[图片路径]%@", e2];
     // JPEG OCR 失败时，才尝试经过完整校验的 NV12；失败只作为普通错误返回。
     if ([gShotMethod isEqualToString:@"R"]) {

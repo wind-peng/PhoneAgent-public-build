@@ -168,3 +168,4 @@ void ocrWarmStart(void);
 void ocrWarmStop(void);
 int ocrModelRebuilds(void);
 int ocrAvailMB(void);
+NSString *ocrDiagLine(void);
