@@ -1259,7 +1259,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             if (hd > 0) sleepWhileRunning(hd);
             if (!gAgentRunning) break;
         }
-        if (!settled) { if (paOn(@"smart_settle", YES)) waitScreenSettle(0, 3.0); else waitForStableFrame(3.0); }
+        if (!settled) waitForStableFrame(3.0); // 动作后已经等过画面稳定的就不再等(静止时立即返回)
         settled = NO;
         NSString *err = nil;
         UIImage *img = takeScreenshot(&err);
