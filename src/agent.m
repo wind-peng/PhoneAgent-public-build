@@ -1109,6 +1109,21 @@ static void taskRunEnd(NSString *task, BOOL stopCast) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ memoryLearn(shownCopy, resultCopy); });
 }
 
+// v0.9.13:画面是否几乎全黑(刚开录屏时广播常先给黑帧)
+static BOOL imageMostlyDark(UIImage *img) {
+    if (!img.CGImage) return YES;
+    unsigned char px[16 * 16 * 4] = {0};
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(px, 16, 16, 8, 64, cs, kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return NO;
+    CGContextDrawImage(ctx, CGRectMake(0, 0, 16, 16), img.CGImage);
+    CGContextRelease(ctx);
+    double sum = 0; int bright = 0;
+    for (int i = 0; i < 256; i++) { double v = (px[i*4] + px[i*4+1] + px[i*4+2]) / 3.0; sum += v; if (v > 60) bright++; }
+    return sum / 256 < 18 && bright < 6;
+}
+
 // ---- v0.9.6 主循环用到的小工具 ----
 static void sleepWhileRunning(double secs) {
     CFAbsoluteTime until = CFAbsoluteTimeGetCurrent() + secs;
@@ -1258,6 +1273,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     CGSize sc = screenSize();
     int startStep = 1;
     int blockedHits = 0;
+    int blackRetry = 0;
     NSDictionary *cp = gResumeCP; gResumeCP = nil;
     if (cp && [cp[@"task"] isEqualToString:task]) { // 11:从断点继续
         for (id h in cp[@"history"]) if ([h isKindOfClass:NSString.class]) { [history addObject:h]; [histProg addObject:@""]; }
@@ -1276,6 +1292,13 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
         NSString *replaySummary = expTryReplay(gTaskDisplay.length ? gTaskDisplay : task, history, &replayStopped);
         if (replayStopped) { agentSay(@"任务已被停止"); gAgentRunning = NO; return; }
         if (replaySummary.length) [history addObject:[NSString stringWithFormat:@"(%@请根据当前屏幕核对任务是否已经完成:没完成就继续做,完成了就用 done 给出结果。)", replaySummary]];
+    }
+    { // v0.9.13:开始时前台是 PhoneAgent 自己(刚开完录屏)→ 先回主屏,免得模型去点自己的“开始任务”
+        NSString *f0 = frontmostBundleID();
+        if ([f0 isEqualToString:NSBundle.mainBundle.bundleIdentifier]) {
+            NSString *hn = nil; goHome(&hn);
+            afterAction(0.8, 3.0, 2);
+        }
     }
     for (int step = startStep; gAgentRunning; step++) @autoreleasepool { // 不限步数,靠"停止任务"和卡死检测结束
         gStepNo = step;
@@ -1313,6 +1336,14 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             if ([it[@"y"] doubleValue] >= 50) [sigText appendFormat:@"%@|", t]; // 卡死检测不看状态栏(时间、电量会变)
         }
         BOOL localOK = items.count >= 2 && localText.length >= 6;
+        if (!localOK && blackRetry < 4 && imageMostlyDark(img)) { // v0.9.13:黑屏帧不交给模型,等一下重拍
+            blackRetry++;
+            if (blackRetry == 1) agentSay(@"画面是黑的(录屏刚开或在转场),等一下再看");
+            dispatch_group_wait(encGroup, DISPATCH_TIME_FOREVER);
+            sleepWhileRunning(1.2);
+            step--; continue;
+        }
+        blackRetry = 0;
         NSArray *allItems = items;
         if (paOn(@"icon_detect", YES) && items.count < 80) { // 19:无文字小图标候选
             NSArray *icons = nil;
