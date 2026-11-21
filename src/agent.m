@@ -69,8 +69,15 @@ static BOOL waitAppActive(double timeout) {
 // 写剪贴板。iOS 9 起不允许后台 App 访问剪贴板(写入也会被忽略),而 PhoneAgent 平时都在后台操作别的 App,
 // 所以这里先把 PhoneAgent 切到前台、写入并读回校验,再切回原来的 App。
 // 返回 YES 表示写入并校验成功;stranded 为 YES 表示切走后没能自动回去(需要模型用 open_app 回到目标 App)。
+// v0.9.12:剪贴板里已经是同一段字(自上次写入后没人改过)就不再切前台重写,比价换 App 时省掉一来一回
+static NSString *gPbLastText; static NSInteger gPbLastCC = -1;
 static BOOL writeClipboardInForeground(NSString *text, NSString *backHint, NSString **note, BOOL *stranded) {
     *stranded = NO;
+    if (gPbLastText && [gPbLastText isEqualToString:text]) {
+        __block NSInteger ccNow = -2;
+        dispatch_sync(dispatch_get_main_queue(), ^{ ccNow = UIPasteboard.generalPasteboard.changeCount; });
+        if (ccNow == gPbLastCC) return YES;
+    }
     NSString *selfID = NSBundle.mainBundle.bundleIdentifier;
     BOOL switched = NO;
     NSString *back = nil;
@@ -91,6 +98,7 @@ static BOOL writeClipboardInForeground(NSString *text, NSString *backHint, NSStr
         check = pb.string;
     });
     BOOL ok = [check isEqualToString:text];
+    if (ok) { gPbLastText = [text copy]; gPbLastCC = cc1; }
     if (!ok) *note = [NSString stringWithFormat:@"剪贴板写入后读回不一致(changeCount %ld→%ld)", (long)cc0, (long)cc1];
     if (switched) {
         if (back.length && ![back isEqualToString:selfID] && ![back isEqualToString:@"com.apple.springboard"]) {
