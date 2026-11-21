@@ -567,6 +567,7 @@ NSString *diagReport(void) {
 // Swift 写的 Live Text(VisionKit ImageAnalyzer,iOS 16,就是相册"长按识别文字"的引擎),见 src/livetext.swift
 @interface PALiveText : NSObject
 + (NSString *)transcript:(UIImage *)img timeout:(double)t;
++ (void)setProbe:(BOOL)b;
 @end
 
 static NSString *paCacheDir(void) {
@@ -677,6 +678,7 @@ NSString *ocrSelfTest(void (^progress)(NSString *soFar)) {
     add([@"2 精确 Rev2 CPU:" stringByAppendingString:selfTestOCR(ti.CGImage, VNRecognizeTextRequestRevision2, YES, YES)]);
     add([@"3 精确 Rev2 非CPU:" stringByAppendingString:selfTestOCR(ti.CGImage, VNRecognizeTextRequestRevision2, YES, NO)]);
     add([@"4 Live Text:" stringByAppendingString:selfTestLive(ti)]);
+    { Class lc = NSClassFromString(@"PALiveText"); if (lc) { [lc setProbe:YES]; add([@"4b 探测:" stringByAppendingString:[lc transcript:ti timeout:20] ?: @""]); [lc setProbe:NO]; } }
     NSString *se = nil;
     UIImage *shot = takeScreenshot(&se);
     if (shot.CGImage) {
