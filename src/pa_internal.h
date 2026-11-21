@@ -167,3 +167,4 @@ void tokClearTotal(void);
 void ocrWarmStart(void);
 void ocrWarmStop(void);
 int ocrModelRebuilds(void);
+int ocrAvailMB(void);

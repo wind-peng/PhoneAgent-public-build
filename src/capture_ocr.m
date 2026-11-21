@@ -259,13 +259,15 @@ static void installOCRLeakPatch(void) {
 static BOOL gAccurateFellBack;
 static double gLastOCRTime;
 int ocrModelRebuilds(void) { return gLeakedModels; }
+int ocrAvailMB(void) { return (int)(os_proc_available_memory() / 1024 / 1024); }
 BOOL ocrAccurateOn(void) {
     if (![NSUserDefaults.standardUserDefaults boolForKey:@"ocr_accurate"]) return NO;
     installOCRLeakPatch();
     if (!gLeakPatchOK) return NO;                       // 找不到私有类:不冒险,用快速模式
     if (gAccurateFellBack) return NO;
     size_t avail = os_proc_available_memory();
-    if (gLeakedModels >= 80 || (avail > 0 && avail < 350ull * 1024 * 1024)) {
+    // v0.9.11:实测重建 80 次后仍剩 738MB,说明每次泄漏很小,次数没有意义,只看剩余内存
+    if (avail > 0 && avail < 250ull * 1024 * 1024) {
         gAccurateFellBack = YES;
         agentSay([NSString stringWithFormat:@"提示:可用内存不足(剩 %zu MB,精确引擎已重建 %d 次),本次运行 OCR 退回快速模式,中文会认不出;重启 PhoneAgent 可恢复", avail / 1024 / 1024, gLeakedModels]);
         return NO;
@@ -587,6 +589,7 @@ static CGImageRef warmImage(void) {
     return img;
 }
 void ocrWarmStart(void) {
+    return;   // v0.9.11:热身没拦住回收,反而可能让重建更频繁,先关掉
     if (gWarmTimer) return;
     dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
     gWarmTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);

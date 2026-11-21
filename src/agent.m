@@ -1822,6 +1822,6 @@ void agentRun(NSString *task, NSString *base, NSString *key, NSString *model) {
     if (proceed && gAgentRunning) agentRunCore(task, base, key, model);
     ocrWarmStop();
     { NSString *ts = tokSummary(NO); if (ts.length) agentSay(ts); }
-    if (ocrAccurateOn() || ocrModelRebuilds() > rb0) agentSay([NSString stringWithFormat:@"精确 OCR:本次引擎重建 %d 次(越少越好)", ocrModelRebuilds() - rb0]);
+    if (ocrAccurateOn() || ocrModelRebuilds() > rb0) agentSay([NSString stringWithFormat:@"精确 OCR:本次引擎重建 %d 次,剩余内存 %d MB", ocrModelRebuilds() - rb0, ocrAvailMB()]);
     taskRunEnd(task, autoCast);
 }
