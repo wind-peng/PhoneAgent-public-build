@@ -207,7 +207,6 @@
 - (void)done { [self save]; [self dismissViewControllerAnimated:YES completion:nil]; }
 - (void)clearAll { self.tv.text = @""; }
 - (void)viewWillDisappear:(BOOL)animated { [super viewWillDisappear:animated]; [self save]; }
-- (void)onTokClear { tokClearTotal(); self.tokL.text = tokSummary(YES); }
 @end
 
 // ---- 安全设置:敏感操作确认、禁止进入的 App ----
@@ -618,6 +617,7 @@ static NSData *attachJPEG(UIImage *img) {
 }
 - (void)done { [self save]; [self dismissViewControllerAnimated:YES completion:nil]; }
 - (void)viewWillDisappear:(BOOL)animated { [super viewWillDisappear:animated]; [self save]; }
+- (void)onTokClear { tokClearTotal(); self.tokL.text = tokSummary(YES); }
 - (void)onCalib {
     CalibVC *c = [CalibVC new];
     c.modalPresentationStyle = UIModalPresentationFullScreen;
