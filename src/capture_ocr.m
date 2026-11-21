@@ -292,8 +292,8 @@ static NSString *accVariantName(int v) {
 }
 static VNRecognizeTextRequest *accVariantRequest(int v) {
     static VNRecognizeTextRequest *r1, *r2, *r3;
-    VNRecognizeTextRequest **slot = v == 1 ? &r1 : v == 2 ? &r2 : &r3;
-    if (*slot) return *slot;
+    VNRecognizeTextRequest *have = v == 1 ? r1 : v == 2 ? r2 : r3;
+    if (have) return have;
     NSUInteger rev = v == 3 ? 3 : VNRecognizeTextRequestRevision2;
     if (![[VNRecognizeTextRequest supportedRevisions] containsIndex:rev]) return nil;
     VNRecognizeTextRequest *r = [VNRecognizeTextRequest new];
@@ -302,7 +302,7 @@ static VNRecognizeTextRequest *accVariantRequest(int v) {
     r.usesLanguageCorrection = YES;
     r.recognitionLanguages = @[@"zh-Hans", @"en-US"];
     r.usesCPUOnly = (v == 2);
-    *slot = r;
+    if (v == 1) r1 = r; else if (v == 2) r2 = r; else r3 = r;
     return r;
 }
 // v0.9.14 诊断:最近一次识别的情况(只记录,不改逻辑)
