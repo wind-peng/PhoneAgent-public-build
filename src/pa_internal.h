@@ -162,3 +162,8 @@ void tokAdd(id usage);
 void tokReset(void);
 NSString *tokSummary(BOOL total);
 void tokClearTotal(void);
+
+// v0.9.10 精确 OCR 热身
+void ocrWarmStart(void);
+void ocrWarmStop(void);
+int ocrModelRebuilds(void);

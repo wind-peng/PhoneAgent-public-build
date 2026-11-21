@@ -1128,6 +1128,13 @@ static NSArray *trimOCRItems(NSArray *items) {
                 if ((c >= 0x4E00 && c <= 0x9FFF) || [NSCharacterSet.alphanumericCharacterSet characterIsMember:c]) good++;
             }
             if (good * 2 < t.length) continue;
+            // v0.9.10:快速模式把中文认成拉丁乱码(È*¥£&] 之类),含 2 个以上怪字符就丢掉
+            NSUInteger odd = 0;
+            for (NSUInteger k = 0; k < t.length; k++) {
+                unichar c = [t characterAtIndex:k];
+                if ((c >= 0x00C0 && c <= 0x024F) || c == 0x00A3 || c == 0x00A5 || c == '*' || c == '&' || c == ']' || c == '[' || c == '\\' || c == '|') odd++;
+            }
+            if (odd >= 2) continue;
         }
         BOOL dup = NO;
         for (NSDictionary *o in out)
@@ -1810,7 +1817,11 @@ void agentRun(NSString *task, NSString *base, NSString *key, NSString *model) {
         else { agentSay([NSString stringWithFormat:@"任务停止:自动开启屏幕录制失败(%@),请手动开启屏幕广播后再开始", n ?: @""]); proceed = NO; }
     }
     tokReset();
+    int rb0 = ocrModelRebuilds();
+    ocrWarmStart();
     if (proceed && gAgentRunning) agentRunCore(task, base, key, model);
+    ocrWarmStop();
     { NSString *ts = tokSummary(NO); if (ts.length) agentSay(ts); }
+    if (ocrAccurateOn() || ocrModelRebuilds() > rb0) agentSay([NSString stringWithFormat:@"精确 OCR:本次引擎重建 %d 次(越少越好)", ocrModelRebuilds() - rb0]);
     taskRunEnd(task, autoCast);
 }

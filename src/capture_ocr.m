@@ -2,6 +2,7 @@
 #import "pa_internal.h"
 #import <objc/runtime.h>
 #import <dlfcn.h>
+#import <os/proc.h>
 
 #pragma mark - 截屏(多种方法依次尝试,并记录每种的结果)
 
@@ -251,16 +252,26 @@ static void installOCRLeakPatch(void) {
         }
     });
 }
-#define PA_MAX_LEAKED_MODELS 10
-
+// v0.9.10:Vision 会在空闲几秒后自动回收识别引擎(每步等模型回复时就空闲了),
+// 于是每步都泄漏一个模型,原来的 10 个上限十几步就用完,悄悄退回快速模式 → 中文变乱码、乱点。
+// 现在:1) 任务期间每 1.5 秒用一张小图“热身”一次,让引擎不被回收;
+//       2) 上限改看剩余内存(低于 350MB 才退回快速模式),并在日志里明确提示。
+static BOOL gAccurateFellBack;
+static double gLastOCRTime;
+int ocrModelRebuilds(void) { return gLeakedModels; }
 BOOL ocrAccurateOn(void) {
     if (![NSUserDefaults.standardUserDefaults boolForKey:@"ocr_accurate"]) return NO;
     installOCRLeakPatch();
     if (!gLeakPatchOK) return NO;                       // 找不到私有类:不冒险,用快速模式
-    if (gLeakedModels >= PA_MAX_LEAKED_MODELS) return NO; // 泄漏太多:本次运行退回快速模式
+    if (gAccurateFellBack) return NO;
+    size_t avail = os_proc_available_memory();
+    if (gLeakedModels >= 80 || (avail > 0 && avail < 350ull * 1024 * 1024)) {
+        gAccurateFellBack = YES;
+        agentSay([NSString stringWithFormat:@"提示:可用内存不足(剩 %zu MB,精确引擎已重建 %d 次),本次运行 OCR 退回快速模式,中文会认不出;重启 PhoneAgent 可恢复", avail / 1024 / 1024, gLeakedModels]);
+        return NO;
+    }
     return YES;
 }
-
 // 启动时调用:上次精确识别没结束就闪退了 → 自动关闭精确模式,返回 YES
 BOOL ocrCrashGuardCheck(void) {
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
@@ -311,7 +322,7 @@ static NSArray *ocrRun(CGImageRef cg, CVPixelBufferRef pb, CGRect rect, NSString
         NSError *e = nil;
         BOOL ok = cg ? [gOCRSeq performRequests:@[req] onCGImage:cg error:&e]
                      : [gOCRSeq performRequests:@[req] onCVPixelBuffer:pb error:&e];
-        if (accurate) [ud setBool:NO forKey:@"ocr_accurate_inflight"];
+        if (accurate) { [ud setBool:NO forKey:@"ocr_accurate_inflight"]; gLastOCRTime = CFAbsoluteTimeGetCurrent(); }
         if (!ok) {
             if (err) *err = e.localizedDescription ?: @"Vision 识别失败";
             out = nil;
@@ -560,4 +571,37 @@ NSString *diagReport(void) {
         if (sf) CFRelease(sf);
     }
     return r;
+}
+
+#pragma mark - v0.9.10 精确 OCR 热身(防止 Vision 空闲回收引擎)
+static dispatch_source_t gWarmTimer;
+static CGImageRef warmImage(void) {
+    static CGImageRef img; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        UIGraphicsBeginImageContextWithOptions(CGSizeMake(96, 32), YES, 1);
+        [UIColor.whiteColor setFill]; UIRectFill(CGRectMake(0, 0, 96, 32));
+        [@"好" drawAtPoint:CGPointMake(36, 4) withAttributes:@{NSFontAttributeName: [UIFont systemFontOfSize:20], NSForegroundColorAttributeName: UIColor.blackColor}];
+        img = CGImageRetain(UIGraphicsGetImageFromCurrentImageContext().CGImage);
+        UIGraphicsEndImageContext();
+    });
+    return img;
+}
+void ocrWarmStart(void) {
+    if (gWarmTimer) return;
+    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+    gWarmTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+    dispatch_source_set_timer(gWarmTimer, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), 1.5 * NSEC_PER_SEC, 0.2 * NSEC_PER_SEC);
+    dispatch_source_set_event_handler(gWarmTimer, ^{
+        if (!ocrAccurateOn()) return;
+        if (CFAbsoluteTimeGetCurrent() - gLastOCRTime < 1.2) return;
+        if (![ocrLock() tryLock]) return;   // 正在识别就跳过
+        @autoreleasepool { NSString *e = nil; ocrRun(warmImage(), NULL, CGRectMake(0, 0, 96, 32), &e); }
+        [ocrLock() unlock];
+    });
+    dispatch_resume(gWarmTimer);
+}
+void ocrWarmStop(void) {
+    if (!gWarmTimer) return;
+    dispatch_source_cancel(gWarmTimer);
+    gWarmTimer = nil;
 }
