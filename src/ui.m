@@ -1013,7 +1013,7 @@ static NSData *attachJPEG(UIImage *img) {
             [d setBool:YES forKey:@"migrated_v7"];
         }
     }
-    frameKey(); // 首次启动时生成广播扩展用的随机暗号
+
     gSwipeMode = (int)[NSUserDefaults.standardUserDefaults integerForKey:@"swipe_mode"];
     gToken = [NSUserDefaults.standardUserDefaults stringForKey:@"token"];
     if (!gToken) {

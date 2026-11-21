@@ -17,9 +17,5 @@
     <string>AGXDeviceUserClient</string>
   </array>
   <key>com.apple.springboard.show-alert</key><true/>
-  <key>com.apple.security.application-groups</key>
-  <array>
-    <string>group.com.example.phoneagent.shared</string>
-  </array>
 </dict>
 </plist>

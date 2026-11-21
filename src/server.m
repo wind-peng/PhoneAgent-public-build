@@ -3,35 +3,7 @@
 
 NSString *gToken;
 
-// 广播扩展与主 App 之间的暗号:首次启动时随机生成,存进共享的 App Group 偏好(扩展从同一处读取);
-// 同时写一份到本机文件,万一 App Group 偏好在 TrollStore 环境下没共享成功,扩展还能从文件读到。
-static NSString *gFrameKey;
-NSString *frameKey(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSUserDefaults *g = [[NSUserDefaults alloc] initWithSuiteName:PA_APP_GROUP];
-        NSString *k = [g stringForKey:PA_FRAME_KEY_NAME];
-        if (k.length < 16) {
-            NSString *fk = [[NSString stringWithContentsOfFile:PA_FRAME_KEY_FILE encoding:NSUTF8StringEncoding error:nil]
-                            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-            if (fk.length >= 16) k = fk;
-        }
-        if (k.length < 16) {
-            uint8_t b[16]; arc4random_buf(b, sizeof b);
-            NSMutableString *m = [NSMutableString string];
-            for (int i = 0; i < 16; i++) [m appendFormat:@"%02x", b[i]];
-            k = m;
-        }
-        [g setObject:k forKey:PA_FRAME_KEY_NAME];
-        [g synchronize];
-        [[NSFileManager defaultManager] createDirectoryAtPath:[PA_FRAME_KEY_FILE stringByDeletingLastPathComponent]
-                                  withIntermediateDirectories:YES attributes:nil error:nil];
-        [k writeToFile:PA_FRAME_KEY_FILE atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0600} ofItemAtPath:PA_FRAME_KEY_FILE error:nil];
-        gFrameKey = k;
-    });
-    return gFrameKey;
-}
+NSString *frameKey(void) { return @FRAME_KEY; }
 
 static void sendResp(int c, int code, NSString *ctype, NSData *body) {
     NSString *head = [NSString stringWithFormat:
@@ -95,7 +67,7 @@ static void handleClient(int c) {
     CGSize s = screenSize();
 
     if ([path isEqualToString:@"/ping"]) {
-        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.9.2", @"broadcast": @(broadcastAlive())});
+        sendJSON(c, 200, @{@"ok": @YES, @"w": @(s.width), @"h": @(s.height), @"version": @"0.9.3", @"broadcast": @(broadcastAlive())});
         return;
     }
     if ([path isEqualToString:@"/frame"] || [path isEqualToString:@"/hb"] || [path isEqualToString:@"/bye"]) {
