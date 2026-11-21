@@ -947,7 +947,7 @@ static void memoryLearn(NSString *task, NSString *result) {
         mem.length ? mem : @"(空)", task ?: @"", result ?: @""];
     BOOL glm = [lm hasPrefix:@"glm"];
     NSDictionary *body = @{@"model": model, @"messages": @[@{@"role": @"user", @"content": prompt}],
-                           @"temperature": glm ? @1.0 : @0.2, @"max_tokens": glm ? @4096 : @300};
+                           @"temperature": glm ? @1.0 : @0.2, @"max_tokens": glm ? @4096 : @2000}; // DeepSeek 等默认思考,300 会被思考吃光
     NSString *err = nil;
     NSString *c = agPostRetry(base, key, body, NO, &err);
     if (!c.length) return;

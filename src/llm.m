@@ -74,22 +74,99 @@ NSString *bundleForAppName(NSString *name, NSString **info) {
     return r;
 }
 
-static NSDictionary *parseModelJSON(NSString *raw) {
+static NSDictionary *jsonDict(NSString *s) {
+    if (!s.length) return nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:[s dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+    return [obj isKindOfClass:NSDictionary.class] ? obj : nil;
+}
+
+// 引号后面(跳过空白)是不是 JSON 结构符号,用来判断这个引号是不是字符串的结尾
+static BOOL quoteEndsString(NSString *s, NSUInteger i) {
+    for (NSUInteger j = i + 1; j < s.length; j++) {
+        unichar c = [s characterAtIndex:j];
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+        return c == ':' || c == ',' || c == '}' || c == ']' || c == 0xFF1A || c == 0xFF0C;
+    }
+    return YES;
+}
+
+// 宽松修复:只替换字符串外面的中文标点;字符串里的中文引号原样保留,裸英文引号转义;
+// 输出被截断时补上引号和括号。truncated 返回是否做了截断补全。
+static NSString *repairJSON(NSString *s, BOOL *truncated) {
+    NSMutableString *o = [NSMutableString string];
+    NSMutableArray *stack = [NSMutableArray array];
+    BOOL inStr = NO;
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (inStr) {
+            if (c == '\\' && i + 1 < s.length) { [o appendFormat:@"%C%C", c, [s characterAtIndex:i + 1]]; i++; continue; }
+            if (c == '"' || c == 0x201C || c == 0x201D) {
+                if (quoteEndsString(s, i)) { [o appendString:@"\""]; inStr = NO; }
+                else if (c == '"') [o appendString:@"\\\""];
+                else [o appendFormat:@"%C", c];
+                continue;
+            }
+            if (c == '\n') { [o appendString:@"\\n"]; continue; }
+            if (c == '\r' || c == '\t') { [o appendString:@" "]; continue; }
+            [o appendFormat:@"%C", c];
+            continue;
+        }
+        if (c == '"' || c == 0x201C || c == 0x201D) { [o appendString:@"\""]; inStr = YES; continue; }
+        if (c == 0xFF1A) c = ':';
+        if (c == 0xFF0C) c = ',';
+        if (c == '{' || c == '[') [stack addObject:@(c)];
+        if (c == '}' || c == ']') { if (stack.count) [stack removeLastObject]; }
+        [o appendFormat:@"%C", c];
+    }
+    BOOL cut = inStr || stack.count > 0;
+    if (inStr) [o appendString:@"\""];
+    if (stack.count) {
+        NSString *t = [o stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        o = [t mutableCopy];
+        if ([o hasSuffix:@","]) [o deleteCharactersInRange:NSMakeRange(o.length - 1, 1)];
+        if ([o hasSuffix:@":"]) [o appendString:@"null"];
+        while (stack.count) {
+            unichar b = [stack.lastObject unsignedShortValue];
+            [o appendString:b == '{' ? @"}" : @"]"];
+            [stack removeLastObject];
+        }
+    }
+    if (truncated) *truncated = cut;
+    return o;
+}
+
+// 解析模型输出:先原样解析;不行再只修字符串外面的标点/补全截断。truncated 返回输出是否被截断。
+static NSDictionary *parseModelJSON(NSString *raw, BOOL *truncated) {
+    if (truncated) *truncated = NO;
     if (![raw isKindOfClass:NSString.class]) return nil;
     NSString *s = [raw stringByReplacingOccurrencesOfString:@"```json" withString:@""];
     s = [s stringByReplacingOccurrencesOfString:@"```" withString:@""];
-    s = [s stringByReplacingOccurrencesOfString:@"：" withString:@":"];
-    s = [s stringByReplacingOccurrencesOfString:@"，" withString:@","];
-    s = [s stringByReplacingOccurrencesOfString:@"“" withString:@"\""];
-    s = [s stringByReplacingOccurrencesOfString:@"”" withString:@"\""];
     s = [s stringByReplacingOccurrencesOfString:@"mvisible_text\"\"" withString:@"\"visible_text\":\""];
     NSRange begin = [s rangeOfString:@"{"];
+    if (begin.location == NSNotFound) return nil;
     NSRange end = [s rangeOfString:@"}" options:NSBackwardsSearch];
-    if (begin.location == NSNotFound || end.location == NSNotFound || end.location < begin.location) return nil;
-    s = [s substringWithRange:NSMakeRange(begin.location, end.location - begin.location + 1)];
-    id obj = [NSJSONSerialization JSONObjectWithData:[s dataUsingEncoding:NSUTF8StringEncoding]
-                                               options:0 error:nil];
-    return [obj isKindOfClass:NSDictionary.class] ? obj : nil;
+    if (end.location != NSNotFound && end.location > begin.location) {
+        NSDictionary *d = jsonDict([s substringWithRange:NSMakeRange(begin.location, end.location - begin.location + 1)]);
+        if (d) return d;
+    }
+    // 从第一个 { 开始逐字修复;多余的结尾文字会让第一个对象闭合后被丢掉
+    NSString *tail = [s substringFromIndex:begin.location];
+    BOOL cut = NO;
+    NSString *fixed = repairJSON(tail, &cut);
+    NSDictionary *d = jsonDict(fixed);
+    if (!d) {
+        // 可能后面还跟了别的文字:截到第一个对象闭合处再试
+        NSInteger depth = 0; BOOL inS = NO;
+        for (NSUInteger i = 0; i < fixed.length; i++) {
+            unichar c = [fixed characterAtIndex:i];
+            if (inS) { if (c == '\\') i++; else if (c == '"') inS = NO; continue; }
+            if (c == '"') inS = YES;
+            else if (c == '{') depth++;
+            else if (c == '}' && --depth == 0) { d = jsonDict([fixed substringToIndex:i + 1]); break; }
+        }
+    }
+    if (d && truncated) *truncated = cut;
+    return d;
 }
 
 volatile BOOL gEscalate;   // 上一步失败/屏幕没变化时置 YES:GLM 这一步用更强的思考(max)和更大的 max_tokens
@@ -147,24 +224,46 @@ static NSDictionary *callLLMOnce(NSString *base, NSString *key, NSString *model,
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     BOOL adaptive = [ud objectForKey:@"glm_adaptive_effort"] ? [ud boolForKey:@"glm_adaptive_effort"] : YES; // 设置里可关:关掉就一直用 max + 16384(旧行为)
     BOOL esc = !adaptive || gEscalate;
+    // 非 GLM(DeepSeek 等)默认也会思考,思考同样占 max_tokens:平时 2000,截断或卡住时 4000
     NSDictionary *body = glm
         ? @{@"model": model, @"messages": messages, @"temperature": @1.0, @"top_p": @0.95, @"max_tokens": esc ? @16384 : @8192,
             @"thinking": @{@"type": @"enabled", @"clear_thinking": @NO}, @"reasoning_effort": esc ? @"max" : @"high"}
         : @{@"model": model, @"messages": messages, @"temperature": @0.1,
-            @"max_tokens": @700, @"response_format": @{@"type": @"json_object"}};
+            @"max_tokens": gEscalate ? @4000 : @2000, @"response_format": @{@"type": @"json_object"}};
     NSString *fr = nil;
-    NSString *content = agPostOnce(base, key, body, YES, glm ? 300 : 90, &fr, err);
+    NSString *content = agPostOnce(base, key, body, YES, glm ? 300 : 120, &fr, err);
     if (!content) return nil;
     if (content.length == 0) {
         *err = [NSString stringWithFormat:@"模型没有输出答案(finish_reason=%@,可能思考占满了 max_tokens)", fr ?: @"?"];
         return nil;
     }
-    content = [[content stringByReplacingOccurrencesOfString:@"```json" withString:@""]
-               stringByReplacingOccurrencesOfString:@"```" withString:@""];
-    NSDictionary *act = parseModelJSON(content);
-    if (![act isKindOfClass:NSDictionary.class]) {
-        *err = [NSString stringWithFormat:@"模型没返回 JSON: %@", content.length > 120 ? [content substringToIndex:120] : content];
+    BOOL cut = NO;
+    NSMutableDictionary *act = [parseModelJSON(content, &cut) mutableCopy];
+    BOOL lengthCut = [fr isEqualToString:@"length"] || cut;
+    NSString *action = [act[@"action"] isKindOfClass:NSString.class] ? act[@"action"] : @"";
+    if (act && !action.length) {
+        // 没写 action,但模型已经明确说任务完成:按 done 收尾,不当成失败
+        NSString *th = [NSString stringWithFormat:@"%@ %@", [act[@"thought"] description] ?: @"", [act[@"progress"] description] ?: @""];
+        BOOL saysDone = NO;
+        for (NSString *w in @[@"任务完成", @"任务已完成", @"任务结束", @"已完成任务"]) if ([th containsString:w]) { saysDone = YES; break; }
+        if (saysDone) {
+            act[@"action"] = @"done";
+            NSString *p = [act[@"progress"] isKindOfClass:NSString.class] ? act[@"progress"] : @"";
+            if (!act[@"text"]) act[@"text"] = p.length ? p : ([act[@"thought"] description] ?: @"任务完成");
+            return act;
+        }
+    }
+    if (!act || !action.length) {
+        NSString *head = content.length > 60 ? [content substringToIndex:60] : content;
+        NSString *tail = content.length > 120 ? [content substringFromIndex:content.length - 60] : @"";
+        *err = [NSString stringWithFormat:@"模型没返回%@ JSON(finish_reason=%@,%@): %@%@%@",
+                lengthCut ? @"完整" : @"有效", fr ?: @"?", lengthCut ? @"输出被截断" : @"格式不对",
+                head, tail.length ? @" … " : @"", tail];
         return nil;
+    }
+    if ([action isEqualToString:@"swipe"] || [action isEqualToString:@"tap"] || [action isEqualToString:@"long_press"] || [action isEqualToString:@"input_text"]) {
+        // 截断后补全的动作缺参数会点错地方:这几种动作被截断就重试
+        if (cut) { *err = [NSString stringWithFormat:@"模型没返回完整 JSON(finish_reason=%@,输出被截断)", fr ?: @"?"]; return nil; }
     }
     return act;
 }
@@ -183,13 +282,20 @@ BOOL llmErrRetryable(NSString *err) {
 // 请求失败最多试 5 次(间隔 1、2、3、4 秒)
 NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSArray *messages, NSString **err) {
     NSString *last = nil;
+    NSArray *msgs = messages;
     for (int attempt = 1; attempt <= 5; attempt++) {
         NSString *e = nil;
-        NSDictionary *r = callLLMOnce(base, key, model, messages, &e);
+        NSDictionary *r = callLLMOnce(base, key, model, msgs, &e);
         if (r) return r;
         last = e;
         if (!gAgentRunning || attempt == 5 || !llmErrRetryable(e)) break;
-        if ([e containsString:@"模型没有输出答案"]) gEscalate = YES; // 思考占满了 max_tokens:重试时给更大的额度
+        if ([e containsString:@"模型没有输出答案"] || [e containsString:@"输出被截断"]) gEscalate = YES; // 额度不够:重试时给更大的额度
+        if ([e containsString:@"模型没返回"] && msgs == messages) {
+            // 格式出错:重试时提醒模型只输出简短、完整的 JSON
+            NSMutableArray *m = [messages mutableCopy];
+            [m addObject:@{@"role": @"user", @"content": @"(系统提示:你上一次的输出不是完整有效的 JSON。请只输出一个简短的 JSON 对象,第一个字段写 action;字符串里不要用英文双引号;如果任务已经完成,action 用 done。)"}];
+            msgs = m;
+        }
         agentSay([NSString stringWithFormat:@"请求失败(%@),%d 秒后重试(第 %d/5 次)", e.length > 80 ? [e substringToIndex:80] : e, attempt, attempt + 1]);
         sleep(attempt);
     }
@@ -200,7 +306,7 @@ NSDictionary *callLLM(NSString *base, NSString *key, NSString *model, NSArray *m
 static NSString *const kAgentSystem =
 @"你是一个控制 iPhone 的视觉智能体。每一步都会收到:任务、最近的动作历史、一张当前屏幕截图(780x1688 像素,图上叠加了红色网格线,每 100 像素一条,边缘标有像素数字),以及本地 OCR 识别出的带编号文字列表。\n"
 @"所有坐标(x,y,x2,y2,以及 OCR 列表里的坐标)都是这张截图的像素坐标:左上角 (0,0),右下角 (780,1688),x 向右,y 向下。请对照网格线和边缘数字估计位置,点击要落在目标元素的中心。\n"
-@"只输出一个 JSON 对象,不要输出其他内容。thought 不超过20个字；visible_text 只抄录关键文字且不超过120字；target 写这一步要点的按钮/文字名称(没有就留空);progress(可选)用不超过60字写清任务进度:已完成什么、还剩什么;risk:如果这一步会对外产生影响或难以撤销(发送消息、发布内容、提交表单、删除、预订、退出登录、授权等),用一句话写明后果,例如“发送消息给张三:今晚吃饭吗”,否则留空；然后输出 action 和参数。\n"
+@"只输出一个 JSON 对象,不要输出其他内容,第一个字段必须是 action(连同它的参数),然后再写其他字段。字符串里引用文字用中文引号“”,不要用英文双引号。thought 不超过20个字；visible_text 只抄录关键文字且不超过120字；target 写这一步要点的按钮/文字名称(没有就留空);progress(可选)用不超过60字写清任务进度:已完成什么、还剩什么;risk:如果这一步会对外产生影响或难以撤销(发送消息、发布内容、提交表单、删除、预订、退出登录、授权等),用一句话写明后果,例如“发送消息给张三:今晚吃饭吗”,否则留空。\n"
 @"action 可选值:\n"
 @"- tap: 参数 id 或 x,y。点击。目标是 OCR 列表里的文字时,优先只给 id(程序会点该文字的中心,最准);没有文字的图标或空白输入框才给 x,y。\n"
 @"- long_press: 参数 id 或 x,y。长按。\n"
