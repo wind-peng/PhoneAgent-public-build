@@ -569,7 +569,7 @@ static NSData *attachJPEG(UIImage *img) {
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"高级设置(v0.9.35)";
+    self.title = @"高级设置(v0.9.36)";
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
     self.popupTV = [UITextView new];
@@ -610,7 +610,8 @@ static NSData *attachJPEG(UIImage *img) {
         [self sw:@"允许模型一次给出多个连续动作(逐个核对屏幕)" key:@"multi_action" def:YES],
         [self sw:@"子目标规划 + 完成前自检" key:@"subgoal_plan" def:YES],
         [self sw:@"经验宏回放(相同任务先本地回放,OCR 核对;默认关)" key:@"macro_replay" def:NO],
-        [self sw:@"比价任务:每个进过的平台记下 3 个商品价格才算完成" key:@"compare_check" def:YES],
+        [self sw:@"比价任务:每个进过的平台记下商品价格才算完成" key:@"compare_check" def:YES],
+        [self sw:@"比价比同款:第一家选销量最高的一款,其他平台搜同款" key:@"compare_same" def:YES],
         [self hdr:@"备用模型(主模型连续限流/出错/格式错误时切换;DeepSeek 会自动在 flash 和 v4-pro 之间切换,无需填写)"],
         self.bBase, self.bKey, self.bModel,
         [self hdr:@"动作执行"],

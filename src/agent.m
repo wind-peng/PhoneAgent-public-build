@@ -1347,11 +1347,14 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     NSMutableOrderedSet *visitedShops = [NSMutableOrderedSet orderedSet]; // 比价任务里进过的购物平台
     NSMutableSet *leaveWarned = [NSMutableSet set];
     NSString *curShop = nil; int compareRejects = 0;
+    NSString *sameKey = nil, *sameShop = nil; // v0.9.36:比同款:第一个平台选定的同款搜索词
     BOOL confirmPendingImg = NO; // v0.9.32:确认后的核对:无障碍元素够用就不发截图
     int confirmStep = 0; NSString *confirmTgt = nil, *confirmSig = nil; double confirmX = -1, confirmY = -1; // v0.9.26:刚确认过的敏感点击
     int shopSinceStep = 0, lastNewFindStep = 0, lastLostHintStep = -99; // v0.9.23:卡住检测
     NSString *lastProgSig = @""; int lastProgStep = 1, stuckHintN = 0, strayReturns = 0; NSMutableArray *recentSigs = [NSMutableArray array]; // v0.9.25:通用卡住检测/误入 App
     BOOL compareTask = isCompareTask(gTaskDisplay.length ? gTaskDisplay : task) && paOn(@"compare_check", YES);
+    BOOL sameMode = compareTask && paOn(@"compare_same", YES);
+    int needN = sameMode ? 1 : 3, enoughN = sameMode ? 2 : 5;
     BOOL glmModel = [model.lowercaseString hasPrefix:@"glm"];
     CGSize sc = screenSize();
     int startStep = 1;
@@ -1667,6 +1670,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 NSString *sum = compressHistory([history subarrayWithRange:NSMakeRange(0, from)], from - 1 < histProg.count ? histProg[from - 1] : @"");
                 if (sum) [hist appendFormat:@"%@\n", sum];
             }
+            if (sameMode && sameKey.length) [hist appendFormat:@"(比同款:在「%@」选定的同款搜索词是「%@」。其他平台用 input_text 搜这个词,只记同款的价格;找不到同款就记最接近的一款并标“非同款”)\n", sameShop ?: @"第一个平台", sameKey];
             for (NSUInteger i = from; i < history.count; i++) [hist appendFormat:@"%@\n", history[i]];
             // S1:文字步骤:OCR 足够丰富、上一步成功、不需要看图标时只发 OCR 列表
             BOOL includeImage = YES;
@@ -1731,6 +1735,12 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             }
             prevImg = img;
             if ([act[@"need_image"] respondsToSelector:@selector(boolValue)] && [act[@"need_image"] boolValue]) needImage = YES;
+            if (sameMode && !sameKey.length && [[act[@"same_key"] description] length] >= 2) { // v0.9.36
+                sameKey = [[[act[@"same_key"] description] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] copy];
+                if (sameKey.length > 24) sameKey = [sameKey substringToIndex:24];
+                sameShop = [curShop copy];
+                agentSay([NSString stringWithFormat:@"同款关键词:%@(来自%@)", sameKey, curShop ?: @"第一个平台"]);
+            }
             {   // v0.9.21:保存模型记下的结果
                 id fd = act[@"found"];
                 NSString *fs = [fd isKindOfClass:NSString.class] ? fd : ([fd isKindOfClass:NSArray.class] ? [fd componentsJoinedByString:@";"] : nil);
@@ -1757,7 +1767,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 }
                 if (added) lastNewFindStep = step;
                 if (added) agentSay([NSString stringWithFormat:@"记下 %d 条结果(共 %lu 条)", added, (unsigned long)findings.count]);
-                if (added && compareTask && curShop && pricedCount(findings, curShop) >= 5 && ![leaveWarned containsObject:[@"enough:" stringByAppendingString:curShop]]) { // v0.9.35:记够就换平台
+                if (added && compareTask && curShop && pricedCount(findings, curShop) >= enoughN && ![leaveWarned containsObject:[@"enough:" stringByAppendingString:curShop]]) { // v0.9.35:记够就换平台
                     [leaveWarned addObject:[@"enough:" stringByAppendingString:curShop]];
                     [history addObject:[NSString stringWithFormat:@"%d. (系统:「%@」已记下 %d 个价格,够了。不要再滑动或点进商品详情,直接 open_app 下一个平台;所有平台都记够就直接 done)", step, curShop, pricedCount(findings, curShop)]];
                 }
@@ -1879,7 +1889,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             BOOL compareOK = NO; // v0.9.22:比价任务每个平台都记够了价格,就不再做子目标自检(省一次调用)
             if ([action isEqualToString:@"done"] && compareTask && visitedShops.count) {
                 compareOK = YES;
-                for (NSString *sp in visitedShops) if (pricedCount(findings, sp) < 3) { compareOK = NO; break; }
+                for (NSString *sp in visitedShops) if (pricedCount(findings, sp) < needN) { compareOK = NO; break; }
             }
             BOOL justFound = (findings.count && lastNewFindStep >= step - 1) || (confirmStep && step - confirmStep <= 2); // v0.9.26:刚用 found 记下了完成证据,不再自检(省一次调用)
             if ([action isEqualToString:@"done"] && plan.count && !doneChecked && !compareOK && !justFound && paOn(@"subgoal_plan", YES)) { // S8:完成自检
@@ -1895,15 +1905,15 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             }
             if ([action isEqualToString:@"done"] && compareTask && visitedShops.count) { // v0.9.21:比价完成检查
                 NSMutableArray *lack = [NSMutableArray array];
-                for (NSString *sp in visitedShops) { int n = pricedCount(findings, sp); if (n < 3) [lack addObject:[NSString stringWithFormat:@"%@(%d 个)", sp, n]]; }
+                for (NSString *sp in visitedShops) { int n = pricedCount(findings, sp); if (n < needN) [lack addObject:[NSString stringWithFormat:@"%@(%d 个)", sp, n]]; }
                 if (lack.count && compareRejects < 2) {
                     compareRejects++;
-                    agentSay([NSString stringWithFormat:@"比价检查:%@ 记下的商品价格不足 3 个,让模型补上", [lack componentsJoinedByString:@"、"]]);
-                    [history addObject:[NSString stringWithFormat:@"%d. (系统提示:比价任务要求每个进过的平台至少用 found 记下 3 个具体商品和价格。%@ 还不够。请回到这些平台看搜索结果并用 found 记下,再 done;如果某平台确实搜不到,在 done 的 text 里说明原因)", step, [lack componentsJoinedByString:@"、"]]];
+                    agentSay([NSString stringWithFormat:@"比价检查:%@ 记下的商品价格不足 %d 个,让模型补上", needN, [lack componentsJoinedByString:@"、"]]);
+                    [history addObject:[NSString stringWithFormat:@"%d. (系统提示:比价任务要求每个进过的平台至少用 found 记下 %d 个具体商品和价格。%@ 还不够。请回到这些平台看搜索结果并用 found 记下,再 done;如果某平台确实搜不到,在 done 的 text 里说明原因)", step, needN, [lack componentsJoinedByString:@"、"]]];
                     lastSig = @""; same = 0; [queue removeAllObjects];
                     continue;
                 }
-                if (lack.count) agentSay([NSString stringWithFormat:@"提示:%@ 的价格记录仍不足 3 个,结果可能不完整", [lack componentsJoinedByString:@"、"]]);
+                if (lack.count) agentSay([NSString stringWithFormat:@"提示:%@ 的价格记录仍不足 %d 个,结果可能不完整", needN, [lack componentsJoinedByString:@"、"]]);
             }
             NSString *doneText = [[act[@"text"] description] ?: @"" stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
             if (!doneText.length && [action isEqualToString:@"done"] && findings.count) { // v0.9.26:模型没写结果,用已记录的结果代替
@@ -2000,7 +2010,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             }
             [history addObject:hline];
             checkStale = YES;
-        } else if ([action isEqualToString:@"swipe"] && compareTask && curShop && pricedCount(findings, curShop) >= 5 && ![leaveWarned containsObject:[@"swipe:" stringByAppendingString:curShop]]) {
+        } else if ([action isEqualToString:@"swipe"] && compareTask && curShop && pricedCount(findings, curShop) >= enoughN && ![leaveWarned containsObject:[@"swipe:" stringByAppendingString:curShop]]) {
             [leaveWarned addObject:[@"swipe:" stringByAppendingString:curShop]]; // v0.9.35:比价时这个平台已记够,不再往下翻(只拦一次)
             result = [NSString stringWithFormat:@"未执行:「%@」已记下 %d 个价格,不用再翻。请 open_app 下一个平台;都记够了就 done", curShop, pricedCount(findings, curShop)];
         } else if ([action isEqualToString:@"swipe"]) {
@@ -2014,9 +2024,9 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             NSString *info = nil;
             NSString *bid = bundleForAppName(name, &info);
             NSString *toShop = shopPlatformOf(bid ? agAppName(bid) : name) ?: (shopPlatformOf(bid) ?: shopPlatformOf(name));
-            if (compareTask && curShop && ![toShop isEqualToString:curShop] && pricedCount(findings, curShop) < 3 && ![leaveWarned containsObject:curShop]) {
+            if (compareTask && curShop && ![toShop isEqualToString:curShop] && pricedCount(findings, curShop) < needN && ![leaveWarned containsObject:curShop]) {
                 [leaveWarned addObject:curShop]; // v0.9.21:每个平台只拦一次
-                result = [NSString stringWithFormat:@"未执行:「%@」还没用 found 记下 3 个商品价格(现在 %d 个)。请先在搜索结果里记下再换平台;确实搜不到就再次 open_app", curShop, pricedCount(findings, curShop)];
+                result = [NSString stringWithFormat:@"未执行:「%@」还没用 found 记下 %d 个商品价格(现在 %d 个)。请先在搜索结果里记下再换平台;确实搜不到就再次 open_app", curShop, needN, pricedCount(findings, curShop)];
             } else if (isBlockedApp(name, nil) || (bid && isBlockedApp(agAppName(bid), bid))) {
                 result = [NSString stringWithFormat:@"「%@」在用户设置的禁止进入的 App 列表里,不能打开。请换别的方式完成,或用 ask_user/stop 说明。", name];
             } else if (bid && openApp(bid)) { result = @"已打开"; gLastApp = bid; taskApp = bid; expectHome = NO; checkStale = YES; expRecord(@{@"a": @"open_app", @"name": name}); }

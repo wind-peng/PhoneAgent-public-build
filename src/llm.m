@@ -321,7 +321,7 @@ static NSArray *agentTools(void) {
         // v0.9.22:公共字段只写类型,含义已在系统提示词里写过一次(之前 11 个工具各带一遍说明,每步白白多 1~2k token)
         NSDictionary *boolT = @{@"type": @"boolean"};
         NSDictionary *common = @{@"thought": str, @"visible_text": str, @"target": str, @"progress": str, @"risk": str,
-            @"plan": @{@"type": @"array", @"items": str}, @"subgoal_done": integer, @"need_image": boolT, @"found": str};
+            @"plan": @{@"type": @"array", @"items": str}, @"subgoal_done": integer, @"need_image": boolT, @"found": str, @"same_key": str};
         NSDictionary *xy = @{@"id": integer, @"x": num, @"y": num};
         NSArray *defs = @[
             @[@"tap", @"点击。有文字的目标优先只给 id;无文字图标给 x,y(780x1688 截图像素)", xy, @[]],
@@ -371,7 +371,7 @@ static NSDictionary *actFromToolCall(NSDictionary *tc) {
 static NSDictionary *packActs(NSArray *acts, NSDictionary *top) {
     if (!acts.count) return nil;
     NSMutableDictionary *first = [acts[0] mutableCopy];
-    for (NSString *k in @[@"thought", @"visible_text", @"progress", @"plan", @"subgoal_done", @"need_image"])
+    for (NSString *k in @[@"thought", @"visible_text", @"progress", @"plan", @"subgoal_done", @"need_image", @"found", @"same_key"])
         if (!first[k] && top[k]) first[k] = top[k];
     NSMutableArray *more = [NSMutableArray array];
     for (NSUInteger i = 1; i < acts.count && more.count < 2; i++) {
@@ -619,7 +619,7 @@ static NSString *const kAgentSystem =
 @"- open_app: 参数 name(App 的中文名)。直接打开 App。\n"
 @"- input_text: 参数 id 或 x,y(输入框),text(要输入的完整文字)。程序点输入框并粘贴(替换原有文字),之后会核对输入框里有没有这段文字。\n"
 @"- wait: 等待 1.5 秒。\n"
-@"- done: 参数 text。任务已完成;text 是写给用户看的完整结果(如果任务是查询、总结、比较信息,把得到的信息完整清楚地写在这里)。比价的 done:不要逐条重抄已记录的结果(程序会附上),只写每个平台最低价/推荐款和 3 句以内结论,总共 300 字以内,不用长时间思考。\n"
+@"- done: 参数 text。任务已完成;text 是写给用户看的完整结果(如果任务是查询、总结、比较信息,把得到的信息完整清楚地写在这里)。比价的 done:不要逐条重抄已记录的结果(程序会附上),只写同款在每个平台的价格、哪家最便宜、差多少,标出非同款,总共 200 字以内,不用长时间思考。\n"
 @"- stop: 参数 text。确实无法继续时才用。\n"
 @"- ask_user: 参数 text。遇到必须由用户本人处理的情况(登录、输入验证码或密码、人机验证、人脸识别、付款、需要用户在多个选项里做选择等)时用:程序会提醒用户并暂停,用户处理完点“继续”后你会拿到新的屏幕再继续。text 写清楚需要用户做什么。\n"
 @"规则:\n"
@@ -634,7 +634,7 @@ static NSString *const kAgentSystem =
 @"9. 可选字段:plan(字符串数组,只在用户消息要求时给出 3-6 个子目标);subgoal_done(刚完成的子目标编号);need_image(下一步需要看截图时设为 true)。\n"
 @"10. 有的步骤只给 OCR 列表、不附截图(用户消息会说明)。OCR 列表里标“[图标]”的是检测到的无文字小图标,后面会注明位置和常见用途(如“左上角,常是返回”),可以用 id 点击;看不清或需要看图标/图片时,先设 need_image=true 或用 wait。\n"
 @"11. 非常有把握时(例如在同一页面连续点几个确定的按钮),可以一次给出最多 3 个连续动作:调用多个工具,或在 JSON 里用 actions 数组(每项是一个动作对象)。程序会逐个执行并核对屏幕,屏幕变化不符合预期就放弃剩下的。done、stop、ask_user 不要和别的动作放在一起。\n"
-@"12. found(可选):这一屏看到任务需要的结果(商品名和价格、查到的数据等)就写进 found,每条用;分隔,例如“XX 行李箱 24寸 ¥199;YY 行李箱 ¥259”。程序会保存并每步给你看,写 done 时据此汇总。比价任务在每个平台记下 3-5 个具体商品和价格(优先销量高的和最便宜的)就换下一个平台;只在搜索结果列表里记,不要点进商品详情页;最后一个平台记够就直接 done,不要先 wait。只记和任务要找的东西相符的商品(例如找风衣就不要记军大衣、棉服);价格明显离谱(比同类高或低 10 倍,常是把“¥25 54人付款”之类连在一起读错了)要先核对截图再记,写 done 时也不要把不相符或读错的商品当成结论。";
+@"12. found(可选):这一屏看到任务需要的结果(商品名和价格、查到的数据等)就写进 found,每条用;分隔,例如“XX 行李箱 24寸 ¥199;YY 行李箱 ¥259”。程序会保存并每步给你看,写 done 时据此汇总。比价任务默认比同款:第一个平台搜索后,在结果里选销量最高(付款人数/已售最多)的一款,用 found 记下它(品牌、名称、规格、价格、销量),同时在 same_key 里给出同款搜索词(品牌+型号或核心规格,10 字左右,例如“巴布豆 护耳帽 围脖”;没有品牌就用标题里最有区分度的词);之后每个平台用 input_text 搜 same_key,只记 1-2 个与它同款(品牌、规格一致)的价格,找不到同款就记最接近的一款并在名称前标“非同款”。用户已指定具体型号时 same_key 就用它。只在搜索结果列表里记,不要点进商品详情页;最后一个平台记完就直接 done,不要先 wait。只记和任务要找的东西相符的商品(例如找风衣就不要记军大衣、棉服);价格明显离谱(比同类高或低 10 倍,常是把“¥25 54人付款”之类连在一起读错了)要先核对截图再记,写 done 时也不要把不相符或读错的商品当成结论。";
 
 NSString *memoryText(void) { return [NSUserDefaults.standardUserDefaults stringForKey:@"memory_text"] ?: @""; }
 
