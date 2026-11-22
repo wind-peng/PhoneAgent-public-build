@@ -1985,12 +1985,12 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 for (NSString *sp in visitedShops) { int n = pricedCount(findings, sp); if (n < needN) [lack addObject:[NSString stringWithFormat:@"%@(%d 个)", sp, n]]; }
                 if (lack.count && compareRejects < 2) {
                     compareRejects++;
-                    agentSay([NSString stringWithFormat:@"比价检查:%@ 记下的商品价格不足 %d 个,让模型补上", needN, [lack componentsJoinedByString:@"、"]]);
+                    agentSay([NSString stringWithFormat:@"比价检查:%@ 记下的商品价格不足 %d 个,让模型补上", [lack componentsJoinedByString:@"、"], needN]);
                     [history addObject:[NSString stringWithFormat:@"%d. (系统提示:比价任务要求每个进过的平台至少用 found 记下 %d 个具体商品和价格。%@ 还不够。请回到这些平台看搜索结果并用 found 记下,再 done;如果某平台确实搜不到,在 done 的 text 里说明原因)", step, needN, [lack componentsJoinedByString:@"、"]]];
                     lastSig = @""; same = 0; [queue removeAllObjects];
                     continue;
                 }
-                if (lack.count) agentSay([NSString stringWithFormat:@"提示:%@ 的价格记录仍不足 %d 个,结果可能不完整", needN, [lack componentsJoinedByString:@"、"]]);
+                if (lack.count) agentSay([NSString stringWithFormat:@"提示:%@ 的价格记录仍不足 %d 个,结果可能不完整", [lack componentsJoinedByString:@"、"], needN]);
             }
             NSString *doneText = [[act[@"text"] description] ?: @"" stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
             if (!doneText.length && [action isEqualToString:@"done"] && findings.count) { // v0.9.26:模型没写结果,用已记录的结果代替
