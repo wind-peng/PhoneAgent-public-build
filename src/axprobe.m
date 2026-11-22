@@ -67,6 +67,26 @@ static NSDictionary *axDescribe(id el) {
     return d;
 }
 
+static void axWalk(id el, int depth, NSMutableArray *acc, NSMutableSet *seen) {
+    if (!el || depth > 14 || acc.count > 600) return;
+    NSString *k = [NSString stringWithFormat:@"%p", (__bridge void *)el];
+    NSDictionary *d = axDescribe(el);
+    NSString *key = [NSString stringWithFormat:@"%@|%@|%@|%d", d[@"label"] ?: @"", d[@"frame"] ?: @"", d[@"traits"] ?: @"", depth];
+    if ([seen containsObject:key]) return;
+    [seen addObject:key]; (void)k;
+    NSMutableDictionary *m = [d mutableCopy]; m[@"深度"] = @(depth);
+    [acc addObject:m];
+    id ch = axCallObj(el, @"children");
+    if ([ch isKindOfClass:NSArray.class]) for (id c in ch) axWalk(c, depth + 1, acc, seen);
+}
+
+static NSArray *axDescribeAll(id arr) {
+    NSMutableArray *r = [NSMutableArray array];
+    if (![arr isKindOfClass:NSArray.class]) return r;
+    for (id e in arr) { if (r.count > 600) break; [r addObject:axDescribe(e)]; }
+    return r;
+}
+
 static NSString *axProbeRun(void) {
     gAXLog = [NSMutableArray array];
     NSMutableDictionary *out = [NSMutableDictionary dictionary];
@@ -99,7 +119,31 @@ static NSString *axProbeRun(void) {
         id a = axCallObj(sys, s);
         if ([a isKindOfClass:NSArray.class] && [a count]) { front = [a firstObject]; axl([NSString stringWithFormat:@"%@ → %lu 个", s, (unsigned long)[a count]]); break; }
     }
+    if (!front) { front = axCallObj(sys, @"currentApplication"); if (front) axl(@"currentApplication → OK"); }
+    if (!front && cE) {
+        SEL sa = NSSelectorFromString(@"applicationAtCoordinate:");
+        if ([cE respondsToSelector:sa]) { @try { front = ((id (*)(id, SEL, CGPoint))objc_msgSend)(cE, sa, CGPointMake(195, 420)); } @catch (NSException *e) {} }
+        axl([NSString stringWithFormat:@"applicationAtCoordinate → %@", front ? @"OK" : @"nil"]);
+    }
     if (front) out[@"前台App"] = axDescribe(front);
+    // 4b. 顺着树读(v0.9.30):三种方式各计时
+    NSMutableString *treeSum = [NSMutableString string];
+    if (front) {
+        for (NSString *m in @[@"explorerElements", @"visibleElements"]) {
+            CFAbsoluteTime a0 = CFAbsoluteTimeGetCurrent();
+            id arr = axCallObj(front, m);
+            NSArray *ds = axDescribeAll(arr);
+            int ms0 = (int)((CFAbsoluteTimeGetCurrent() - a0) * 1000);
+            out[m] = ds;
+            [treeSum appendFormat:@"%@:%lu 个,%d ms\n", m, (unsigned long)ds.count, ms0];
+        }
+        CFAbsoluteTime a1 = CFAbsoluteTimeGetCurrent();
+        NSMutableArray *acc = [NSMutableArray array];
+        axWalk(front, 0, acc, [NSMutableSet set]);
+        int ms1 = (int)((CFAbsoluteTimeGetCurrent() - a1) * 1000);
+        out[@"children递归"] = acc;
+        [treeSum appendFormat:@"children 递归:%lu 个,%d ms\n", (unsigned long)acc.count, ms1];
+    } else [treeSum appendString:@"没拿到前台 App,树读取跳过\n"];
     if (app) out[@"systemApplication"] = axDescribe(app);
 
     CGSize sz = UIScreen.mainScreen.bounds.size;
@@ -156,6 +200,7 @@ static NSString *axProbeRun(void) {
     NSMutableString *sum = [NSMutableString string];
     [sum appendFormat:@"方式 %@,取点 %d 次,命中 %d,不同元素 %lu 个,其中可输入 %lu 个,耗时 %d ms\n", how ?: @"都失败", tries, hits, (unsigned long)els.count, (unsigned long)inputs.count, (int)ms];
     if (front) [sum appendFormat:@"前台 App:%@\n", out[@"前台App"][@"label"] ?: @"?"];
+    [sum appendString:treeSum];
     for (NSDictionary *d in inputs) [sum appendFormat:@"【%@】%@ 位置%@\n", d[@"可输入"], d[@"label"] ?: d[@"value"] ?: @"", d[@"frame"] ?: @"?"];
     int shown = 0;
     for (NSDictionary *d in els) {
