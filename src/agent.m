@@ -1757,6 +1757,10 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 }
                 if (added) lastNewFindStep = step;
                 if (added) agentSay([NSString stringWithFormat:@"记下 %d 条结果(共 %lu 条)", added, (unsigned long)findings.count]);
+                if (added && compareTask && curShop && pricedCount(findings, curShop) >= 5 && ![leaveWarned containsObject:[@"enough:" stringByAppendingString:curShop]]) { // v0.9.35:记够就换平台
+                    [leaveWarned addObject:[@"enough:" stringByAppendingString:curShop]];
+                    [history addObject:[NSString stringWithFormat:@"%d. (系统:「%@」已记下 %d 个价格,够了。不要再滑动或点进商品详情,直接 open_app 下一个平台;所有平台都记够就直接 done)", step, curShop, pricedCount(findings, curShop)]];
+                }
             }
             // 12:子目标
             id pl = act[@"plan"];
@@ -1996,6 +2000,9 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             }
             [history addObject:hline];
             checkStale = YES;
+        } else if ([action isEqualToString:@"swipe"] && compareTask && curShop && pricedCount(findings, curShop) >= 5 && ![leaveWarned containsObject:[@"swipe:" stringByAppendingString:curShop]]) {
+            [leaveWarned addObject:[@"swipe:" stringByAppendingString:curShop]]; // v0.9.35:比价时这个平台已记够,不再往下翻(只拦一次)
+            result = [NSString stringWithFormat:@"未执行:「%@」已记下 %d 个价格,不用再翻。请 open_app 下一个平台;都记够了就 done", curShop, pricedCount(findings, curShop)];
         } else if ([action isEqualToString:@"swipe"]) {
             if (paOn(@"smooth_swipe", YES)) doSwipeSmooth(x, y, x2, y2, 300, 100); else doSwipe(x, y, x2, y2, 20, 350);
             expRecord(@{@"a": @"swipe", @"x1": @(x), @"y1": @(y), @"x2": @(x2), @"y2": @(y2), @"anchors": localOK ? expAnchors(items) : @[]});
