@@ -408,7 +408,7 @@ static NSDictionary *buildBody(NSString *model, NSArray *messages, BOOL tools) {
         BOOL esc = !adaptive || gEscalate;
         NSString *eff = esc ? @"max" : ((lowOK && gEffortLow && !gEffortHigh) ? @"low" : @"high");
         b[@"temperature"] = @1.0; b[@"top_p"] = @0.95;
-        b[@"max_tokens"] = esc ? @16384 : ([eff isEqualToString:@"low"] ? @6144 : @8192); // 常规步骤限制思考额度
+        b[@"max_tokens"] = esc ? @16384 : ([eff isEqualToString:@"low"] ? @(paOn(@"low_think_cap", YES) ? 3072 : 6144) : @8192); // v0.9.37:常规低思考步骤封顶 3072 // 常规步骤限制思考额度
         b[@"thinking"] = @{@"type": @"enabled", @"clear_thinking": @NO};
         b[@"reasoning_effort"] = eff;
     } else {
@@ -619,7 +619,7 @@ static NSString *const kAgentSystem =
 @"- open_app: 参数 name(App 的中文名)。直接打开 App。\n"
 @"- input_text: 参数 id 或 x,y(输入框),text(要输入的完整文字)。程序点输入框并粘贴(替换原有文字),之后会核对输入框里有没有这段文字。\n"
 @"- wait: 等待 1.5 秒。\n"
-@"- done: 参数 text。任务已完成;text 是写给用户看的完整结果(如果任务是查询、总结、比较信息,把得到的信息完整清楚地写在这里)。比价的 done:不要逐条重抄已记录的结果(程序会附上),只写同款在每个平台的价格、哪家最便宜、差多少,标出非同款,总共 200 字以内,不用长时间思考。\n"
+@"- done: 参数 text。任务里有数量目标(如领 14 天、发 3 条)时,每一步都先对照目标:一旦达到就关掉弹窗直接 done,不要因为页面还提供更多奖励就继续。任务已完成;text 是写给用户看的完整结果(如果任务是查询、总结、比较信息,把得到的信息完整清楚地写在这里)。比价的 done:不要逐条重抄已记录的结果(程序会附上),只写同款在每个平台的价格、哪家最便宜、差多少,标出非同款,总共 200 字以内,不用长时间思考。\n"
 @"- stop: 参数 text。确实无法继续时才用。\n"
 @"- ask_user: 参数 text。遇到必须由用户本人处理的情况(登录、输入验证码或密码、人机验证、人脸识别、付款、需要用户在多个选项里做选择等)时用:程序会提醒用户并暂停,用户处理完点“继续”后你会拿到新的屏幕再继续。text 写清楚需要用户做什么。\n"
 @"规则:\n"
