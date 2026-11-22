@@ -1260,6 +1260,56 @@ static int pricedCount(NSArray *findings, NSString *plat) {
     return n;
 }
 
+// v0.9.26:结果去重用:去掉空格标点后比较
+static NSString *findNorm(NSString *s) {
+    NSMutableString *o = [NSMutableString string];
+    [s enumerateSubstringsInRange:NSMakeRange(0, s.length) options:NSStringEnumerationByComposedCharacterSequences usingBlock:^(NSString *c, NSRange a, NSRange b, BOOL *st) {
+        if ([c rangeOfCharacterFromSet:[NSCharacterSet.punctuationCharacterSet invertedSet]].location == NSNotFound) return;
+        if ([c rangeOfCharacterFromSet:[NSCharacterSet.whitespaceAndNewlineCharacterSet invertedSet]].location == NSNotFound) return;
+        [o appendString:c.lowercaseString];
+    }];
+    return o;
+}
+static NSString *findPrice(NSString *s) {
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"[¥￥]\\s*([0-9]+(\\.[0-9]+)?)" options:0 error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:s options:0 range:NSMakeRange(0, s.length)];
+    return m ? [s substringWithRange:[m rangeAtIndex:1]] : nil;
+}
+static BOOL findingDup(NSArray *findings, NSString *line) {
+    NSRange e = [line rangeOfString:@"] "]; if (e.location == NSNotFound) return NO;
+    NSString *tag = [line substringToIndex:e.location + 1];
+    NSString *body = [line substringFromIndex:NSMaxRange(e)], *nb = findNorm(body), *pb = findPrice(body);
+    for (NSString *f in findings) {
+        if (![f hasPrefix:tag]) continue;
+        NSString *fb = [f substringFromIndex:MIN(f.length, tag.length + 1)], *nf = findNorm(fb);
+        if ([nf isEqualToString:nb]) return YES;
+        NSString *pf = findPrice(fb);
+        if (pb && pf && [pb doubleValue] == [pf doubleValue] && nb.length && nf.length && ([nf containsString:[nb substringToIndex:MIN(nb.length, 4)]] || [nb containsString:[nf substringToIndex:MIN(nf.length, 4)]])) return YES;
+    }
+    return NO;
+}
+
+// v0.9.26:从“打开淘宝搜索…/进入微信…”这类文字里取出 App 名(必须是真装了的 App 才算)
+static NSString *guessAppName(NSArray *texts) {
+    NSCharacterSet *stop = [NSCharacterSet characterSetWithCharactersInString:@"，,。.;；、→ \n"];
+    NSArray *stopWords = @[@"搜索", @"找", @"并", @"给", @"里", @"中", @"的", @"发", @"输入", @"点", @"查", @"看", @"记录", @"设置一", @"定", @"导航", @"打开", @"然后"];
+    for (NSString *t in texts) {
+        for (NSString *verb in @[@"打开", @"进入", @"切换到", @"回到", @"去"]) {
+            NSRange r = [t rangeOfString:verb];
+            if (r.location == NSNotFound) continue;
+            NSString *rest = [t substringFromIndex:NSMaxRange(r)];
+            NSRange sr = [rest rangeOfCharacterFromSet:stop];
+            if (sr.location != NSNotFound) rest = [rest substringToIndex:sr.location];
+            for (NSString *w in stopWords) { NSRange wr = [rest rangeOfString:w]; if (wr.location != NSNotFound && wr.location > 0) rest = [rest substringToIndex:wr.location]; }
+            rest = [rest stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+            if (rest.length < 2 || rest.length > 12) continue;
+            NSString *info = nil;
+            if (bundleForAppName(rest, &info)) return rest;
+        }
+    }
+    return nil;
+}
+
 static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString *model) {
     if ([model.lowercaseString containsString:@"autoglm"]) { agentRunAutoGLM(task, base, key, model); return; }
     gCurrentModel = model;
@@ -1586,6 +1636,15 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 ma[@"direction"] = @"up"; act = ma;
                 agentSay(@"swipe 没给方向,按上滑处理");
             }
+            if ([[[act[@"action"] description] lowercaseString] isEqualToString:@"open_app"] && ![[act[@"name"] description] length]) { // v0.9.26:open_app 漏了 name,从子目标/任务里补,不再重问
+                NSMutableArray *srcs = [NSMutableArray array];
+                for (NSUInteger i = 0; i < plan.count; i++) if (![planDone[i] boolValue]) [srcs addObject:plan[i]];
+                if (!plan.count && [act[@"plan"] isKindOfClass:NSArray.class]) for (id p in act[@"plan"]) if ([p isKindOfClass:NSString.class]) [srcs addObject:p];
+                if ([[act[@"thought"] description] length]) [srcs addObject:[act[@"thought"] description]];
+                [srcs addObject:gTaskDisplay.length ? gTaskDisplay : task];
+                NSString *guess = guessAppName(srcs);
+                if (guess.length) { NSMutableDictionary *ma = [act mutableCopy]; ma[@"name"] = guess; act = ma; agentSay([NSString stringWithFormat:@"open_app 没给 App 名,按子目标补成「%@」", guess]); }
+            }
             NSString *bad = validateAct(act, allItems.count);
             if (bad) {
                 agentSay([NSString stringWithFormat:@"提示:模型给的动作参数无效(%@),重新询问一次", bad]);
@@ -1617,6 +1676,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                     if (f.length > 60) f = [f substringToIndex:60];
                     NSString *line = [NSString stringWithFormat:@"[%@] %@", tagName, f];
                     if ([findings containsObject:line] || findings.count >= 40) continue;
+                    if (findingDup(findings, line)) continue; // v0.9.26:同平台同价格、名字互相包含的视为重复
                     [findings addObject:line]; added++;
                 }
                 if (added) lastNewFindStep = step;
@@ -1741,7 +1801,8 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 compareOK = YES;
                 for (NSString *sp in visitedShops) if (pricedCount(findings, sp) < 3) { compareOK = NO; break; }
             }
-            if ([action isEqualToString:@"done"] && plan.count && !doneChecked && !compareOK && paOn(@"subgoal_plan", YES)) { // S8:完成自检
+            BOOL justFound = findings.count && lastNewFindStep >= step - 1; // v0.9.26:刚用 found 记下了完成证据,不再自检(省一次调用)
+            if ([action isEqualToString:@"done"] && plan.count && !doneChecked && !compareOK && !justFound && paOn(@"subgoal_plan", YES)) { // S8:完成自检
                 NSMutableArray *left = [NSMutableArray array];
                 for (NSUInteger i = 0; i < plan.count; i++) if (![planDone[i] boolValue]) [left addObject:[NSString stringWithFormat:@"%lu", (unsigned long)i + 1]];
                 if (left.count) {
@@ -1764,7 +1825,12 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 }
                 if (lack.count) agentSay([NSString stringWithFormat:@"提示:%@ 的价格记录仍不足 3 个,结果可能不完整", [lack componentsJoinedByString:@"、"]]);
             }
-            agentSay([NSString stringWithFormat:@"%@:%@", [action isEqualToString:@"done"] ? @"任务完成" : @"任务停止", [act[@"text"] description] ?: @""]);
+            NSString *doneText = [[act[@"text"] description] ?: @"" stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if (!doneText.length && [action isEqualToString:@"done"] && findings.count) { // v0.9.26:模型没写结果,用已记录的结果代替
+                NSUInteger n0 = findings.count > 5 ? findings.count - 5 : 0;
+                doneText = [[findings subarrayWithRange:NSMakeRange(n0, findings.count - n0)] componentsJoinedByString:@"\n"];
+            }
+            agentSay([NSString stringWithFormat:@"%@:%@", [action isEqualToString:@"done"] ? @"任务完成" : @"任务停止", doneText]);
             if ([action isEqualToString:@"done"] && findings.count) agentSay([NSString stringWithFormat:@"已记录的结果:\n%@", [findings componentsJoinedByString:@"\n"]]);
             break;
         }
@@ -1900,8 +1966,8 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                     [want enumerateSubstringsInRange:NSMakeRange(0, want.length) options:NSStringEnumerationByComposedCharacterSequences usingBlock:^(NSString *c, NSRange r1, NSRange r2, BOOL *stop) { [wset addObject:c]; }];
                     for (NSDictionary *it in it3) {
                         if (seen || !wset.count) break;
-                        if ([it[@"y"] doubleValue] > sc.height * 0.55) continue; // 不看键盘区域
                         NSString *t = [[[it[@"text"] description] stringByReplacingOccurrencesOfString:@" " withString:@""] lowercaseString];
+                        if ([it[@"y"] doubleValue] > sc.height * 0.55 && t.length < 2 && want.length >= 2) continue; // v0.9.26:下半屏只跳过单个字(键盘按键),聊天输入框在底部/键盘上方也要看
                         if (!t.length || t.length > want.length + 14) continue;
                         if ([t containsString:want]) { seen = YES; break; }
                         __block NSUInteger hitc = 0;
