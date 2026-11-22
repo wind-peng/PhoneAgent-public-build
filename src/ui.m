@@ -569,7 +569,7 @@ static NSData *attachJPEG(UIImage *img) {
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"高级设置(v0.9.37)";
+    self.title = @"高级设置(v0.9.38)";
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
     self.popupTV = [UITextView new];
@@ -611,6 +611,8 @@ static NSData *attachJPEG(UIImage *img) {
         [self sw:@"子目标规划 + 完成前自检" key:@"subgoal_plan" def:YES],
         [self sw:@"经验宏回放(相同任务先本地回放,OCR 核对;默认关)" key:@"macro_replay" def:NO],
         [self sw:@"比价任务:每个进过的平台记下商品价格才算完成" key:@"compare_check" def:YES],
+        [self sw:@"只显示“加载中”的屏幕本地等待,不调用模型" key:@"local_load_wait" def:YES],
+        [self sw:@"元素列表标出【标题】(一般不可点)" key:@"ax_header_tag" def:YES],
         [self sw:@"数量目标核对:模型说已达标就提醒它直接完成" key:@"goal_nudge" def:YES],
         [self sw:@"动作没给 id 时按目标文字本地匹配" key:@"target_resolve" def:YES],
         [self sw:@"常规步骤思考额度封顶(GLM 3072)" key:@"low_think_cap" def:YES],

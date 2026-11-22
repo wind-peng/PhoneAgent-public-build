@@ -721,6 +721,7 @@ NSArray *hybridMessages2(NSString *task, NSString *history, UIImage *img, NSData
             NSString *tag = @"";
             if (it[@"axin"]) tag = [NSString stringWithFormat:@" 【%@,可输入】", it[@"axin"]];
             else if ([it[@"axbtn"] boolValue]) tag = @" 【按钮】";
+            else if ([it[@"axhdr"] boolValue] && paOn(@"ax_header_tag", YES)) tag = @" 【标题】";
             [ocr appendFormat:@"[%d] (%d,%d) %@%@\n", idx, (int)round([it[@"x"] doubleValue] * k), (int)round([it[@"y"] doubleValue] * k), t, tag];
             hasAX = YES;
             continue;
@@ -750,7 +751,7 @@ NSArray *hybridMessages2(NSString *task, NSString *history, UIImage *img, NSData
              [it[@"inbox"] boolValue] ? @" (在输入框里,可能是提示文字)" : @""];
     }
     if (!ocr.length) [ocr appendString:@"(本地 OCR 没有识别到文字)\n"];
-    if (hasAX) [ocr appendString:@"(带【按钮】【…可输入】标记或排在前面的条目来自系统无障碍信息,名字、类型、选中状态都可信;要输入文字就对【可输入】的条目 input_text。)\n"];
+    if (hasAX) [ocr appendString:@"(带【按钮】【…可输入】标记或排在前面的条目来自系统无障碍信息,名字、类型、选中状态都可信;要输入文字就对【可输入】的条目 input_text;同一块区域既有说明文字/【标题】又有【按钮】时点【按钮】,标题和说明文字一般点了没反应。)\n"];
     NSString *text = [NSString stringWithFormat:
                       @"任务:%@\n\n最近的动作:\n%@\n本地 OCR 文字列表(格式 [编号] (中心x,中心y) 文字,坐标是 780x1688 截图像素):\n%@\n%@",
                       task, history.length ? history : @"(还没有)", ocr,

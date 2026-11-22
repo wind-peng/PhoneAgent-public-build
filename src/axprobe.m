@@ -362,7 +362,8 @@ NSArray *axReadScreen(NSString *frontBid, int *msOut, NSString **howOut) {
             NSMutableDictionary *d = [@{@"text": text, @"x": @((int)round(CGRectGetMidX(r))), @"y": @((int)round(CGRectGetMidY(r))),
                                         @"w": @((int)round(r.size.width)), @"h": @((int)round(r.size.height)), @"ax": @YES} mutableCopy];
             if (input) d[@"axin"] = (t & 0x400ULL) ? @"搜索框" : @"输入框";
-            else if (t & 0x1ULL) d[@"axbtn"] = @YES;
+            else if ((t & 0x1ULL) || (t & 0x2ULL)) d[@"axbtn"] = @YES; // v0.9.38:链接也算可点
+            else if (t & 0x10000ULL) d[@"axhdr"] = @YES;              // v0.9.38:标题(一般不可点)
             if ([label containsString:@"已选中"]) d[@"axsel"] = @YES;
             [out addObject:d];
         }

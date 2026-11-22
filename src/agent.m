@@ -1374,6 +1374,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     NSString *lastAction = @"";
     NSString *pendingSwipeSig = nil;       // 5:上一步滑动前的屏幕签名,下一步对比确认有没有滚动
     NSMutableArray *queue = [NSMutableArray array]; NSArray *queueItems = nil; NSData *queueThumb = nil; // S7:预定的后续动作
+    int loadWaits = 0; // v0.9.38:只有“加载中”的屏幕本地等
     int lastAdN = -1, lastAdRep = 0; NSArray *numGoals = taskNumGoals(gTaskDisplay.length ? gTaskDisplay : task); BOOL goalNudged = NO; // v0.9.37
     int adWaits = 0, popupTaps = 0, relaunches = 0, castLost = 0, selfBlocks = 0; // selfBlocks:v0.9.17 拦截点 PhoneAgent 自己界面的次数
     NSString *lastPopupKey = nil;
@@ -1630,6 +1631,24 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 step--; continue;
             }
             adWaits = 0; if (n <= 0) { if (lastAdRep) agentSay(@"倒计时停在同一个数字,当作广告已结束"); lastAdN = -1; lastAdRep = 0; }
+        }
+        if (paOn(@"local_load_wait", YES) && localOK) { // v0.9.38:屏幕只剩“加载中”之类的字:本地等,不调用模型、不截图
+            BOOL loading = NO; int meaningful = 0;
+            for (NSDictionary *it in items) {
+                NSString *t = [[it[@"text"] description] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+                if (t.length < 2 || [it[@"icon"] boolValue]) continue;
+                meaningful++;
+                NSString *lt = t.lowercaseString;
+                if (t.length <= 14 && ([t containsString:@"加载中"] || [t containsString:@"正在加载"] || [t containsString:@"请稍候"] || [t containsString:@"请稍后"] || [t containsString:@"努力加载"] || [lt hasPrefix:@"loading"])) loading = YES;
+            }
+            if (loading && meaningful <= 5 && loadWaits < 5) {
+                if (loadWaits == 0) { agentSay(@"屏幕在加载中,本地等待"); [history addObject:[NSString stringWithFormat:@"%d. (屏幕显示加载中,程序已原地等待,没有调用模型)", step]]; }
+                loadWaits++;
+                sleepWhileRunning(1.5);
+                lastSig = @""; same = 0;
+                step--; continue;
+            }
+            if (!loading) loadWaits = 0;
         }
         // 7:弹窗规则:完全匹配的小按钮直接点掉(默认关)
         if (paOn(@"auto_popup", NO) && popupTaps < 3 && localOK) {
