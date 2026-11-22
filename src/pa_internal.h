@@ -135,6 +135,7 @@ NSString *defaultPopupWords(void);
 NSArray *popupWords(void);
 NSDictionary *popupTarget(NSArray *items);
 NSArray *detectIcons(UIImage *img, NSArray *textItems);
+NSArray *detectInputBoxes(UIImage *img, NSArray *textItems);
 void cpSave(NSDictionary *d);
 NSDictionary *cpLoad(void);
 void cpClear(void);

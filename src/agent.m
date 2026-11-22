@@ -1421,6 +1421,27 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 allItems = m;
             }
         }
+        if (paOn(@"input_box_detect", YES)) { // v0.9.27:空输入框没有文字,从截图里找出来标成「[输入框]」;框里的提示文字/图标也注明
+            NSArray *boxes = nil;
+            @try { boxes = detectInputBoxes(img, items); } @catch (NSException *ex) { boxes = nil; }
+            if (boxes.count) {
+                NSMutableArray *m = [NSMutableArray array];
+                for (NSDictionary *it in allItems) {
+                    double ix = [it[@"x"] doubleValue], iy = [it[@"y"] doubleValue];
+                    BOOL in = NO;
+                    for (NSDictionary *bx in boxes) {
+                        double bw = [bx[@"w"] doubleValue] / 2, bh = [bx[@"h"] doubleValue] / 2;
+                        if (fabs(ix - [bx[@"x"] doubleValue]) <= bw && fabs(iy - [bx[@"y"] doubleValue]) <= bh) { in = YES; break; }
+                    }
+                    if (in) { NSMutableDictionary *d = [it mutableCopy]; d[@"inbox"] = @YES; [m addObject:d]; } else [m addObject:it];
+                }
+                for (NSDictionary *bx in boxes) {
+                    if ([bx[@"texts"] intValue] > 0 || m.count >= 80) continue; // 框里有提示文字的,已经在列表里注明“在输入框里”
+                    [m addObject:@{@"text": @"[输入框]", @"x": bx[@"x"], @"y": bx[@"y"], @"w": bx[@"w"], @"h": bx[@"h"], @"box": @YES}];
+                }
+                allItems = m;
+            }
+        }
         NSString *screen = localOK ? sigText : thumbSig(thumbNow);
         // 9:前台 App 意外变化(崩溃回到主屏 / 跳到别的 App)
         NSString *front = frontmostBundleID();
@@ -1805,7 +1826,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 compareOK = YES;
                 for (NSString *sp in visitedShops) if (pricedCount(findings, sp) < 3) { compareOK = NO; break; }
             }
-            BOOL justFound = findings.count && lastNewFindStep >= step - 1; // v0.9.26:刚用 found 记下了完成证据,不再自检(省一次调用)
+            BOOL justFound = (findings.count && lastNewFindStep >= step - 1) || (confirmStep && step - confirmStep <= 2); // v0.9.26:刚用 found 记下了完成证据,不再自检(省一次调用)
             if ([action isEqualToString:@"done"] && plan.count && !doneChecked && !compareOK && !justFound && paOn(@"subgoal_plan", YES)) { // S8:完成自检
                 NSMutableArray *left = [NSMutableArray array];
                 for (NSUInteger i = 0; i < plan.count; i++) if (![planDone[i] boolValue]) [left addObject:[NSString stringWithFormat:@"%lu", (unsigned long)i + 1]];
@@ -1960,6 +1981,17 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             if (appHint.length) { NSString *i2 = nil; hintBid = bundleForAppName(appHint, &i2); }
             if (!hintBid.length && taskApp.length) hintBid = taskApp;
             NSString *note = nil;
+            if (typing && usedID && usedIcon && paOn(@"input_box_detect", YES)) { // v0.9.27:对着小图标 input_text,同一行有输入框 → 改点输入框(避免点到语音按钮)
+                for (NSDictionary *it in allItems) {
+                    BOOL isBox = [it[@"box"] boolValue], inText = [it[@"inbox"] boolValue] && ![it[@"icon"] boolValue];
+                    if (!isBox && !inText) continue;
+                    double by = [it[@"y"] doubleValue], bh = MAX(24.0, [it[@"h"] doubleValue]);
+                    if (fabs(by - y) > bh) continue;
+                    double nx = isBox ? [it[@"x"] doubleValue] - [it[@"w"] doubleValue] * 0.15 : [it[@"x"] doubleValue];
+                    agentSay([NSString stringWithFormat:@"input_text 对着的是小图标,同一行有输入框,改点输入框 (%.0f,%.0f)pt", nx, by]);
+                    x = nx; y = by; break;
+                }
+            }
             if (typing) {
                 BOOL ok = agPasteText(text, x, y, hintBid, &note);
                 if (!ok) {

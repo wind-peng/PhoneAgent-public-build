@@ -386,3 +386,75 @@ BOOL waitForNetwork(NSString *base, double maxWait) {
     }
     return NO;
 }
+
+// v0.9.26:找“输入框”:宽、颜色均匀且偏灰、左右两边有边界、高度像一行输入框的长条。
+// 空输入框没有文字,OCR 列表里看不到它,模型只能在旁边的小图标(语音/表情/加号)里猜。
+// 返回 @[@{x,y,w,h(pt), texts: 框内文字条数}]
+NSArray *detectInputBoxes(UIImage *img, NSArray *textItems) {
+    if (!img.CGImage) return @[];
+    CGSize sc = screenSize();
+    const int W = 260;
+    int H = (int)lround(W * img.size.height / MAX(1.0, img.size.width));
+    if (H < 100 || H > 1200) return @[];
+    NSMutableData *buf = [NSMutableData dataWithLength:(NSUInteger)W * H * 4];
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf.mutableBytes, W, H, 8, W * 4, cs, (CGBitmapInfo)kCGImageAlphaNoneSkipLast);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return @[];
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationMedium);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, W, H), img.CGImage);
+    CGContextRelease(ctx);
+    const uint8_t *p = buf.bytes;
+    double k = sc.width / W;
+    #define PX(xx, yy) (p + ((yy) * W + (xx)) * 4)
+    #define CDIFF(a, b) (abs((int)(a)[0] - (int)(b)[0]) + abs((int)(a)[1] - (int)(b)[1]) + abs((int)(a)[2] - (int)(b)[2]))
+    typedef struct { int y0, y1, x0, x1; uint8_t c[3]; int ends[160]; int ne; } Box;
+    Box boxes[64]; int nb = 0;
+    int yStart = (int)(50 / k);
+    for (int y = yStart; y < H - 1; y++) {
+        int x = 0;
+        while (x < W - 1) {
+            const uint8_t *c = PX(x, y);
+            int lastGood = x, gap = 0;
+            for (int j = x + 1; j < W; j++) {
+                if (CDIFF(PX(j, y), c) <= 12) { lastGood = j; gap = 0; }
+                else if (++gap > 14) break;
+            }
+            int len = lastGood - x + 1;
+            if (len >= W * 0.4 && len <= W * 0.96 && x >= 2 && lastGood <= W - 3) {
+                int mx = MAX(c[0], MAX(c[1], c[2])), mn = MIN(c[0], MIN(c[1], c[2]));
+                BOOL edges = CDIFF(PX(x - 2, y), c) > 24 && CDIFF(PX(lastGood + 2, y), c) > 24;
+                if (mx - mn <= 28 && edges) {
+                    int hit = -1;
+                    for (int b = 0; b < nb; b++)
+                        if (boxes[b].y1 >= y - 2 && abs(boxes[b].x0 - x) <= 3 && CDIFF(boxes[b].c, c) <= 12) { hit = b; break; } // 右端可能被框里的图标打断,只按左端和颜色合并
+                    if (hit >= 0) { boxes[hit].y1 = y; boxes[hit].x0 = MIN(boxes[hit].x0, x); if (boxes[hit].ne < 160) boxes[hit].ends[boxes[hit].ne++] = lastGood; }
+                    else if (nb < 64) { Box nbx = {0}; nbx.y0 = nbx.y1 = y; nbx.x0 = x; nbx.x1 = lastGood; nbx.c[0] = c[0]; nbx.c[1] = c[1]; nbx.c[2] = c[2]; nbx.ends[0] = lastGood; nbx.ne = 1; boxes[nb++] = nbx; }
+                }
+            }
+            x = lastGood + 1;
+        }
+    }
+    #undef PX
+    #undef CDIFF
+    NSMutableArray *out = [NSMutableArray array];
+    for (int b = 0; b < nb && out.count < 3; b++) {
+        { // 右端取中位数
+            int *e = boxes[b].ends, n = boxes[b].ne;
+            for (int i = 1; i < n; i++) { int v = e[i], j = i - 1; while (j >= 0 && e[j] > v) { e[j + 1] = e[j]; j--; } e[j + 1] = v; }
+            if (n) boxes[b].x1 = e[n / 2];
+        }
+        double hpt = (boxes[b].y1 - boxes[b].y0 + 1) * k, wpt = (boxes[b].x1 - boxes[b].x0 + 1) * k;
+        if (hpt < sc.height * 0.025 || hpt > sc.height * 0.08 || wpt < sc.width * 0.4) continue;
+        double x0 = boxes[b].x0 * k, x1 = (boxes[b].x1 + 1) * k, y0 = boxes[b].y0 * k, y1 = (boxes[b].y1 + 1) * k;
+        int texts = 0; BOOL centered = NO;
+        for (NSDictionary *it in textItems) {
+            double tx = [it[@"x"] doubleValue], ty = [it[@"y"] doubleValue];
+            if (tx >= x0 && tx <= x1 && ty >= y0 && ty <= y1) { texts++; if (fabs(tx - (x0 + x1) / 2) < (x1 - x0) * 0.15) centered = YES; }
+        }
+        if (texts > 2) continue; // 里面字太多,多半是卡片/列表行
+        if (texts && centered) continue; // 字在正中间,多半是按钮(如弹窗的“好”),输入框的提示文字靠左
+        [out addObject:@{@"x": @((x0 + x1) / 2), @"y": @((y0 + y1) / 2), @"w": @(x1 - x0), @"h": @(y1 - y0), @"texts": @(texts)}];
+    }
+    return out;
+}

@@ -717,6 +717,11 @@ NSArray *hybridMessages2(NSString *task, NSString *history, UIImage *img, NSData
         if (![it[@"icon"] boolValue] && [t rangeOfCharacterFromSet:meaningful].location == NSNotFound && ![t containsString:@"¥"] && ![t containsString:@"×"]) continue;
         n++;
         if (t.length > 36) t = [t substringToIndex:36];
+        if ([it[@"box"] boolValue]) { // v0.9.27:截图里找到的空输入框
+            [ocr appendFormat:@"[%d] (%d,%d) [输入框] %dx%d(空的,点它或对它 input_text)\n", idx, (int)round([it[@"x"] doubleValue] * k), (int)round([it[@"y"] doubleValue] * k),
+             (int)round([it[@"w"] doubleValue] * k), (int)round([it[@"h"] doubleValue] * k)];
+            continue;
+        }
         if ([it[@"icon"] boolValue])
         {
             double ix = [it[@"x"] doubleValue], iy = [it[@"y"] doubleValue];
@@ -728,11 +733,13 @@ NSArray *hybridMessages2(NSString *task, NSString *history, UIImage *img, NSData
             else if (iy > sc.height * 0.91 && ix > sc.width * 0.85) pos = @" 右下角,聊天页常是加号/更多";
             else if (iy > sc.height * 0.91) pos = @" 底部栏,常是标签页或表情";
             else if (iy < sc.height * 0.13) pos = @" 顶部栏";
+            if ([it[@"inbox"] boolValue]) pos = @" 在输入框里面(常是语音/清除/扫码按钮,输入文字请点输入框空白处)";
             [ocr appendFormat:@"[%d] (%d,%d) [图标] %dx%d%@\n", idx, (int)round(ix * k), (int)round(iy * k),
              (int)round([it[@"w"] doubleValue] * k), (int)round([it[@"h"] doubleValue] * k), pos];
         }
         else
-            [ocr appendFormat:@"[%d] (%d,%d) %@\n", idx, (int)round([it[@"x"] doubleValue] * k), (int)round([it[@"y"] doubleValue] * k), t];
+            [ocr appendFormat:@"[%d] (%d,%d) %@%@\n", idx, (int)round([it[@"x"] doubleValue] * k), (int)round([it[@"y"] doubleValue] * k), t,
+             [it[@"inbox"] boolValue] ? @" (在输入框里,可能是提示文字)" : @""];
     }
     if (!ocr.length) [ocr appendString:@"(本地 OCR 没有识别到文字)\n"];
     NSString *text = [NSString stringWithFormat:
