@@ -788,21 +788,22 @@ NSString *llmCacheTest(void) {
                       @{@"role": @"user", @"content": @"这是缓存测试,不用看屏幕,直接调用 wait。"}];
     NSMutableDictionary *b1 = [buildBody(model, msgs, YES) mutableCopy];
     b1[@"max_tokens"] = @512;
-    NSMutableDictionary *b3 = [b1 mutableCopy];
-    if (b3[@"reasoning_effort"]) b3[@"reasoning_effort"] = [b1[@"reasoning_effort"] isEqual:@"high"] ? @"low" : @"high";
-    NSArray *bodies = @[b1, b1, b3];
-    NSArray *names = @[@"第 1 次", @"第 2 次(完全相同)", @"第 3 次(只改思考强度)"];
+    // v0.9.23:对照测试:带工具定义连发 2 次,再不带工具连发 2 次,间隔 5 秒
+    NSMutableDictionary *b2 = [b1 mutableCopy];
+    [b2 removeObjectForKey:@"tools"]; [b2 removeObjectForKey:@"tool_choice"];
+    NSArray *bodies = @[b1, b1, b2, b2];
+    NSArray *names = @[@"带工具 第 1 次", @"带工具 第 2 次", @"不带工具 第 1 次", @"不带工具 第 2 次"];
     NSMutableString *out = [NSMutableString stringWithFormat:@"模型 %@\n", model];
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         gLastUsage = nil;
         NSString *e = nil, *fr = nil;
         NSDictionary *msg = agPostFull(base, key, bodies[i], NO, 120, &fr, NULL, NULL, NULL, &e);
-        if (!msg && !gLastUsage) { [out appendFormat:@"%@:失败 %@\n", names[i], e ?: @""]; break; }
+        if (!msg && !gLastUsage) { [out appendFormat:@"%@:失败 %@\n", names[i], e ?: @""]; continue; }
         NSDictionary *u = gLastUsage;
         [out appendFormat:@"%@:输入 %lld,缓存 %lld\n", names[i], u ? numOf(u[@"prompt_tokens"]) : -1, cachedOf(u)];
-        if (i < 2) sleep(1);
+        if (i < 3) sleep(5);
     }
     gCurrentModel = saveModel; gEffortLow = NO;
-    [out appendString:@"\n第 2 次缓存接近输入数 = 接口支持缓存;仍是 0 = 这个模型/接口不缓存或要求更长的相同开头。"];
+    [out appendString:@"\n只有“不带工具 第 2 次”有缓存 = 工具定义导致不缓存;两种都是 0 = 这个模型/接口基本不缓存;两种都有 = 缓存正常。"];
     return out;
 }

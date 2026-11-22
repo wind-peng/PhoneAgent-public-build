@@ -1294,6 +1294,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     NSMutableOrderedSet *visitedShops = [NSMutableOrderedSet orderedSet]; // 比价任务里进过的购物平台
     NSMutableSet *leaveWarned = [NSMutableSet set];
     NSString *curShop = nil; int compareRejects = 0;
+    int shopSinceStep = 0, lastNewFindStep = 0, lastLostHintStep = -99; NSMutableDictionary *stuckHints = [NSMutableDictionary dictionary]; // v0.9.23:卡住检测
     BOOL compareTask = isCompareTask(gTaskDisplay.length ? gTaskDisplay : task) && paOn(@"compare_check", YES);
     BOOL glmModel = [model.lowercaseString hasPrefix:@"glm"];
     CGSize sc = screenSize();
@@ -1388,7 +1389,32 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
         }
         {   // v0.9.21:记下当前所在的购物平台
             NSString *sp = (front.length && ![front isEqualToString:selfID] && ![front isEqualToString:@"com.apple.springboard"]) ? (shopPlatformOf(agAppName(front)) ?: shopPlatformOf(front)) : nil;
-            if (sp) { curShop = sp; [visitedShops addObject:sp]; }
+            if (sp) { if (![sp isEqualToString:curShop]) shopSinceStep = step; curShop = sp; [visitedShops addObject:sp]; }
+        }
+        if (compareTask && curShop && localOK && paOn(@"stuck_hint", YES)) { // v0.9.23:比价时走错页面/卡住,本地提醒模型(不多调用模型)
+            NSString *tk = gTaskDisplay.length ? gTaskDisplay : task;
+            BOOL lost = NO;
+            if (![tk containsString:@"外卖"] && ![tk containsString:@"秒送"]) {
+                BOOL qs = NO, ys = NO;
+                for (NSDictionary *it in items) {
+                    NSString *t = [it[@"text"] description] ?: @"";
+                    if ([t containsString:@"搜秒送"] || [t containsString:@"搜全站"]) lost = YES;
+                    if ([t containsString:@"起送"]) qs = YES;
+                    if ([t containsString:@"月售"]) ys = YES;
+                }
+                if (qs && ys) lost = YES;
+            }
+            int idle = step - MAX(shopSinceStep, lastNewFindStep);
+            int nh = [stuckHints[curShop] intValue];
+            if (lost && step - lastLostHintStep >= 3) {
+                lastLostHintStep = step;
+                [history addObject:[NSString stringWithFormat:@"%d. (系统提醒:现在在「%@」的外卖/秒送频道,这里搜不到普通商品。请点左上角返回或底部「首页」回到 App 首页,用首页最上面的主搜索框搜商品;不要在外卖页搜索)", step, curShop]];
+                agentSay(@"提醒模型:走进了外卖/秒送频道,让它退回首页");
+            } else if (idle >= 8 && nh < 2 && step - lastLostHintStep >= 3) {
+                stuckHints[curShop] = @(nh + 1); lastLostHintStep = step; lastNewFindStep = step;
+                [history addObject:[NSString stringWithFormat:@"%d. (系统提醒:在「%@」已经 %d 步没记到新价格,可能走错页面(外卖、商品详情、推荐流)。请先回到 App 首页,用首页最上面的主搜索框搜任务里的商品,在搜索结果页用 found 记价格)", step, curShop, idle]];
+                agentSay([NSString stringWithFormat:@"提醒模型:在「%@」%d 步没记到新价格", curShop, idle]);
+            }
         }
         if ([screen isEqualToString:lastSig]) same++; else same = 0;
         lastSig = [screen copy];
@@ -1526,6 +1552,12 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             if (!gAgentRunning) break;
             if (!act) { agentSay([@"调用模型失败,任务停止:" stringByAppendingString:err ?: @"?"]); break; }
             // A2:参数不合法:带一句简短说明重新问一次,而不是直接执行
+            if ([[[act[@"action"] description] lowercaseString] isEqualToString:@"swipe"] && validateAct(act, allItems.count)) { // v0.9.23:swipe 没给方向,本地默认上滑,不再重问
+                NSMutableDictionary *ma = [act mutableCopy];
+                [ma removeObjectsForKeys:@[@"x", @"y", @"x2", @"y2"]];
+                ma[@"direction"] = @"up"; act = ma;
+                agentSay(@"swipe 没给方向,按上滑处理");
+            }
             NSString *bad = validateAct(act, allItems.count);
             if (bad) {
                 agentSay([NSString stringWithFormat:@"提示:模型给的动作参数无效(%@),重新询问一次", bad]);
@@ -1559,6 +1591,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                     if ([findings containsObject:line] || findings.count >= 40) continue;
                     [findings addObject:line]; added++;
                 }
+                if (added) lastNewFindStep = step;
                 if (added) agentSay([NSString stringWithFormat:@"记下 %d 条结果(共 %lu 条)", added, (unsigned long)findings.count]);
             }
             // 12:子目标
@@ -1833,7 +1866,22 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                     UIImage *im3 = takeScreenshot(&e3);
                     NSArray *it3 = im3 ? ocrImage(im3, &e3) : nil;
                     NSDictionary *hit = nil;
+                    BOOL seen = !paOn(@"paste_verify", YES); // v0.9.23:先确认输入框里确实是要搜的词(本地 OCR,不调用模型)
+                    NSString *want = [[text stringByReplacingOccurrencesOfString:@" " withString:@""] lowercaseString];
+                    NSMutableSet *wset = [NSMutableSet set];
+                    [want enumerateSubstringsInRange:NSMakeRange(0, want.length) options:NSStringEnumerationByComposedCharacterSequences usingBlock:^(NSString *c, NSRange r1, NSRange r2, BOOL *stop) { [wset addObject:c]; }];
                     for (NSDictionary *it in it3) {
+                        if (seen || !wset.count) break;
+                        if ([it[@"y"] doubleValue] > sc.height * 0.55) continue; // 不看键盘区域
+                        NSString *t = [[[it[@"text"] description] stringByReplacingOccurrencesOfString:@" " withString:@""] lowercaseString];
+                        if (!t.length || t.length > want.length + 14) continue;
+                        if ([t containsString:want]) { seen = YES; break; }
+                        __block NSUInteger hitc = 0;
+                        for (NSString *c in wset) if ([t containsString:c]) hitc++;
+                        if (hitc * 10 >= wset.count * 7) seen = YES;
+                    }
+                    if (!wset.count) seen = YES;
+                    for (NSDictionary *it in (seen ? it3 : @[])) {
                         NSString *t = [[[it[@"text"] description] stringByReplacingOccurrencesOfString:@" " withString:@""] lowercaseString];
                         if (![t isEqualToString:@"搜索"] && ![t isEqualToString:@"search"]) continue;
                         double ix = [it[@"x"] doubleValue], iy = [it[@"y"] doubleValue];
@@ -1848,6 +1896,9 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                         [history addObject:[NSString stringWithFormat:@"%d. (程序已自动点了「搜索」,请看新屏幕)", step]];
                         agentSay(@"粘贴后已自动点“搜索”");
                         [queue removeAllObjects];
+                    } else if (!seen) {
+                        result = [NSString stringWithFormat:@"粘贴后屏幕上没看到「%@」,可能点到了别的地方(比如语音按钮)或文字没进输入框;程序没有自动点搜索。请确认输入框,必要时点输入框后再 input_text", text];
+                        [history addObject:[NSString stringWithFormat:@"%d. (%@)", step, result]];
                     }
                 }
             } else {

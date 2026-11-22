@@ -569,7 +569,7 @@ static NSData *attachJPEG(UIImage *img) {
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"高级设置(v0.9.22)";
+    self.title = @"高级设置(v0.9.23)";
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
     self.popupTV = [UITextView new];
@@ -590,7 +590,7 @@ static NSData *attachJPEG(UIImage *img) {
     [tokClr setTitle:@"累计清零" forState:UIControlStateNormal];
     [tokClr addTarget:self action:@selector(onTokClear) forControlEvents:UIControlEventTouchUpInside];
     UIButton *cacheT = [UIButton buttonWithType:UIButtonTypeSystem];
-    [cacheT setTitle:@"缓存测试(同一请求连发 3 次,约用 1 万 token)" forState:UIControlStateNormal];
+    [cacheT setTitle:@"缓存对照测试(带/不带工具各 2 次,约用 1.3 万 token)" forState:UIControlStateNormal];
     cacheT.titleLabel.numberOfLines = 0;
     [cacheT addTarget:self action:@selector(onCacheTest:) forControlEvents:UIControlEventTouchUpInside];
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
@@ -611,6 +611,8 @@ static NSData *attachJPEG(UIImage *img) {
         [self hdr:@"动作执行"],
         [self sw:@"智能等待:动作后等画面稳定(代替固定等待)" key:@"smart_settle" def:YES],
         [self sw:@"输入文字后自动点“搜索”按钮(右上角或键盘上的)" key:@"auto_search" def:YES],
+        [self sw:@"自动点搜索前先确认输入框里是要搜的词" key:@"paste_verify" def:YES],
+        [self sw:@"比价时走错页面/卡住提醒模型回首页" key:@"stuck_hint" def:YES],
         [self sw:@"打开 App / 点搜索后本地等页面加载完(少问模型一次 wait)" key:@"local_load_wait" def:YES],
         [self sw:@"点击没反应时在旁边自动重试一次(敏感按钮除外)" key:@"tap_retry" def:YES],
         [self sw:@"新滑动方式(60Hz 匀速、抬手前停顿防甩动)" key:@"smooth_swipe" def:YES],
@@ -667,7 +669,7 @@ static NSData *attachJPEG(UIImage *img) {
         agentSay([@"[缓存测试] " stringByAppendingString:r]);
         dispatch_async(dispatch_get_main_queue(), ^{
             btn.enabled = YES;
-            [btn setTitle:@"缓存测试(同一请求连发 3 次,约用 1 万 token)" forState:UIControlStateNormal];
+            [btn setTitle:@"缓存对照测试(带/不带工具各 2 次,约用 1.3 万 token)" forState:UIControlStateNormal];
             self.tokL.text = tokSummary(YES);
             UIAlertController *a = [UIAlertController alertControllerWithTitle:@"缓存测试结果" message:r preferredStyle:UIAlertControllerStyleAlert];
             [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
