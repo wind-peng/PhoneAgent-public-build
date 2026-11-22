@@ -264,8 +264,10 @@ NSString *agPostOnce(NSString *base, NSString *key, NSDictionary *body, BOOL hon
 static long long gTokIn, gTokOut, gTokCache, gTokReason; static int gTokCalls;
 NSString *gTokTag;
 static long long numOf(id v) { return [v respondsToSelector:@selector(longLongValue)] ? [v longLongValue] : 0; }
+static NSDictionary *gLastUsage;
 void tokAdd(id usage) {
     if (![usage isKindOfClass:NSDictionary.class]) return;
+    gLastUsage = usage;
     NSDictionary *u = usage;
     long long in = numOf(u[@"prompt_tokens"]), out = numOf(u[@"completion_tokens"]);
     long long cache = numOf(u[@"prompt_cache_hit_tokens"]); // DeepSeek
@@ -316,17 +318,11 @@ static NSArray *agentTools(void) {
     static NSArray *tools; static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSDictionary *str = @{@"type": @"string"}, *num = @{@"type": @"number"}, *integer = @{@"type": @"integer"};
-        NSDictionary *common = @{
-            @"thought": @{@"type": @"string", @"description": @"不超过20字的思考"},
-            @"visible_text": @{@"type": @"string", @"description": @"截图/OCR 里的关键文字,不超过120字"},
-            @"target": @{@"type": @"string", @"description": @"这一步要点的按钮/文字名称"},
-            @"progress": @{@"type": @"string", @"description": @"不超过60字:已完成什么、还剩什么"},
-            @"risk": @{@"type": @"string", @"description": @"对外影响或难以撤销时写明后果,否则留空"},
-            @"plan": @{@"type": @"array", @"items": str, @"description": @"只在被要求时给出:3-6 个子目标"},
-            @"subgoal_done": @{@"type": @"integer", @"description": @"刚刚完成的子目标编号(没有就不填)"},
-            @"need_image": @{@"type": @"boolean", @"description": @"下一步需要看截图时设为 true"},
-            @"found": @{@"type": @"string", @"description": @"这一屏看到的、任务需要的结果(如 商品名 价格),每条用;分隔,程序会保存;没有就不填"}};
-        NSDictionary *xy = @{@"id": @{@"type": @"integer", @"description": @"OCR 列表编号(优先)"}, @"x": num, @"y": num};
+        // v0.9.22:公共字段只写类型,含义已在系统提示词里写过一次(之前 11 个工具各带一遍说明,每步白白多 1~2k token)
+        NSDictionary *boolT = @{@"type": @"boolean"};
+        NSDictionary *common = @{@"thought": str, @"visible_text": str, @"target": str, @"progress": str, @"risk": str,
+            @"plan": @{@"type": @"array", @"items": str}, @"subgoal_done": integer, @"need_image": boolT, @"found": str};
+        NSDictionary *xy = @{@"id": integer, @"x": num, @"y": num};
         NSArray *defs = @[
             @[@"tap", @"点击。有文字的目标优先只给 id;无文字图标给 x,y(780x1688 截图像素)", xy, @[]],
             @[@"long_press", @"长按。参数同 tap", xy, @[]],
@@ -641,7 +637,7 @@ static NSString *const kAgentSystem =
 @"12. 可选字段:plan(字符串数组,只在用户消息要求时给出 3-6 个子目标);subgoal_done(刚完成的子目标编号);need_image(下一步需要看截图时设为 true)。\n"
 @"13. 有的步骤只给 OCR 列表、不附截图(用户消息会说明)。OCR 列表里标“[图标]”的是检测到的无文字小图标(可能是关闭×、返回箭头等),可以用 id 点击;看不清或需要看图标/图片时,先设 need_image=true 或用 wait。\n"
 @"14. 非常有把握时(例如在同一页面连续点几个确定的按钮),可以一次给出最多 3 个连续动作:调用多个工具,或在 JSON 里用 actions 数组(每项是一个动作对象)。程序会逐个执行并核对屏幕,屏幕变化不符合预期就放弃剩下的。done、stop、ask_user 不要和别的动作放在一起。\n"
-@"15. found(可选):这一屏看到任务需要的结果(商品名和价格、查到的数据等)就写进 found,每条用;分隔,例如“XX 行李箱 24寸 ¥199;YY 行李箱 ¥259”。程序会保存并每步给你看,写 done 时据此汇总。比价任务在每个平台至少记下 3 个具体商品和价格,再换下一个平台。";
+@"15. found(可选):这一屏看到任务需要的结果(商品名和价格、查到的数据等)就写进 found,每条用;分隔,例如“XX 行李箱 24寸 ¥199;YY 行李箱 ¥259”。程序会保存并每步给你看,写 done 时据此汇总。比价任务在每个平台至少记下 3 个具体商品和价格,再换下一个平台。只记和任务要找的东西相符的商品(例如找风衣就不要记军大衣、棉服);价格明显离谱(比同类高或低 10 倍,常是把“¥25 54人付款”之类连在一起读错了)要先核对截图再记,写 done 时也不要把不相符或读错的商品当成结论。";
 
 NSString *memoryText(void) { return [NSUserDefaults.standardUserDefaults stringForKey:@"memory_text"] ?: @""; }
 
@@ -714,16 +710,21 @@ NSArray *hybridMessages2(NSString *task, NSString *history, UIImage *img, NSData
     double k = MODEL_W / sc.width;
     NSMutableString *ocr = [NSMutableString string];
     int n = 0;
+    // v0.9.22:OCR 列表瘦身:最多 70 条、每条 36 字,去掉只有标点符号的碎片(图标照常保留)
+    NSCharacterSet *meaningful = [NSCharacterSet alphanumericCharacterSet]; // 含汉字、字母、数字
+    int idx = 0;
     for (NSDictionary *it in items) {
-        if (n >= 80) break;
-        n++;
+        idx++;  // 编号始终等于在 items 里的位置(程序按编号取点击位置),跳过的条目不重新编号
+        if (n >= 70) break;
         NSString *t = [it[@"text"] description] ?: @"";
-        if (t.length > 40) t = [t substringToIndex:40];
+        if (![it[@"icon"] boolValue] && [t rangeOfCharacterFromSet:meaningful].location == NSNotFound && ![t containsString:@"¥"] && ![t containsString:@"×"]) continue;
+        n++;
+        if (t.length > 36) t = [t substringToIndex:36];
         if ([it[@"icon"] boolValue])
-            [ocr appendFormat:@"[%d] (%d,%d) [图标] %dx%d\n", n, (int)round([it[@"x"] doubleValue] * k), (int)round([it[@"y"] doubleValue] * k),
+            [ocr appendFormat:@"[%d] (%d,%d) [图标] %dx%d\n", idx, (int)round([it[@"x"] doubleValue] * k), (int)round([it[@"y"] doubleValue] * k),
              (int)round([it[@"w"] doubleValue] * k), (int)round([it[@"h"] doubleValue] * k)];
         else
-            [ocr appendFormat:@"[%d] (%d,%d) %@\n", n, (int)round([it[@"x"] doubleValue] * k), (int)round([it[@"y"] doubleValue] * k), t];
+            [ocr appendFormat:@"[%d] (%d,%d) %@\n", idx, (int)round([it[@"x"] doubleValue] * k), (int)round([it[@"y"] doubleValue] * k), t];
     }
     if (!ocr.length) [ocr appendString:@"(本地 OCR 没有识别到文字)\n"];
     NSString *text = [NSString stringWithFormat:
@@ -763,4 +764,45 @@ NSArray *hybridMessages2(NSString *task, NSString *history, UIImage *img, NSData
 
 NSArray *hybridMessages(NSString *task, NSString *history, UIImage *img, NSArray *items, NSString **err) {
     return hybridMessages2(task, history, img, nil, nil, items, YES, YES, err);
+}
+
+
+#pragma mark - v0.9.22 缓存测试
+// 用当前模型把同一段固定文字(系统提示词 + 工具)连发 3 次:第 2 次看相同请求能不能命中缓存,
+// 第 3 次只改思考强度,看思考强度变化会不会让缓存失效。返回给用户看的结果。
+static long long cachedOf(NSDictionary *u) {
+    if (![u isKindOfClass:NSDictionary.class]) return -1;
+    long long c = numOf(u[@"prompt_cache_hit_tokens"]);
+    id pd = u[@"prompt_tokens_details"];
+    if (!c && [pd isKindOfClass:NSDictionary.class]) c = numOf(pd[@"cached_tokens"]);
+    return c;
+}
+NSString *llmCacheTest(void) {
+    NSString *key = nil, *base = nil, *model = nil;
+    loadLLMConfig(&key, &base, &model);
+    if (!key.length || !base.length || !model.length) return @"请先填好接口地址、API Key 和模型名";
+    if ([model.lowercaseString hasPrefix:@"glm"] && (!base.length || [base.lowercaseString containsString:@"deepseek"])) base = @"https://open.bigmodel.cn/api/paas/v4";
+    NSString *saveModel = gCurrentModel; gCurrentModel = model;
+    gEscalate = NO; gEffortHigh = NO; gEffortLow = YES;
+    NSArray *msgs = @[@{@"role": @"system", @"content": kAgentSystem},
+                      @{@"role": @"user", @"content": @"这是缓存测试,不用看屏幕,直接调用 wait。"}];
+    NSMutableDictionary *b1 = [buildBody(model, msgs, YES) mutableCopy];
+    b1[@"max_tokens"] = @512;
+    NSMutableDictionary *b3 = [b1 mutableCopy];
+    if (b3[@"reasoning_effort"]) b3[@"reasoning_effort"] = [b1[@"reasoning_effort"] isEqual:@"high"] ? @"low" : @"high";
+    NSArray *bodies = @[b1, b1, b3];
+    NSArray *names = @[@"第 1 次", @"第 2 次(完全相同)", @"第 3 次(只改思考强度)"];
+    NSMutableString *out = [NSMutableString stringWithFormat:@"模型 %@\n", model];
+    for (int i = 0; i < 3; i++) {
+        gLastUsage = nil;
+        NSString *e = nil, *fr = nil;
+        NSDictionary *msg = agPostFull(base, key, bodies[i], NO, 120, &fr, NULL, NULL, NULL, &e);
+        if (!msg && !gLastUsage) { [out appendFormat:@"%@:失败 %@\n", names[i], e ?: @""]; break; }
+        NSDictionary *u = gLastUsage;
+        [out appendFormat:@"%@:输入 %lld,缓存 %lld\n", names[i], u ? numOf(u[@"prompt_tokens"]) : -1, cachedOf(u)];
+        if (i < 2) sleep(1);
+    }
+    gCurrentModel = saveModel; gEffortLow = NO;
+    [out appendString:@"\n第 2 次缓存接近输入数 = 接口支持缓存;仍是 0 = 这个模型/接口不缓存或要求更长的相同开头。"];
+    return out;
 }

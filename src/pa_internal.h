@@ -158,6 +158,7 @@ extern NSString *gTokTag; // v0.9.21:当前这次模型调用的用途(写进每
 void tokReset(void);
 NSString *tokSummary(BOOL total);
 void tokClearTotal(void);
+NSString *llmCacheTest(void); // v0.9.22
 // v0.9.7 OCR 精确模式闪退保护
 extern BOOL gOCRGuardTripped;
 BOOL ocrCrashGuardCheck(void);

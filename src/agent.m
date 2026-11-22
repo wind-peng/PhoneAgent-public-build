@@ -1121,6 +1121,29 @@ static void afterAction(double minWait, double cap, double legacySecs) {
     else usleep((useconds_t)(legacySecs * 1e6));
 }
 
+// v0.9.22:打开 App / 自动点搜索后,在本地多等一会儿,直到页面像是加载好了(文字够多、没有“加载中”),
+// 省掉模型专门回一个 wait 的调用。最多等 cap 秒。
+static void settleUntilLoaded(double cap) {
+    if (!paOn(@"local_load_wait", YES)) return;
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+    int rounds = 0;
+    while (gAgentRunning && CFAbsoluteTimeGetCurrent() - t0 < cap) {
+        NSString *e = nil;
+        UIImage *im = takeScreenshot(&e);
+        NSArray *its = im ? ocrImage(im, &e) : nil;
+        BOOL loading = its.count < 10;
+        for (NSDictionary *it in its) {
+            NSString *t = [it[@"text"] description] ?: @"";
+            if ([t containsString:@"加载中"] || [t containsString:@"正在加载"] || [t containsString:@"努力加载"] || [t isEqualToString:@"跳过"] || [t hasPrefix:@"跳过 "]) { loading = YES; break; }
+        }
+        if (!loading) break;
+        rounds++;
+        sleepWhileRunning(0.8);
+        waitScreenSettle(0.2, 1.5);
+    }
+    if (rounds) agentSay([NSString stringWithFormat:@"页面加载中,程序本地多等了 %.1f 秒", CFAbsoluteTimeGetCurrent() - t0]);
+}
+
 // S5:OCR 列表整理:去掉状态栏、重复项;太多时按字号/长度保留 80 条,再按阅读顺序排好
 static NSArray *trimOCRItems(NSArray *items) {
     NSMutableArray *out = [NSMutableArray array];
@@ -1213,6 +1236,15 @@ static NSString *shopPlatformOf(NSString *name) {
     if (!name.length) return nil;
     for (NSString *k in @[@"淘宝", @"天猫", @"京东", @"拼多多", @"闲鱼", @"唯品会", @"抖音", @"苏宁", @"得物", @"1688", @"当当"])
         if ([name containsString:k]) return k;
+    // v0.9.22:App 显示名可能是英文(京东在桌面上叫 JD)
+    NSString *l = name.lowercaseString;
+    NSDictionary *alias = @{@"jd": @"京东", @"taobao": @"淘宝", @"tmall": @"天猫", @"pinduoduo": @"拼多多", @"xianyu": @"闲鱼", @"vip": @"唯品会", @"dewu": @"得物", @"douyin": @"抖音"};
+    for (NSString *a in alias) {
+        if ([l isEqualToString:a] || [l hasPrefix:[a stringByAppendingString:@" "]] || [l hasPrefix:[a stringByAppendingString:@"."]]) return alias[a];
+    }
+    NSDictionary *bids = @{@"com.360buy.jdmobile": @"京东", @"com.taobao.taobao4iphone": @"淘宝", @"com.xunmeng.pinduoduo": @"拼多多",
+                           @"com.tmall.wireless": @"天猫", @"com.taobao.fleamarket": @"闲鱼", @"com.vipshop.iphone": @"唯品会"};
+    if (bids[l]) return bids[l];
     return nil;
 }
 static BOOL isCompareTask(NSString *t) {
@@ -1355,7 +1387,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             }
         }
         {   // v0.9.21:记下当前所在的购物平台
-            NSString *sp = (front.length && ![front isEqualToString:selfID] && ![front isEqualToString:@"com.apple.springboard"]) ? shopPlatformOf(agAppName(front)) : nil;
+            NSString *sp = (front.length && ![front isEqualToString:selfID] && ![front isEqualToString:@"com.apple.springboard"]) ? (shopPlatformOf(agAppName(front)) ?: shopPlatformOf(front)) : nil;
             if (sp) { curShop = sp; [visitedShops addObject:sp]; }
         }
         if ([screen isEqualToString:lastSig]) same++; else same = 0;
@@ -1512,10 +1544,15 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 id fd = act[@"found"];
                 NSString *fs = [fd isKindOfClass:NSString.class] ? fd : ([fd isKindOfClass:NSArray.class] ? [fd componentsJoinedByString:@";"] : nil);
                 NSString *ap = (front.length && ![front isEqualToString:@"com.apple.springboard"] && ![front isEqualToString:selfID]) ? agAppName(front) : nil;
-                NSString *tagName = shopPlatformOf(ap) ?: (ap.length ? ap : (curShop ?: @"其他"));
+                NSString *tagName = shopPlatformOf(ap) ?: (ap.length ? (shopPlatformOf(front) ?: ap) : (curShop ?: @"其他"));
                 int added = 0;
                 for (NSString *raw in [fs componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@";；\n"]]) {
                     NSString *f = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+                    while ([f hasPrefix:@"["] || [f hasPrefix:@"【"]) { // v0.9.22:模型自己写了 [平台] 前缀时去掉,避免“[拼多多] [拼多多]”
+                        NSRange r = [f rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"]】"]];
+                        if (r.location == NSNotFound || r.location > 8) break;
+                        f = [[f substringFromIndex:r.location + 1] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+                    }
                     if (f.length < 2) continue;
                     if (f.length > 60) f = [f substringToIndex:60];
                     NSString *line = [NSString stringWithFormat:@"[%@] %@", tagName, f];
@@ -1638,7 +1675,12 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
         }
 
         if ([action isEqualToString:@"done"] || [action isEqualToString:@"stop"]) {
-            if ([action isEqualToString:@"done"] && plan.count && !doneChecked && paOn(@"subgoal_plan", YES)) { // S8:完成自检
+            BOOL compareOK = NO; // v0.9.22:比价任务每个平台都记够了价格,就不再做子目标自检(省一次调用)
+            if ([action isEqualToString:@"done"] && compareTask && visitedShops.count) {
+                compareOK = YES;
+                for (NSString *sp in visitedShops) if (pricedCount(findings, sp) < 3) { compareOK = NO; break; }
+            }
+            if ([action isEqualToString:@"done"] && plan.count && !doneChecked && !compareOK && paOn(@"subgoal_plan", YES)) { // S8:完成自检
                 NSMutableArray *left = [NSMutableArray array];
                 for (NSUInteger i = 0; i < plan.count; i++) if (![planDone[i] boolValue]) [left addObject:[NSString stringWithFormat:@"%lu", (unsigned long)i + 1]];
                 if (left.count) {
@@ -1746,7 +1788,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             NSString *name = [act[@"name"] description] ?: @"";
             NSString *info = nil;
             NSString *bid = bundleForAppName(name, &info);
-            NSString *toShop = shopPlatformOf(bid ? agAppName(bid) : name) ?: shopPlatformOf(name);
+            NSString *toShop = shopPlatformOf(bid ? agAppName(bid) : name) ?: (shopPlatformOf(bid) ?: shopPlatformOf(name));
             if (compareTask && curShop && ![toShop isEqualToString:curShop] && pricedCount(findings, curShop) < 3 && ![leaveWarned containsObject:curShop]) {
                 [leaveWarned addObject:curShop]; // v0.9.21:每个平台只拦一次
                 result = [NSString stringWithFormat:@"未执行:「%@」还没用 found 记下 3 个商品价格(现在 %d 个)。请先在搜索结果里记下再换平台;确实搜不到就再次 open_app", curShop, pricedCount(findings, curShop)];
@@ -1762,6 +1804,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             }
             [history addObject:[NSString stringWithFormat:@"%d. open_app(%@) → %@", step, name, result]];
             afterAction(1.0, 4.0, 3); settled = YES;
+            if ([result isEqualToString:@"已打开"]) settleUntilLoaded(6.0);
             [queue removeAllObjects];
         } else if ([action isEqualToString:@"input_text"] || [action isEqualToString:@"set_clipboard"]) {
             BOOL typing = [action isEqualToString:@"input_text"];
@@ -1801,6 +1844,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                     if (hit) {
                         doTap([hit[@"x"] doubleValue], [hit[@"y"] doubleValue]);
                         afterAction(0.3, 2.5, 2);
+                        settleUntilLoaded(5.0);
                         [history addObject:[NSString stringWithFormat:@"%d. (程序已自动点了「搜索」,请看新屏幕)", step]];
                         agentSay(@"粘贴后已自动点“搜索”");
                         [queue removeAllObjects];

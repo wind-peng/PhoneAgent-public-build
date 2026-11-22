@@ -569,7 +569,7 @@ static NSData *attachJPEG(UIImage *img) {
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"高级设置(v0.9.21)";
+    self.title = @"高级设置(v0.9.22)";
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
     self.popupTV = [UITextView new];
@@ -589,9 +589,13 @@ static NSData *attachJPEG(UIImage *img) {
     UIButton *tokClr = [UIButton buttonWithType:UIButtonTypeSystem];
     [tokClr setTitle:@"累计清零" forState:UIControlStateNormal];
     [tokClr addTarget:self action:@selector(onTokClear) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *cacheT = [UIButton buttonWithType:UIButtonTypeSystem];
+    [cacheT setTitle:@"缓存测试(同一请求连发 3 次,约用 1 万 token)" forState:UIControlStateNormal];
+    cacheT.titleLabel.numberOfLines = 0;
+    [cacheT addTarget:self action:@selector(onCacheTest:) forControlEvents:UIControlEventTouchUpInside];
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
         [self hdr:@"Token 统计(每次任务结束也会在执行记录里显示本次用量)"],
-        self.tokL, tokClr,
+        self.tokL, tokClr, cacheT,
         [self sw:@"每次调用模型都在执行记录里写一行 Token 明细(第几步、几张图、输入/缓存/输出)" key:@"token_step_log" def:YES],
         [self hdr:@"模型请求"],
         [self sw:@"用函数调用(tools)输出动作(GLM/DeepSeek;不支持时自动退回 JSON)" key:@"use_tool_calls" def:YES],
@@ -607,6 +611,7 @@ static NSData *attachJPEG(UIImage *img) {
         [self hdr:@"动作执行"],
         [self sw:@"智能等待:动作后等画面稳定(代替固定等待)" key:@"smart_settle" def:YES],
         [self sw:@"输入文字后自动点“搜索”按钮(右上角或键盘上的)" key:@"auto_search" def:YES],
+        [self sw:@"打开 App / 点搜索后本地等页面加载完(少问模型一次 wait)" key:@"local_load_wait" def:YES],
         [self sw:@"点击没反应时在旁边自动重试一次(敏感按钮除外)" key:@"tap_retry" def:YES],
         [self sw:@"新滑动方式(60Hz 匀速、抬手前停顿防甩动)" key:@"smooth_swipe" def:YES],
         [self sw:@"应用触摸校准偏移(先在校准页自检)" key:@"apply_touch_offset" def:NO],
@@ -653,6 +658,23 @@ static NSData *attachJPEG(UIImage *img) {
 - (void)done { [self save]; [self dismissViewControllerAnimated:YES completion:nil]; }
 - (void)viewWillDisappear:(BOOL)animated { [super viewWillDisappear:animated]; [self save]; }
 - (void)onTokClear { tokClearTotal(); self.tokL.text = tokSummary(YES); }
+- (void)onCacheTest:(UIButton *)btn {
+    if (gAgentRunning) return;
+    btn.enabled = NO;
+    [btn setTitle:@"缓存测试中…" forState:UIControlStateNormal];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *r = llmCacheTest();
+        agentSay([@"[缓存测试] " stringByAppendingString:r]);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            btn.enabled = YES;
+            [btn setTitle:@"缓存测试(同一请求连发 3 次,约用 1 万 token)" forState:UIControlStateNormal];
+            self.tokL.text = tokSummary(YES);
+            UIAlertController *a = [UIAlertController alertControllerWithTitle:@"缓存测试结果" message:r preferredStyle:UIAlertControllerStyleAlert];
+            [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:a animated:YES completion:nil];
+        });
+    });
+}
 - (void)onOCRTest { [self.navigationController pushViewController:[OCRTestVC new] animated:YES]; }
 - (void)onOCRClear {
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"清除识别缓存" message:@"只把 /var/mobile/Library/Caches/本App 目录改名为 .bak,不动设置和 Key。之后需要从后台划掉 PhoneAgent 再打开。" preferredStyle:UIAlertControllerStyleAlert];
