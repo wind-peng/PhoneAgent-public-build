@@ -569,7 +569,7 @@ static NSData *attachJPEG(UIImage *img) {
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"高级设置(v0.9.28)";
+    self.title = @"高级设置(v0.9.29)";
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
     self.popupTV = [UITextView new];
@@ -593,9 +593,14 @@ static NSData *attachJPEG(UIImage *img) {
     [cacheT setTitle:@"缓存对照测试(带/不带工具各 2 次,约用 1.3 万 token)" forState:UIControlStateNormal];
     cacheT.titleLabel.numberOfLines = 0;
     [cacheT addTarget:self action:@selector(onCacheTest:) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *axT = [UIButton buttonWithType:UIButtonTypeSystem];
+    [axT setTitle:@"无障碍探测(点后 6 秒内切到微信/淘宝/美团等,停 10 秒再回来看执行记录)" forState:UIControlStateNormal];
+    axT.titleLabel.numberOfLines = 0;
+    [axT addTarget:self action:@selector(onAXProbe) forControlEvents:UIControlEventTouchUpInside];
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
         [self hdr:@"Token 统计(每次任务结束也会在执行记录里显示本次用量)"],
         self.tokL, tokClr, cacheT,
+        [self hdr:@"实验"], axT,
         [self sw:@"每次调用模型都在执行记录里写一行 Token 明细(第几步、几张图、输入/缓存/输出)" key:@"token_step_log" def:YES],
         [self hdr:@"模型请求"],
         [self sw:@"用函数调用(tools)输出动作(GLM/DeepSeek;不支持时自动退回 JSON)" key:@"use_tool_calls" def:YES],
@@ -662,6 +667,12 @@ static NSData *attachJPEG(UIImage *img) {
 }
 - (void)done { [self save]; [self dismissViewControllerAnimated:YES completion:nil]; }
 - (void)viewWillDisappear:(BOOL)animated { [super viewWillDisappear:animated]; [self save]; }
+- (void)onAXProbe {
+    axProbeAfterDelay();
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"无障碍探测" message:@"6 秒后开始。现在切到要测的 App(比如微信聊天页、淘宝首页),停 10 秒左右再回来,结果写在执行记录里。不会点击任何东西。" preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
 - (void)onTokClear { tokClearTotal(); self.tokL.text = tokSummary(YES); }
 - (void)onCacheTest:(UIButton *)btn {
     if (gAgentRunning) return;

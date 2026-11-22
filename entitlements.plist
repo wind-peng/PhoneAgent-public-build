@@ -17,5 +17,7 @@
     <string>AGXDeviceUserClient</string>
   </array>
   <key>com.apple.springboard.show-alert</key><true/>
+  <key>com.apple.private.accessibility.inspection.allow</key><true/>
+  <key>com.apple.accessibility.api</key><true/>
 </dict>
 </plist>

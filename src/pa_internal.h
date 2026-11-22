@@ -106,6 +106,7 @@ void expFinish(NSString *task, NSString *status);
 NSString *frameKey(void);
 NSString *startServer(void);
 void agentSay(NSString *m);
+void axProbeAfterDelay(void); // v0.9.29 无障碍树探测
 void doLongPress(double x, double y, int ms);
 NSString *bundleForAppName(NSString *name, NSString **info);
 NSString *agPostOnce(NSString *base, NSString *key, NSDictionary *body, BOOL honorStop, double timeout, NSString **finish, NSString **err);
