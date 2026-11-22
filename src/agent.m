@@ -1425,6 +1425,11 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
         if (paOn(@"input_box_detect", YES)) { // v0.9.27:空输入框没有文字,从截图里找出来标成「[输入框]」;框里的提示文字/图标也注明
             NSArray *boxes = nil;
             @try { boxes = detectInputBoxes(img, items); } @catch (NSException *ex) { boxes = nil; }
+            if (boxes.count && allItems.count >= 25) { // v0.9.34:内容很多的页面(商品流)中间的灰框多半是商品卡,不当输入框;输入框一般在顶部或底部
+                CGSize scb = screenSize(); NSMutableArray *kb = [NSMutableArray array];
+                for (NSDictionary *bx in boxes) { double by = [bx[@"y"] doubleValue]; if (by > scb.height * 0.22 && by < scb.height * 0.62) continue; [kb addObject:bx]; }
+                boxes = kb;
+            }
             if (boxes.count) {
                 NSMutableArray *m = [NSMutableArray array];
                 for (NSDictionary *it in allItems) {
@@ -1741,7 +1746,10 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                     }
                     if (f.length < 2) continue;
                     if (f.length > 60) f = [f substringToIndex:60];
-                    if (compareTask && [f rangeOfCharacterFromSet:NSCharacterSet.decimalDigitCharacterSet].location == NSNotFound) continue; // v0.9.33:比价时没有价格数字的“记录”不收
+                    if (compareTask) { // v0.9.34:比价记录要有价格(¥/元/小数),「31CM」这种不算
+                        static NSRegularExpression *prx; if (!prx) prx = [NSRegularExpression regularExpressionWithPattern:@"[¥￥]\\s*\\d|\\d\\s*元|\\d+\\.\\d+|价\\s*\\d" options:0 error:nil];
+                        if (prx && ![prx firstMatchInString:f options:0 range:NSMakeRange(0, f.length)]) continue;
+                    } // v0.9.33:比价时没有价格数字的“记录”不收
                     NSString *line = [NSString stringWithFormat:@"[%@] %@", tagName, f];
                     if ([findings containsObject:line] || findings.count >= 40) continue;
                     if (findingDup(findings, line)) continue; // v0.9.26:同平台同价格、名字互相包含的视为重复

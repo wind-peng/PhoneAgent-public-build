@@ -249,8 +249,20 @@ static void axCollect(id el, int depth, NSMutableArray *acc, NSMutableSet *seen,
 
 // 返回元素列表(屏幕点坐标、中心点),每项:text x y w h ax=YES,可带 axbtn / axin(可输入) / axsel(已选中)
 // v0.9.33:无障碍文字整理:人民币→¥;商品卡这类长标签截短,保留价格/销量部分
+static id axHitAt(CGPoint p) { // v0.9.34:按坐标取元素(设备上可用的 C 方式)
+    Class cU = NSClassFromString(@"AXUIElement"), cE = NSClassFromString(@"AXElement");
+    id u = axCallPoint(cU, @"uiElementAtCoordinate:", p);
+    if (!u || !cE) return nil;
+    id el = nil; id w = [cE alloc]; SEL s = NSSelectorFromString(@"initWithUIElement:");
+    if ([w respondsToSelector:s]) { @try { el = ((id (*)(id, SEL, id))objc_msgSend)(w, s, u); } @catch (NSException *e) {} }
+    return el;
+}
 static NSString *axTidy(NSString *t) {
     t = [t stringByReplacingOccurrencesOfString:@"人民币" withString:@"¥"];
+    { // v0.9.34:「128.2元」这类写法也统一成 ¥128.2
+        static NSRegularExpression *rx; if (!rx) rx = [NSRegularExpression regularExpressionWithPattern:@"(?<![¥\\d.])(\\d+(?:\\.\\d+)?)元" options:0 error:nil];
+        if (rx) t = [rx stringByReplacingMatchesInString:t options:0 range:NSMakeRange(0, t.length) withTemplate:@"¥$1"];
+    }
     t = [t stringByReplacingOccurrencesOfString:@"¥ " withString:@"¥"];
     while ([t containsString:@"  "]) t = [t stringByReplacingOccurrencesOfString:@"  " withString:@" "];
     if (t.length <= 50) return t;
@@ -293,6 +305,31 @@ NSArray *axReadScreen(NSString *frontBid, int *msOut, NSString **howOut) {
             int chLab = 0;
             for (id e in acc) { NSString *l = axKV(e, @"label"); if ([l isKindOfClass:NSString.class] && l.length) chLab++; }
             if (chLab > exLab) { list = acc; how = @"children"; }
+        }
+        { // v0.9.34:列表里几乎没有中间区域的内容(京东搜索页商品卡不在列表里),补一次稀疏网格取点
+            int content = 0;
+            for (id e in list) {
+                NSString *l = axKV(e, @"label"); id fv = axKV(e, @"frame");
+                if (![l isKindOfClass:NSString.class] || l.length < 6 || ![fv isKindOfClass:NSValue.class] || strcmp([(NSValue *)fv objCType], @encode(CGRect)) != 0) continue;
+                CGFloat my = CGRectGetMidY([(NSValue *)fv CGRectValue]);
+                if (my > sz.height * 0.15 && my < sz.height * 0.85) content++;
+            }
+            if (content < 3) {
+                NSMutableArray *ml = [list mutableCopy] ?: [NSMutableArray array];
+                NSMutableSet *hk = [NSMutableSet set];
+                int got = 0;
+                for (CGFloat y = sz.height * 0.15; y < sz.height * 0.92; y += 60)
+                    for (CGFloat fx = 0.25; fx < 0.8; fx += 0.5) {
+                        if (CFAbsoluteTimeGetCurrent() - t0 > 0.6) break;
+                        id el = axHitAt(CGPointMake(sz.width * fx, y));
+                        if (!el) continue;
+                        NSString *l = axKV(el, @"label"); id fv = axKV(el, @"frame");
+                        NSString *k = [NSString stringWithFormat:@"%@|%@", l ?: @"", fv ?: @""];
+                        if ([hk containsObject:k]) continue;
+                        [hk addObject:k]; [ml addObject:el]; got++;
+                    }
+                if (got) { list = ml; how = [how stringByAppendingString:@"+grid"]; }
+            }
         }
         if (howOut) *howOut = how;
         NSMutableArray *out = [NSMutableArray array];
@@ -344,6 +381,7 @@ NSArray *axReadScreen(NSString *frontBid, int *msOut, NSString **howOut) {
                 break;
             }
         }
+        if (out.count < 3) { gAXFrontCache = nil; gAXFrontBid = nil; } // v0.9.34:读到太少多半是启动时缓存的旧对象,下次重新取
         if (msOut) *msOut = (int)((CFAbsoluteTimeGetCurrent() - t0) * 1000);
         return out;
     } @catch (NSException *e) {
