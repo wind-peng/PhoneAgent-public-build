@@ -624,7 +624,7 @@ static NSData *attachJPEG(UIImage *img) {
         self.popupTV,
         [self hdr:@"识别"],
         [self sw:@"检测无文字小图标(×、返回箭头等)" key:@"icon_detect" def:YES],
-        [self sw:@"合并同一行相邻的 OCR 碎片" key:@"ocr_merge" def:YES],
+        [self sw:@"合并同一行相邻的 OCR 碎片" key:@"ocr_merge" def:NO],
         [self sw:@"Live Text 把隔开的标签拆成单独条目" key:@"ocr_split_gap" def:YES],
         [self sw:@"右上角小字放大再识别一次" key:@"ocr_corner" def:YES],
         [self sw:@"OCR 用 Live Text(相册同款引擎,能认中文;失败自动退回)" key:@"ocr_livetext" def:YES],

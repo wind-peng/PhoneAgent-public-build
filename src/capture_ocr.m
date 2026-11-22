@@ -419,7 +419,7 @@ static NSArray *cornerPass(UIImage *src, NSArray *have) {
 
 static NSArray *postOCR(UIImage *src, NSArray *r) {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-    BOOL merge = [d objectForKey:@"ocr_merge"] ? [d boolForKey:@"ocr_merge"] : YES;
+    BOOL merge = [d objectForKey:@"ocr_merge"] ? [d boolForKey:@"ocr_merge"] : NO; // v0.9.23:默认不合并
     BOOL corner = [d objectForKey:@"ocr_corner"] ? [d boolForKey:@"ocr_corner"] : YES;
     if (corner && !ocrAccurateOn()) { @try { r = cornerPass(src, r); } @catch (NSException *ex) {} }
     if (merge) r = mergeFragments(r);
