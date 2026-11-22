@@ -569,7 +569,7 @@ static NSData *attachJPEG(UIImage *img) {
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"高级设置(v0.9.20)";
+    self.title = @"高级设置(v0.9.21)";
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
     self.popupTV = [UITextView new];
@@ -589,16 +589,10 @@ static NSData *attachJPEG(UIImage *img) {
     UIButton *tokClr = [UIButton buttonWithType:UIButtonTypeSystem];
     [tokClr setTitle:@"累计清零" forState:UIControlStateNormal];
     [tokClr addTarget:self action:@selector(onTokClear) forControlEvents:UIControlEventTouchUpInside];
-    UIButton *ocrT = [UIButton buttonWithType:UIButtonTypeSystem];
-    [ocrT setTitle:@"OCR 自检(中文识别是否正常)" forState:UIControlStateNormal];
-    [ocrT addTarget:self action:@selector(onOCRTest) forControlEvents:UIControlEventTouchUpInside];
-    UIButton *ocrC = [UIButton buttonWithType:UIButtonTypeSystem];
-    [ocrC setTitle:@"清除 PhoneAgent 的识别缓存(改名备份)" forState:UIControlStateNormal];
-    [ocrC addTarget:self action:@selector(onOCRClear) forControlEvents:UIControlEventTouchUpInside];
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
-        [self hdr:@"OCR 诊断"], ocrT, ocrC,
         [self hdr:@"Token 统计(每次任务结束也会在执行记录里显示本次用量)"],
         self.tokL, tokClr,
+        [self sw:@"每次调用模型都在执行记录里写一行 Token 明细(第几步、几张图、输入/缓存/输出)" key:@"token_step_log" def:YES],
         [self hdr:@"模型请求"],
         [self sw:@"用函数调用(tools)输出动作(GLM/DeepSeek;不支持时自动退回 JSON)" key:@"use_tool_calls" def:YES],
         [self sw:@"DeepSeek 分档:常规步骤 deepseek-flash,卡住/规划/完成自检用 deepseek-v4-pro" key:@"ds_tiering" def:YES],
@@ -606,11 +600,13 @@ static NSData *attachJPEG(UIImage *img) {
         [self sw:@"文字步骤:OCR 足够时不发截图(更快更省)" key:@"text_only_steps" def:YES],
         [self sw:@"允许模型一次给出多个连续动作(逐个核对屏幕)" key:@"multi_action" def:YES],
         [self sw:@"子目标规划 + 完成前自检" key:@"subgoal_plan" def:YES],
-        [self sw:@"经验宏回放(相同任务先本地回放,OCR 核对)" key:@"macro_replay" def:YES],
+        [self sw:@"经验宏回放(相同任务先本地回放,OCR 核对;默认关)" key:@"macro_replay" def:NO],
+        [self sw:@"比价任务:每个进过的平台记下 3 个商品价格才算完成" key:@"compare_check" def:YES],
         [self hdr:@"备用模型(主模型连续限流/出错/格式错误时切换;DeepSeek 会自动在 flash 和 v4-pro 之间切换,无需填写)"],
         self.bBase, self.bKey, self.bModel,
         [self hdr:@"动作执行"],
         [self sw:@"智能等待:动作后等画面稳定(代替固定等待)" key:@"smart_settle" def:YES],
+        [self sw:@"输入文字后自动点“搜索”按钮(右上角或键盘上的)" key:@"auto_search" def:YES],
         [self sw:@"点击没反应时在旁边自动重试一次(敏感按钮除外)" key:@"tap_retry" def:YES],
         [self sw:@"新滑动方式(60Hz 匀速、抬手前停顿防甩动)" key:@"smooth_swipe" def:YES],
         [self sw:@"应用触摸校准偏移(先在校准页自检)" key:@"apply_touch_offset" def:NO],
@@ -624,7 +620,6 @@ static NSData *attachJPEG(UIImage *img) {
         [self sw:@"合并同一行相邻的 OCR 碎片" key:@"ocr_merge" def:YES],
         [self sw:@"右上角小字放大再识别一次" key:@"ocr_corner" def:YES],
         [self sw:@"OCR 用 Live Text(相册同款引擎,能认中文;失败自动退回)" key:@"ocr_livetext" def:YES],
-        [self sw:@"OCR 精确模式(较慢;闪退会自动关闭)" key:@"ocr_accurate" def:NO],
         [self hdr:@"自我恢复与长任务"],
         [self sw:@"目标 App 意外退出时自动重新打开" key:@"auto_relaunch" def:YES],
         [self sw:@"录屏画面卡住时暂停提醒" key:@"stale_frame_check" def:YES],

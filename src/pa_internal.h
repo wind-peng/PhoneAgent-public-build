@@ -154,6 +154,7 @@ NSArray *hybridMessages2(NSString *task, NSString *history, UIImage *img, NSData
 
 // v0.9.6r Token 统计
 void tokAdd(id usage);
+extern NSString *gTokTag; // v0.9.21:当前这次模型调用的用途(写进每步 Token 明细)
 void tokReset(void);
 NSString *tokSummary(BOOL total);
 void tokClearTotal(void);

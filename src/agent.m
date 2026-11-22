@@ -705,7 +705,7 @@ static int expReplay(NSDictionary *entry, NSMutableArray *history, int *done, NS
 // 返回给模型看的一句说明;没有可用经验返回 nil;用户停止了任务时 *stopped = YES
 static NSString *expTryReplay(NSString *task, NSMutableArray *history, BOOL *stopped) {
     *stopped = NO;
-    if (!expEnabled() || !expReplayEnabled() || !paOn(@"macro_replay", YES)) return nil;
+    if (!expEnabled() || !expReplayEnabled() || !paOn(@"macro_replay", NO)) return nil;
     double score = 0;
     NSMutableDictionary *e = expFind(task, &score);
     if (!e || score < 0.85 || [e[@"steps"] count] < 2) return nil;
@@ -1208,6 +1208,26 @@ static NSString *thumbSig(NSData *th) {
 }
 
 
+// ---- v0.9.21:结果记录(found)与比价完成检查 ----
+static NSString *shopPlatformOf(NSString *name) {
+    if (!name.length) return nil;
+    for (NSString *k in @[@"淘宝", @"天猫", @"京东", @"拼多多", @"闲鱼", @"唯品会", @"抖音", @"苏宁", @"得物", @"1688", @"当当"])
+        if ([name containsString:k]) return k;
+    return nil;
+}
+static BOOL isCompareTask(NSString *t) {
+    for (NSString *k in @[@"比价", @"比较价格", @"价格比较", @"对比价格", @"价格对比", @"哪家便宜", @"哪个便宜", @"最便宜"])
+        if ([t containsString:k]) return YES;
+    return NO;
+}
+static BOOL hasDigitStr(NSString *t) { return [t rangeOfCharacterFromSet:NSCharacterSet.decimalDigitCharacterSet].location != NSNotFound; }
+// 某个平台记下的、带数字(价格)的结果条数
+static int pricedCount(NSArray *findings, NSString *plat) {
+    int n = 0; NSString *tag = [NSString stringWithFormat:@"[%@]", plat];
+    for (NSString *f in findings) if ([f hasPrefix:tag] && hasDigitStr([f substringFromIndex:tag.length])) n++;
+    return n;
+}
+
 static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString *model) {
     if ([model.lowercaseString containsString:@"autoglm"]) { agentRunAutoGLM(task, base, key, model); return; }
     gCurrentModel = model;
@@ -1238,6 +1258,12 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     NSString *lastPopupKey = nil;
     NSString *taskApp = nil; BOOL expectHome = NO;
     UIImage *prevImg = nil;
+    NSMutableArray *findings = [NSMutableArray array];   // v0.9.21:模型用 found 记下的结果("[平台] 内容")
+    NSMutableOrderedSet *visitedShops = [NSMutableOrderedSet orderedSet]; // 比价任务里进过的购物平台
+    NSMutableSet *leaveWarned = [NSMutableSet set];
+    NSString *curShop = nil; int compareRejects = 0;
+    BOOL compareTask = isCompareTask(gTaskDisplay.length ? gTaskDisplay : task) && paOn(@"compare_check", YES);
+    BOOL glmModel = [model.lowercaseString hasPrefix:@"glm"];
     CGSize sc = screenSize();
     int startStep = 1;
     int blockedHits = 0;
@@ -1249,6 +1275,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
         for (NSUInteger i = 0; i < plan.count; i++) [planDone addObject:@([cp[@"planDone"] isKindOfClass:NSArray.class] && i < [cp[@"planDone"] count] ? [cp[@"planDone"][i] boolValue] : NO)];
         startStep = MAX(1, [cp[@"step"] intValue] + 1);
         taskApp = [cp[@"app"] isKindOfClass:NSString.class] && [cp[@"app"] length] ? cp[@"app"] : nil;
+        for (id f in cp[@"findings"]) if ([f isKindOfClass:NSString.class]) [findings addObject:f];
         [history addObject:[NSString stringWithFormat:@"(PhoneAgent 曾被中断,现在从第 %d 步继续;请先看当前屏幕确认状态)", startStep]];
         agentSay([NSString stringWithFormat:@"继续上次任务(从第 %d 步):%@", startStep, task]);
         if (taskApp.length && ![frontmostBundleID() isEqualToString:taskApp]) { openApp(taskApp); afterAction(1.0, 4.0, 3); }
@@ -1326,6 +1353,10 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 lastSig = @""; same = 0; [queue removeAllObjects];
                 step--; continue;
             }
+        }
+        {   // v0.9.21:记下当前所在的购物平台
+            NSString *sp = (front.length && ![front isEqualToString:selfID] && ![front isEqualToString:@"com.apple.springboard"]) ? shopPlatformOf(agAppName(front)) : nil;
+            if (sp) { curShop = sp; [visitedShops addObject:sp]; }
         }
         if ([screen isEqualToString:lastSig]) same++; else same = 0;
         lastSig = [screen copy];
@@ -1424,6 +1455,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             while (histProg.count < history.count) [histProg addObject:progress ?: @""];
             NSMutableString *hist = [NSMutableString string];
             if (progress.length) [hist appendFormat:@"当前进度:%@\n", progress]; // 进度放在 8 条历史窗口之外,始终带上
+            if (findings.count) [hist appendFormat:@"已记录的结果(程序保存,写 done 时据此汇总):\n%@\n", [findings componentsJoinedByString:@"\n"]];
             if (plan.count) {
                 [hist appendString:@"子目标:\n"];
                 BOOL marked = NO;
@@ -1456,7 +1488,9 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             dispatch_group_wait(encGroup, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
             NSArray *msgs = hybridMessages2(task, hist, img, hq ? nil : jpgPre, prevForModel, allItems, includeImage, hq, &err);
             if (!msgs) { agentSay([@"截图视觉请求失败:" stringByAppendingString:err ?: @"?"]); break; }
+            gTokTag = [NSString stringWithFormat:@"第 %d 步(%@)", step, !includeImage ? @"纯文字" : ((glmModel && prevForModel) ? @"2 张图" : @"1 张图")];
             act = callLLM(base, key, model, msgs, &err); // callLLM 内部已经最多重试 5 次
+            gTokTag = nil;
             if (!gAgentRunning) break;
             if (!act) { agentSay([@"调用模型失败,任务停止:" stringByAppendingString:err ?: @"?"]); break; }
             // A2:参数不合法:带一句简短说明重新问一次,而不是直接执行
@@ -1466,12 +1500,30 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 NSMutableArray *m2 = [msgs mutableCopy];
                 [m2 addObject:@{@"role": @"user", @"content": [NSString stringWithFormat:@"(系统提示:你上一个动作参数无效:%@。请重新给出一个参数完整、坐标在 780x1688 范围内的动作。)", bad]}];
                 NSString *e2 = nil;
+                gTokTag = [NSString stringWithFormat:@"第 %d 步(参数无效重问)", step];
                 NSDictionary *act2 = callLLM(base, key, model, m2, &e2);
+                gTokTag = nil;
                 if (!gAgentRunning) break;
                 if (act2 && !validateAct(act2, allItems.count)) act = act2;
             }
             prevImg = img;
             if ([act[@"need_image"] respondsToSelector:@selector(boolValue)] && [act[@"need_image"] boolValue]) needImage = YES;
+            {   // v0.9.21:保存模型记下的结果
+                id fd = act[@"found"];
+                NSString *fs = [fd isKindOfClass:NSString.class] ? fd : ([fd isKindOfClass:NSArray.class] ? [fd componentsJoinedByString:@";"] : nil);
+                NSString *ap = (front.length && ![front isEqualToString:@"com.apple.springboard"] && ![front isEqualToString:selfID]) ? agAppName(front) : nil;
+                NSString *tagName = shopPlatformOf(ap) ?: (ap.length ? ap : (curShop ?: @"其他"));
+                int added = 0;
+                for (NSString *raw in [fs componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@";；\n"]]) {
+                    NSString *f = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+                    if (f.length < 2) continue;
+                    if (f.length > 60) f = [f substringToIndex:60];
+                    NSString *line = [NSString stringWithFormat:@"[%@] %@", tagName, f];
+                    if ([findings containsObject:line] || findings.count >= 40) continue;
+                    [findings addObject:line]; added++;
+                }
+                if (added) agentSay([NSString stringWithFormat:@"记下 %d 条结果(共 %lu 条)", added, (unsigned long)findings.count]);
+            }
             // 12:子目标
             id pl = act[@"plan"];
             if ([pl isKindOfClass:NSArray.class] && [pl count] && (!plan.count || planning)) {
@@ -1597,7 +1649,20 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                     continue;
                 }
             }
+            if ([action isEqualToString:@"done"] && compareTask && visitedShops.count) { // v0.9.21:比价完成检查
+                NSMutableArray *lack = [NSMutableArray array];
+                for (NSString *sp in visitedShops) { int n = pricedCount(findings, sp); if (n < 3) [lack addObject:[NSString stringWithFormat:@"%@(%d 个)", sp, n]]; }
+                if (lack.count && compareRejects < 2) {
+                    compareRejects++;
+                    agentSay([NSString stringWithFormat:@"比价检查:%@ 记下的商品价格不足 3 个,让模型补上", [lack componentsJoinedByString:@"、"]]);
+                    [history addObject:[NSString stringWithFormat:@"%d. (系统提示:比价任务要求每个进过的平台至少用 found 记下 3 个具体商品和价格。%@ 还不够。请回到这些平台看搜索结果并用 found 记下,再 done;如果某平台确实搜不到,在 done 的 text 里说明原因)", step, [lack componentsJoinedByString:@"、"]]];
+                    lastSig = @""; same = 0; [queue removeAllObjects];
+                    continue;
+                }
+                if (lack.count) agentSay([NSString stringWithFormat:@"提示:%@ 的价格记录仍不足 3 个,结果可能不完整", [lack componentsJoinedByString:@"、"]]);
+            }
             agentSay([NSString stringWithFormat:@"%@:%@", [action isEqualToString:@"done"] ? @"任务完成" : @"任务停止", [act[@"text"] description] ?: @""]);
+            if ([action isEqualToString:@"done"] && findings.count) agentSay([NSString stringWithFormat:@"已记录的结果:\n%@", [findings componentsJoinedByString:@"\n"]]);
             break;
         }
         {   // 同一个动作(同目标/同坐标/同文字)连续重复:3 次提醒模型换办法,5 次停止任务
@@ -1681,7 +1746,11 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             NSString *name = [act[@"name"] description] ?: @"";
             NSString *info = nil;
             NSString *bid = bundleForAppName(name, &info);
-            if (isBlockedApp(name, nil) || (bid && isBlockedApp(agAppName(bid), bid))) {
+            NSString *toShop = shopPlatformOf(bid ? agAppName(bid) : name) ?: shopPlatformOf(name);
+            if (compareTask && curShop && ![toShop isEqualToString:curShop] && pricedCount(findings, curShop) < 3 && ![leaveWarned containsObject:curShop]) {
+                [leaveWarned addObject:curShop]; // v0.9.21:每个平台只拦一次
+                result = [NSString stringWithFormat:@"未执行:「%@」还没用 found 记下 3 个商品价格(现在 %d 个)。请先在搜索结果里记下再换平台;确实搜不到就再次 open_app", curShop, pricedCount(findings, curShop)];
+            } else if (isBlockedApp(name, nil) || (bid && isBlockedApp(agAppName(bid), bid))) {
                 result = [NSString stringWithFormat:@"「%@」在用户设置的禁止进入的 App 列表里,不能打开。请换别的方式完成,或用 ask_user/stop 说明。", name];
             } else if (bid && openApp(bid)) { result = @"已打开"; gLastApp = bid; taskApp = bid; expectHome = NO; checkStale = YES; expRecord(@{@"a": @"open_app", @"name": name}); }
             else {
@@ -1716,6 +1785,27 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 [history addObject:[NSString stringWithFormat:@"%d. input_text(%@,%@)", step, usedID ? [NSString stringWithFormat:@"id=%ld", (long)oid] : [NSString stringWithFormat:@"%.0f,%.0f", xpx, ypx], text]];
                 expRecord(@{@"a": @"input_text", @"text": text, @"t": usedID ? (usedIcon ? @"" : idText) : ([act[@"target"] description] ?: @""), @"x": @(x), @"y": @(y), @"anchors": localOK ? expAnchors(items) : @[]});
                 afterAction(0.2, 1.5, 1); settled = YES;
+                if (!note.length && paOn(@"auto_search", YES)) { // v0.9.21:粘贴后找到“搜索”按钮(右上角或键盘右下角)就自动点
+                    NSString *e3 = nil;
+                    UIImage *im3 = takeScreenshot(&e3);
+                    NSArray *it3 = im3 ? ocrImage(im3, &e3) : nil;
+                    NSDictionary *hit = nil;
+                    for (NSDictionary *it in it3) {
+                        NSString *t = [[[it[@"text"] description] stringByReplacingOccurrencesOfString:@" " withString:@""] lowercaseString];
+                        if (![t isEqualToString:@"搜索"] && ![t isEqualToString:@"search"]) continue;
+                        double ix = [it[@"x"] doubleValue], iy = [it[@"y"] doubleValue];
+                        BOOL topRight = iy < sc.height * 0.15 && ix > sc.width * 0.6;
+                        BOOL keyRet = iy > sc.height * 0.55 && ix > sc.width * 0.65;
+                        if (topRight || keyRet) { hit = it; if (topRight) break; }
+                    }
+                    if (hit) {
+                        doTap([hit[@"x"] doubleValue], [hit[@"y"] doubleValue]);
+                        afterAction(0.3, 2.5, 2);
+                        [history addObject:[NSString stringWithFormat:@"%d. (程序已自动点了「搜索」,请看新屏幕)", step]];
+                        agentSay(@"粘贴后已自动点“搜索”");
+                        [queue removeAllObjects];
+                    }
+                }
             } else {
                 BOOL stranded = NO;
                 BOOL ok = writeClipboardInForeground(text, hintBid, &note, &stranded);
@@ -1777,7 +1867,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             NSUInteger h0 = history.count > 30 ? history.count - 30 : 0;
             cpSave(@{@"task": task ?: @"", @"display": gTaskDisplay ?: @"", @"step": @(step), @"progress": progress ?: @"",
                      @"history": [history subarrayWithRange:NSMakeRange(h0, history.count - h0)], @"plan": [plan copy], @"planDone": [planDone copy],
-                     @"app": taskApp ?: @"", @"model": model ?: @""});
+                     @"app": taskApp ?: @"", @"model": model ?: @"", @"findings": [findings copy]});
         }
     }
     if (gAgentRunning) agentSay(@"任务结束");
@@ -1789,6 +1879,10 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
 void agentRun(NSString *task, NSString *base, NSString *key, NSString *model) {
     taskRunBegin(task);
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    if (![ud boolForKey:@"mig_0921"]) { // v0.9.21:经验回放改为默认关,清掉以前保存的开关;精确 OCR 停用
+        [ud removeObjectForKey:@"macro_replay"]; [ud removeObjectForKey:@"exp_replay_on"]; [ud setBool:NO forKey:@"ocr_accurate"];
+        [ud setBool:YES forKey:@"mig_0921"];
+    }
     BOOL autoCast = [ud objectForKey:@"auto_cast"] ? [ud boolForKey:@"auto_cast"] : YES;
     BOOL proceed = YES;
     if (autoCast && !broadcastAlive()) {

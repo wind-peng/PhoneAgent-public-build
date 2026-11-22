@@ -262,6 +262,7 @@ NSString *agPostOnce(NSString *base, NSString *key, NSDictionary *body, BOOL hon
 
 #pragma mark - Token 统计(v0.9.9)
 static long long gTokIn, gTokOut, gTokCache, gTokReason; static int gTokCalls;
+NSString *gTokTag;
 static long long numOf(id v) { return [v respondsToSelector:@selector(longLongValue)] ? [v longLongValue] : 0; }
 void tokAdd(id usage) {
     if (![usage isKindOfClass:NSDictionary.class]) return;
@@ -281,6 +282,9 @@ void tokAdd(id usage) {
         [ud setObject:@([[ud objectForKey:@"tok_total_cache"] longLongValue] + cache) forKey:@"tok_total_cache"];
         [ud setObject:@([[ud objectForKey:@"tok_total_calls"] longLongValue] + 1) forKey:@"tok_total_calls"];
     }
+    if (gAgentRunning && paOn(@"token_step_log", YES)) // v0.9.21:每次调用一行明细
+        agentSay([NSString stringWithFormat:@"[Token] %@:输入 %lld(缓存 %lld),输出 %lld%@", gTokTag.length ? gTokTag : @"其他调用",
+                  in, cache, out, reason > 0 ? [NSString stringWithFormat:@"(思考 %lld)", reason] : @""]);
 }
 void tokReset(void) { @synchronized (NSUserDefaults.class) { gTokIn = gTokOut = gTokCache = gTokReason = 0; gTokCalls = 0; } }
 static NSString *fmtTok(long long n) { return n >= 10000 ? [NSString stringWithFormat:@"%.1f 万", n / 10000.0] : [NSString stringWithFormat:@"%lld", n]; }
@@ -320,7 +324,8 @@ static NSArray *agentTools(void) {
             @"risk": @{@"type": @"string", @"description": @"对外影响或难以撤销时写明后果,否则留空"},
             @"plan": @{@"type": @"array", @"items": str, @"description": @"只在被要求时给出:3-6 个子目标"},
             @"subgoal_done": @{@"type": @"integer", @"description": @"刚刚完成的子目标编号(没有就不填)"},
-            @"need_image": @{@"type": @"boolean", @"description": @"下一步需要看截图时设为 true"}};
+            @"need_image": @{@"type": @"boolean", @"description": @"下一步需要看截图时设为 true"},
+            @"found": @{@"type": @"string", @"description": @"这一屏看到的、任务需要的结果(如 商品名 价格),每条用;分隔,程序会保存;没有就不填"}};
         NSDictionary *xy = @{@"id": @{@"type": @"integer", @"description": @"OCR 列表编号(优先)"}, @"x": num, @"y": num};
         NSArray *defs = @[
             @[@"tap", @"点击。有文字的目标优先只给 id;无文字图标给 x,y(780x1688 截图像素)", xy, @[]],
@@ -635,7 +640,8 @@ static NSString *const kAgentSystem =
 @"11. 如果请求里提供了工具(函数):用调用工具的方式给出动作,每个动作对应一个同名工具,参数和上面的 JSON 字段相同,不要再输出 JSON 文本。没有工具时才输出 JSON。\n"
 @"12. 可选字段:plan(字符串数组,只在用户消息要求时给出 3-6 个子目标);subgoal_done(刚完成的子目标编号);need_image(下一步需要看截图时设为 true)。\n"
 @"13. 有的步骤只给 OCR 列表、不附截图(用户消息会说明)。OCR 列表里标“[图标]”的是检测到的无文字小图标(可能是关闭×、返回箭头等),可以用 id 点击;看不清或需要看图标/图片时,先设 need_image=true 或用 wait。\n"
-@"14. 非常有把握时(例如在同一页面连续点几个确定的按钮),可以一次给出最多 3 个连续动作:调用多个工具,或在 JSON 里用 actions 数组(每项是一个动作对象)。程序会逐个执行并核对屏幕,屏幕变化不符合预期就放弃剩下的。done、stop、ask_user 不要和别的动作放在一起。";
+@"14. 非常有把握时(例如在同一页面连续点几个确定的按钮),可以一次给出最多 3 个连续动作:调用多个工具,或在 JSON 里用 actions 数组(每项是一个动作对象)。程序会逐个执行并核对屏幕,屏幕变化不符合预期就放弃剩下的。done、stop、ask_user 不要和别的动作放在一起。\n"
+@"15. found(可选):这一屏看到任务需要的结果(商品名和价格、查到的数据等)就写进 found,每条用;分隔,例如“XX 行李箱 24寸 ¥199;YY 行李箱 ¥259”。程序会保存并每步给你看,写 done 时据此汇总。比价任务在每个平台至少记下 3 个具体商品和价格,再换下一个平台。";
 
 NSString *memoryText(void) { return [NSUserDefaults.standardUserDefaults stringForKey:@"memory_text"] ?: @""; }
 

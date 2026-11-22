@@ -254,6 +254,7 @@ static void installOCRLeakPatch(void) {
 #define PA_MAX_LEAKED_MODELS 10
 
 BOOL ocrAccurateOn(void) {
+    return NO; // v0.9.21:精确 Vision 在本机进程里一直报错,已停用(中文识别改由 Live Text 负责)
     if (![NSUserDefaults.standardUserDefaults boolForKey:@"ocr_accurate"]) return NO;
     installOCRLeakPatch();
     if (!gLeakPatchOK) return NO;                       // 找不到私有类:不冒险,用快速模式

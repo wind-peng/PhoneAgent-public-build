@@ -142,7 +142,7 @@ BOOL expEnabled(void) {
 }
 BOOL expReplayEnabled(void) {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-    return [d objectForKey:@"exp_replay_on"] ? [d boolForKey:@"exp_replay_on"] : YES;
+    return [d objectForKey:@"exp_replay_on"] ? [d boolForKey:@"exp_replay_on"] : NO; // v0.9.21:默认关
 }
 NSMutableArray *expLoad(void) {
     NSData *d = [NSUserDefaults.standardUserDefaults dataForKey:@"exp_json"];
