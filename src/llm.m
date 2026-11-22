@@ -424,7 +424,8 @@ static NSDictionary *buildBody(NSString *model, NSArray *messages, BOOL tools) {
     }
     if (tools) {
         b[@"tools"] = agentTools();
-        b[@"tool_choice"] = (!glm && isDeepSeekModel(model) && !gToolChoiceAuto) ? @"required" : @"auto";
+        // v0.9.42:DeepSeek 思考模式不支持 tool_choice=required(会 400),开了思考就直接用 auto
+        b[@"tool_choice"] = (!glm && isDeepSeekModel(model) && !gToolChoiceAuto && !b[@"thinking"]) ? @"required" : @"auto";
     }
     return b;
 }
