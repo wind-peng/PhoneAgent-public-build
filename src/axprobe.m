@@ -220,3 +220,103 @@ void axProbeAfterDelay(void) {
         agentSay([@"[无障碍探测] " stringByAppendingString:r]);
     });
 }
+
+// ---- v0.9.31:每步读前台 App 的无障碍元素,作为元素列表的主来源 ----
+static id gAXFrontCache; static NSString *gAXFrontBid;
+static void axInitOnce(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dlopen("/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime", RTLD_NOW);
+        dlopen("/System/Library/PrivateFrameworks/AccessibilityUtilities.framework/AccessibilityUtilities", RTLD_NOW);
+        dlopen("/usr/lib/libAccessibility.dylib", RTLD_NOW);
+        void (*setAuto)(int) = dlsym(RTLD_DEFAULT, "_AXSSetAutomationEnabled");
+        void (*setApp)(int) = dlsym(RTLD_DEFAULT, "_AXSApplicationAccessibilitySetEnabled");
+        if (setAuto) setAuto(1);
+        if (setApp) setApp(1);
+        [NSThread sleepForTimeInterval:0.8];
+    });
+}
+
+static void axCollect(id el, int depth, NSMutableArray *acc, NSMutableSet *seen, CFAbsoluteTime t0) {
+    if (!el || depth > 18 || acc.count > 500 || CFAbsoluteTimeGetCurrent() - t0 > 1.5) return;
+    NSString *k = [NSString stringWithFormat:@"%p", (__bridge void *)el];
+    if ([seen containsObject:k]) return;
+    [seen addObject:k];
+    [acc addObject:el];
+    id ch = axCallObj(el, @"children");
+    if ([ch isKindOfClass:NSArray.class]) for (id c in ch) axCollect(c, depth + 1, acc, seen, t0);
+}
+
+// 返回元素列表(屏幕点坐标、中心点),每项:text x y w h ax=YES,可带 axbtn / axin(可输入) / axsel(已选中)
+NSArray *axReadScreen(NSString *frontBid, int *msOut, NSString **howOut) {
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+    if (msOut) *msOut = 0;
+    @try {
+        axInitOnce();
+        gAXLog = [NSMutableArray array];
+        Class cE = NSClassFromString(@"AXElement");
+        if (!cE) return @[];
+        CGSize sz = UIScreen.mainScreen.bounds.size;
+        id front = nil;
+        if (frontBid.length && [frontBid isEqualToString:gAXFrontBid]) front = gAXFrontCache;
+        if (!front) {
+            SEL sa = NSSelectorFromString(@"applicationAtCoordinate:");
+            if ([cE respondsToSelector:sa]) front = ((id (*)(id, SEL, CGPoint))objc_msgSend)(cE, sa, CGPointMake(sz.width / 2, sz.height / 2));
+            gAXFrontCache = front; gAXFrontBid = frontBid;
+        }
+        if (!front) return @[];
+        // 两种读法:explorerElements(淘宝这类)和 children 递归(微信这类),取有文字元素多的
+        NSArray *list = nil; NSString *how = @"explorer";
+        id ex = axCallObj(front, @"explorerElements");
+        NSArray *exArr = [ex isKindOfClass:NSArray.class] ? ex : @[];
+        int exLab = 0;
+        for (id e in exArr) { NSString *l = axKV(e, @"label"); if ([l isKindOfClass:NSString.class] && l.length) exLab++; }
+        list = exArr;
+        if (exLab < 12) {
+            NSMutableArray *acc = [NSMutableArray array];
+            axCollect(front, 0, acc, [NSMutableSet set], CFAbsoluteTimeGetCurrent());
+            int chLab = 0;
+            for (id e in acc) { NSString *l = axKV(e, @"label"); if ([l isKindOfClass:NSString.class] && l.length) chLab++; }
+            if (chLab > exLab) { list = acc; how = @"children"; }
+        }
+        if (howOut) *howOut = how;
+        NSMutableArray *out = [NSMutableArray array];
+        NSMutableSet *dup = [NSMutableSet set];
+        for (id e in list) {
+            if (out.count >= 70) break;
+            NSString *label = axKV(e, @"label"); if (![label isKindOfClass:NSString.class]) label = @"";
+            label = [label stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            id fv = axKV(e, @"frame");
+            if (![fv isKindOfClass:NSValue.class] || strcmp([(NSValue *)fv objCType], @encode(CGRect)) != 0) continue;
+            CGRect full = [(NSValue *)fv CGRectValue];
+            CGRect r = CGRectIntersection(full, CGRectMake(0, 0, sz.width, sz.height));
+            if (CGRectIsNull(r) || r.size.width < 4 || r.size.height < 4) continue;
+            // 只要屏幕上看得见的:露出不到一半的(屏幕外的聊天、横向滚出去的标签)不要
+            if (full.size.width > 0 && full.size.height > 0 && (r.size.width * r.size.height) < 0.5 * full.size.width * full.size.height) continue;
+            if (r.origin.y + r.size.height <= 46 && r.size.height < 30) continue;            // 状态栏
+            if (r.size.width >= sz.width * 0.95 && r.size.height >= sz.height * 0.8) continue; // 整屏容器
+            unsigned long long t = [axKV(e, @"traits") unsignedLongLongValue];
+            BOOL input = (t & 0x400ULL) || (t & 0x40000ULL);
+            if (!label.length && !input) continue;
+            if ([label containsString:@"辅助触控"] || [label containsString:@"滚动条"] || [label isEqualToString:@"标签页栏"] || [label isEqualToString:@"工具栏"]) continue;
+            NSString *val = axKV(e, @"value");
+            NSString *text = label;
+            if ([val isKindOfClass:NSString.class] && val.length && val.length <= 20 && ![label containsString:val]) text = [NSString stringWithFormat:@"%@:%@", label, val];
+            if (!text.length) text = @"(无文字)";
+            NSString *dk = [NSString stringWithFormat:@"%@|%d|%d", text, (int)CGRectGetMidX(r), (int)CGRectGetMidY(r)];
+            if ([dup containsObject:dk]) continue;
+            [dup addObject:dk];
+            NSMutableDictionary *d = [@{@"text": text, @"x": @((int)round(CGRectGetMidX(r))), @"y": @((int)round(CGRectGetMidY(r))),
+                                        @"w": @((int)round(r.size.width)), @"h": @((int)round(r.size.height)), @"ax": @YES} mutableCopy];
+            if (input) d[@"axin"] = (t & 0x400ULL) ? @"搜索框" : @"输入框";
+            else if (t & 0x1ULL) d[@"axbtn"] = @YES;
+            if ([label containsString:@"已选中"]) d[@"axsel"] = @YES;
+            [out addObject:d];
+        }
+        if (msOut) *msOut = (int)((CFAbsoluteTimeGetCurrent() - t0) * 1000);
+        return out;
+    } @catch (NSException *e) {
+        if (msOut) *msOut = (int)((CFAbsoluteTimeGetCurrent() - t0) * 1000);
+        return @[];
+    }
+}

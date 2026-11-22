@@ -709,7 +709,7 @@ NSArray *hybridMessages2(NSString *task, NSString *history, UIImage *img, NSData
     int n = 0;
     // v0.9.22:OCR 列表瘦身:最多 70 条、每条 36 字,去掉只有标点符号的碎片(图标照常保留)
     NSCharacterSet *meaningful = [NSCharacterSet alphanumericCharacterSet]; // 含汉字、字母、数字
-    int idx = 0;
+    int idx = 0; BOOL hasAX = NO;
     for (NSDictionary *it in items) {
         idx++;  // 编号始终等于在 items 里的位置(程序按编号取点击位置),跳过的条目不重新编号
         if (n >= 70) break;
@@ -717,6 +717,14 @@ NSArray *hybridMessages2(NSString *task, NSString *history, UIImage *img, NSData
         if (![it[@"icon"] boolValue] && [t rangeOfCharacterFromSet:meaningful].location == NSNotFound && ![t containsString:@"¥"] && ![t containsString:@"×"]) continue;
         n++;
         if (t.length > 36) t = [t substringToIndex:36];
+        if ([it[@"ax"] boolValue]) { // v0.9.31:系统无障碍信息,类型和状态可信
+            NSString *tag = @"";
+            if (it[@"axin"]) tag = [NSString stringWithFormat:@" 【%@,可输入】", it[@"axin"]];
+            else if ([it[@"axbtn"] boolValue]) tag = @" 【按钮】";
+            [ocr appendFormat:@"[%d] (%d,%d) %@%@\n", idx, (int)round([it[@"x"] doubleValue] * k), (int)round([it[@"y"] doubleValue] * k), t, tag];
+            hasAX = YES;
+            continue;
+        }
         if ([it[@"box"] boolValue]) { // v0.9.27:截图里找到的空输入框
             [ocr appendFormat:@"[%d] (%d,%d) [输入框] %dx%d(空的,点它或对它 input_text)\n", idx, (int)round([it[@"x"] doubleValue] * k), (int)round([it[@"y"] doubleValue] * k),
              (int)round([it[@"w"] doubleValue] * k), (int)round([it[@"h"] doubleValue] * k)];
@@ -742,6 +750,7 @@ NSArray *hybridMessages2(NSString *task, NSString *history, UIImage *img, NSData
              [it[@"inbox"] boolValue] ? @" (在输入框里,可能是提示文字)" : @""];
     }
     if (!ocr.length) [ocr appendString:@"(本地 OCR 没有识别到文字)\n"];
+    if (hasAX) [ocr appendString:@"(带【按钮】【…可输入】标记或排在前面的条目来自系统无障碍信息,名字、类型、选中状态都可信;要输入文字就对【可输入】的条目 input_text。)\n"];
     NSString *text = [NSString stringWithFormat:
                       @"任务:%@\n\n最近的动作:\n%@\n本地 OCR 文字列表(格式 [编号] (中心x,中心y) 文字,坐标是 780x1688 截图像素):\n%@\n%@",
                       task, history.length ? history : @"(还没有)", ocr,

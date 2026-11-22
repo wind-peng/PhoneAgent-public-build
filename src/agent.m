@@ -1442,6 +1442,32 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 allItems = m;
             }
         }
+        // v0.9.31:无障碍元素树(系统给的按钮/输入框/标签名和精确位置),有就放在列表最前面;
+        // OCR/图标/输入框检测里落在这些元素内部的条目去掉,只保留无障碍没覆盖到的(自绘界面、图片里的字)
+        BOOL axRich = NO; int axMs = 0, axN = 0; NSString *axHow = nil;
+        if (paOn(@"ax_tree", YES)) {
+            NSString *fb = frontmostBundleID();
+            BOOL skipAX = !fb.length || [fb isEqualToString:selfID] || [fb isEqualToString:@"com.apple.springboard"];
+            NSArray *axItems = skipAX ? nil : axReadScreen(fb, &axMs, &axHow);
+            axN = (int)axItems.count;
+            if (axN >= 8) {
+                axRich = YES;
+                CGSize ssz = screenSize();
+                NSMutableArray *m = [axItems mutableCopy];
+                for (NSDictionary *it in allItems) {
+                    if (m.count >= 80) break;
+                    double ix = [it[@"x"] doubleValue], iy = [it[@"y"] doubleValue];
+                    BOOL covered = NO;
+                    for (NSDictionary *a in axItems) {
+                        double aw = [a[@"w"] doubleValue], ah = [a[@"h"] doubleValue];
+                        if (aw * ah > ssz.width * ssz.height * 0.25) continue;
+                        if (fabs(ix - [a[@"x"] doubleValue]) <= aw / 2 + 2 && fabs(iy - [a[@"y"] doubleValue]) <= ah / 2 + 2) { covered = YES; break; }
+                    }
+                    if (!covered) [m addObject:it];
+                }
+                allItems = m;
+            }
+        }
         NSString *screen = localOK ? sigText : thumbSig(thumbNow);
         // 9:前台 App 意外变化(崩溃回到主屏 / 跳到别的 App)
         NSString *front = frontmostBundleID();
@@ -1637,7 +1663,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             for (NSUInteger i = from; i < history.count; i++) [hist appendFormat:@"%@\n", history[i]];
             // S1:文字步骤:OCR 足够丰富、上一步成功、不需要看图标时只发 OCR 列表
             BOOL includeImage = YES;
-            if (paOn(@"text_only_steps", YES) && !planning && localOK && items.count >= 6 && !wasFailed && !gEscalate && !needImage &&
+            if (paOn(@"text_only_steps", YES) && !planning && ((localOK && items.count >= 6) || axRich) && !wasFailed && !gEscalate && !needImage &&
                 !lastUsedXY && ![lastAction isEqualToString:@"open_app"] && ![lastAction isEqualToString:@"home"] && same == 0)
                 includeImage = NO;
             needImage = NO;
@@ -1649,7 +1675,8 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             dispatch_group_wait(encGroup, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
             NSArray *msgs = hybridMessages2(task, hist, img, hq ? nil : jpgPre, prevForModel, allItems, includeImage, hq, &err);
             if (!msgs) { agentSay([@"截图视觉请求失败:" stringByAppendingString:err ?: @"?"]); break; }
-            gTokTag = [NSString stringWithFormat:@"第 %d 步(%@)", step, !includeImage ? @"纯文字" : ((glmModel && prevForModel) ? @"2 张图" : @"1 张图")];
+            gTokTag = [NSString stringWithFormat:@"第 %d 步(%@%@)", step, !includeImage ? @"纯文字" : ((glmModel && prevForModel) ? @"2 张图" : @"1 张图"),
+                       axN ? [NSString stringWithFormat:@",无障碍 %d 个/%@/%d ms%@", axN, axHow ?: @"?", axMs, axRich ? @"" : @"(太少未用)"] : @""];
             act = callLLM(base, key, model, msgs, &err); // callLLM 内部已经最多重试 5 次
             gTokTag = nil;
             if (!gAgentRunning) break;
@@ -1981,10 +2008,11 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             if (appHint.length) { NSString *i2 = nil; hintBid = bundleForAppName(appHint, &i2); }
             if (!hintBid.length && taskApp.length) hintBid = taskApp;
             NSString *note = nil;
-            if (typing && usedID && usedIcon && paOn(@"input_box_detect", YES)) { // v0.9.27:对着小图标 input_text,同一行有输入框 → 改点输入框(避免点到语音按钮)
+            if (typing && usedID && (usedIcon || [allItems[oid - 1][@"axbtn"] boolValue]) && paOn(@"input_box_detect", YES)) { // v0.9.27:对着小图标 input_text,同一行有输入框 → 改点输入框(避免点到语音按钮)
                 for (NSDictionary *it in allItems) {
                     BOOL isBox = [it[@"box"] boolValue], inText = [it[@"inbox"] boolValue] && ![it[@"icon"] boolValue];
-                    if (!isBox && !inText) continue;
+                    BOOL isAX = it[@"axin"] != nil;
+                    if (!isBox && !inText && !isAX) continue;
                     double by = [it[@"y"] doubleValue], bh = MAX(24.0, [it[@"h"] doubleValue]);
                     if (fabs(by - y) > bh) continue;
                     double nx = isBox ? [it[@"x"] doubleValue] - [it[@"w"] doubleValue] * 0.15 : [it[@"x"] doubleValue];

@@ -569,7 +569,7 @@ static NSData *attachJPEG(UIImage *img) {
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"高级设置(v0.9.30)";
+    self.title = @"高级设置(v0.9.31)";
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
     self.popupTV = [UITextView new];
@@ -630,6 +630,7 @@ static NSData *attachJPEG(UIImage *img) {
         [self sw:@"弹窗规则:自动点掉下面列表里的按钮" key:@"auto_popup" def:NO],
         self.popupTV,
         [self hdr:@"识别"],
+        [self sw:@"读系统无障碍元素(按钮/输入框/图标名称和精确位置;够用时不发截图)" key:@"ax_tree" def:YES],
         [self sw:@"检测无文字小图标(×、返回箭头等)" key:@"icon_detect" def:YES],
         [self sw:@"合并同一行相邻的 OCR 碎片" key:@"ocr_merge" def:NO],
         [self sw:@"Live Text 把隔开的标签拆成单独条目" key:@"ocr_split_gap" def:YES],
