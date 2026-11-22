@@ -1632,7 +1632,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             }
             adWaits = 0; if (n <= 0) { if (lastAdRep) agentSay(@"倒计时停在同一个数字,当作广告已结束"); lastAdN = -1; lastAdRep = 0; }
         }
-        if (paOn(@"local_load_wait", YES) && localOK) { // v0.9.38:屏幕只剩“加载中”之类的字:本地等,不调用模型、不截图
+        if (paOn(@"loading_screen_wait", YES) && localOK) { // v0.9.38:屏幕只剩“加载中”之类的字:本地等,不调用模型、不截图
             BOOL loading = NO; int meaningful = 0;
             for (NSDictionary *it in items) {
                 NSString *t = [[it[@"text"] description] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
