@@ -513,7 +513,49 @@ static void paWalkCR(id r, NSMutableArray *lines, int depth) {
             NSString *t = [r valueForKey:@"text"];
             id q = [r valueForKey:@"boundingQuad"];
             NSValue *bv = [q valueForKey:@"boundingBox"];
-            if ([t isKindOfClass:NSString.class] && t.length && bv) [lines addObject:@{@"text": t, @"bb": bv}];
+            if ([t isKindOfClass:NSString.class] && t.length && bv) {
+                // v0.9.23:Live Text 会把一排隔开的标签(如“特价 首更 秒送 外卖”)认成一行。
+                // 行里有空格时,按下一级的词拆开:词之间空隙大于 0.35 个字高就分成两条,挨着的仍算一条。
+                NSArray *parts = nil;
+                NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+                BOOL split = [ud objectForKey:@"ocr_split_gap"] ? [ud boolForKey:@"ocr_split_gap"] : YES;
+                if (split && [t containsString:@" "]) {
+                    id kids = paIvar(r, "_children");
+                    NSMutableArray *ws = [NSMutableArray array];
+                    if ([kids isKindOfClass:NSArray.class]) for (id k in kids) {
+                        @try {
+                            NSString *kt = [k valueForKey:@"text"];
+                            NSValue *kb = [[k valueForKey:@"boundingQuad"] valueForKey:@"boundingBox"];
+                            if ([kt isKindOfClass:NSString.class] && kt.length && kb) [ws addObject:@{@"text": kt, @"bb": kb}];
+                        } @catch (NSException *e2) {}
+                    }
+                    if (ws.count >= 2) {
+                        [ws sortUsingComparator:^NSComparisonResult(NSDictionary *p1, NSDictionary *p2) {
+                            double a1 = [p1[@"bb"] CGRectValue].origin.x, a2 = [p2[@"bb"] CGRectValue].origin.x;
+                            return a1 < a2 ? NSOrderedAscending : (a1 > a2 ? NSOrderedDescending : NSOrderedSame);
+                        }];
+                        NSMutableArray *groups = [NSMutableArray array];
+                        NSMutableString *gt = nil; CGRect gb = CGRectZero;
+                        for (NSDictionary *w in ws) {
+                            CGRect wb = [w[@"bb"] CGRectValue];
+                            double gap = gt ? wb.origin.x - CGRectGetMaxX(gb) : 0;
+                            double hh = MAX(wb.size.height, gb.size.height);
+                            if (gt && gap <= hh * 0.35) {
+                                NSString *wt = w[@"text"];
+                                BOOL latin = gt.length && [gt characterAtIndex:gt.length - 1] < 0x2E80 && [wt characterAtIndex:0] < 0x2E80;
+                                if (latin) [gt appendString:@" "];
+                                [gt appendString:wt]; gb = CGRectUnion(gb, wb);
+                            } else {
+                                if (gt) [groups addObject:@{@"text": [gt copy], @"bb": [NSValue valueWithCGRect:gb]}];
+                                gt = [w[@"text"] mutableCopy]; gb = wb;
+                            }
+                        }
+                        if (gt) [groups addObject:@{@"text": [gt copy], @"bb": [NSValue valueWithCGRect:gb]}];
+                        if (groups.count >= 2) parts = groups;
+                    }
+                }
+                if (parts) [lines addObjectsFromArray:parts]; else [lines addObject:@{@"text": t, @"bb": bv}];
+            }
         } @catch (NSException *e) {}
         return;
     }
