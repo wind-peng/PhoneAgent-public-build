@@ -1347,6 +1347,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     NSMutableOrderedSet *visitedShops = [NSMutableOrderedSet orderedSet]; // 比价任务里进过的购物平台
     NSMutableSet *leaveWarned = [NSMutableSet set];
     NSString *curShop = nil; int compareRejects = 0;
+    BOOL confirmPendingImg = NO; // v0.9.32:确认后的核对:无障碍元素够用就不发截图
     int confirmStep = 0; NSString *confirmTgt = nil, *confirmSig = nil; double confirmX = -1, confirmY = -1; // v0.9.26:刚确认过的敏感点击
     int shopSinceStep = 0, lastNewFindStep = 0, lastLostHintStep = -99; // v0.9.23:卡住检测
     NSString *lastProgSig = @""; int lastProgStep = 1, stuckHintN = 0, strayReturns = 0; NSMutableArray *recentSigs = [NSMutableArray array]; // v0.9.25:通用卡住检测/误入 App
@@ -1468,6 +1469,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 allItems = m;
             }
         }
+        if (confirmPendingImg) { confirmPendingImg = NO; if (!axRich) needImage = YES; }
         NSString *screen = localOK ? sigText : thumbSig(thumbNow);
         // 9:前台 App 意外变化(崩溃回到主屏 / 跳到别的 App)
         NSString *front = frontmostBundleID();
@@ -1664,7 +1666,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             // S1:文字步骤:OCR 足够丰富、上一步成功、不需要看图标时只发 OCR 列表
             BOOL includeImage = YES;
             if (paOn(@"text_only_steps", YES) && !planning && ((localOK && items.count >= 6) || axRich) && !wasFailed && !gEscalate && !needImage &&
-                !lastUsedXY && ![lastAction isEqualToString:@"open_app"] && ![lastAction isEqualToString:@"home"] && same == 0)
+                !lastUsedXY && (axRich || ![lastAction isEqualToString:@"open_app"]) && ![lastAction isEqualToString:@"home"] && same == 0)
                 includeImage = NO;
             needImage = NO;
             BOOL hq = gEscalate || planning;
@@ -1942,8 +1944,8 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             if (gGuardConfirmed) { // v0.9.26:用户允许后已点击,下一步带截图让模型确认是否生效
                 gGuardConfirmed = NO;
                 confirmStep = step; confirmTgt = [tgt copy]; confirmX = x; confirmY = y; confirmSig = localOK ? [sigText copy] : nil;
-                hline = [hline stringByAppendingString:@" (用户已允许,已经点击;请看下一张截图确认是否已生效,不要重复点)"];
-                needImage = YES;
+                hline = [hline stringByAppendingString:@" (用户已允许,已经点击;请看下一屏确认是否已生效,不要重复点)"];
+                if (paOn(@"ax_tree", YES)) confirmPendingImg = YES; else needImage = YES;
             }
             // 4:点击没反应:在旁边 8pt 处本地重试一次(敏感/购物类按钮不重试,避免重复操作)
             if (isTap && paOn(@"tap_retry", YES) && broadcastAlive() && thumbNow) {
@@ -2054,6 +2056,14 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                         if (hitc * 10 >= wset.count * 7) seen = YES;
                     }
                     if (!wset.count) seen = YES;
+                    if (!seen && paOn(@"ax_tree", YES)) { // v0.9.32:用输入框自己的内容核对(无障碍),OCR 漏看时不误报
+                        int am = 0;
+                        NSArray *axl2 = axReadScreen(frontmostBundleID(), &am, NULL);
+                        for (NSDictionary *a in axl2) {
+                            NSString *t = [[[a[@"text"] description] stringByReplacingOccurrencesOfString:@" " withString:@""] lowercaseString];
+                            if (want.length && [t containsString:want]) { seen = YES; break; }
+                        }
+                    }
                     for (NSDictionary *it in (seen ? it3 : @[])) {
                         NSString *t = [[[it[@"text"] description] stringByReplacingOccurrencesOfString:@" " withString:@""] lowercaseString];
                         if (![t isEqualToString:@"搜索"] && ![t isEqualToString:@"search"]) continue;

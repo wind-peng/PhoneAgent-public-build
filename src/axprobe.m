@@ -301,7 +301,7 @@ NSArray *axReadScreen(NSString *frontBid, int *msOut, NSString **howOut) {
             if ([label containsString:@"辅助触控"] || [label containsString:@"滚动条"] || [label isEqualToString:@"标签页栏"] || [label isEqualToString:@"工具栏"]) continue;
             NSString *val = axKV(e, @"value");
             NSString *text = label;
-            if ([val isKindOfClass:NSString.class] && val.length && val.length <= 20 && ![label containsString:val]) text = [NSString stringWithFormat:@"%@:%@", label, val];
+            if ([val isKindOfClass:NSString.class] && val.length && val.length <= 40 && ![label containsString:val]) text = [NSString stringWithFormat:@"%@:%@", label, val];
             if (!text.length) text = @"(无文字)";
             NSString *dk = [NSString stringWithFormat:@"%@|%d|%d", text, (int)CGRectGetMidX(r), (int)CGRectGetMidY(r)];
             if ([dup containsObject:dk]) continue;
