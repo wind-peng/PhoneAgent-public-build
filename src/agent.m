@@ -1294,7 +1294,8 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     NSMutableOrderedSet *visitedShops = [NSMutableOrderedSet orderedSet]; // 比价任务里进过的购物平台
     NSMutableSet *leaveWarned = [NSMutableSet set];
     NSString *curShop = nil; int compareRejects = 0;
-    int shopSinceStep = 0, lastNewFindStep = 0, lastLostHintStep = -99; NSMutableDictionary *stuckHints = [NSMutableDictionary dictionary]; // v0.9.23:卡住检测
+    int shopSinceStep = 0, lastNewFindStep = 0, lastLostHintStep = -99; // v0.9.23:卡住检测
+    NSString *lastProgSig = @""; int lastProgStep = 1, stuckHintN = 0, strayReturns = 0; NSMutableArray *recentSigs = [NSMutableArray array]; // v0.9.25:通用卡住检测/误入 App
     BOOL compareTask = isCompareTask(gTaskDisplay.length ? gTaskDisplay : task) && paOn(@"compare_check", YES);
     BOOL glmModel = [model.lowercaseString hasPrefix:@"glm"];
     CGSize sc = screenSize();
@@ -1374,6 +1375,21 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
         if (front.length) {
             BOOL third = ![front isEqualToString:@"com.apple.springboard"] && ![front isEqualToString:selfID];
             if (third) {
+                if (taskApp.length && ![front isEqualToString:taskApp] && ![lastAction isEqualToString:@"open_app"] && paOn(@"stray_return", YES) && strayReturns < 3) {
+                    // v0.9.25:被广告/链接带进 App Store 或浏览器(任务没提到它们)→ 自动回到原来的 App
+                    NSString *tk = gTaskDisplay.length ? gTaskDisplay : task;
+                    BOOL store = [front isEqualToString:@"com.apple.AppStore"] && ![tk containsString:@"App Store"] && ![tk containsString:@"商店"] && ![tk containsString:@"下载"] && ![tk containsString:@"安装"] && ![tk containsString:@"更新"];
+                    BOOL web = [front isEqualToString:@"com.apple.mobilesafari"] && ![tk.lowercaseString containsString:@"safari"] && ![tk containsString:@"浏览器"] && ![tk containsString:@"网页"] && ![tk containsString:@"网站"] && ![tk containsString:@"链接"];
+                    if (store || web) {
+                        strayReturns++;
+                        agentSay([NSString stringWithFormat:@"被带进了「%@」,自动回到「%@」", agAppName(front), agAppName(taskApp)]);
+                        openApp(taskApp);
+                        [history addObject:[NSString stringWithFormat:@"%d. (上一步把你带进了「%@」(多半是点到广告或链接),程序已自动回到「%@」;不要再点同一个位置)", step, agAppName(front), agAppName(taskApp)]];
+                        afterAction(1.2, 4.0, 3); settled = YES;
+                        lastSig = @""; same = 0; [queue removeAllObjects];
+                        step--; continue;
+                    }
+                }
                 if (taskApp.length && ![front isEqualToString:taskApp] && ![lastAction isEqualToString:@"open_app"])
                     [history addObject:[NSString stringWithFormat:@"%d. (前台 App 从「%@」变成了「%@」,不是 open_app 打开的;如果不是有意跳转,请用 open_app 回到「%@」)", step, agAppName(taskApp), agAppName(front), agAppName(taskApp)]];
                 taskApp = front; expectHome = NO;
@@ -1391,10 +1407,16 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             NSString *sp = (front.length && ![front isEqualToString:selfID] && ![front isEqualToString:@"com.apple.springboard"]) ? (shopPlatformOf(agAppName(front)) ?: shopPlatformOf(front)) : nil;
             if (sp) { if (![sp isEqualToString:curShop]) shopSinceStep = step; curShop = sp; [visitedShops addObject:sp]; }
         }
-        if (compareTask && curShop && localOK && paOn(@"stuck_hint", YES)) { // v0.9.23:比价时走错页面/卡住,本地提醒模型(不多调用模型)
-            NSString *tk = gTaskDisplay.length ? gTaskDisplay : task;
+        if (localOK && paOn(@"stuck_hint", YES)) { // v0.9.25:通用卡住检测(所有任务),只往历史里加提醒,不多调用模型
+            NSUInteger nDone = 0; for (id o in planDone) if ([o boolValue]) nDone++;
+            NSString *psig = [NSString stringWithFormat:@"%@|%lu|%lu|%@", progress ?: @"", (unsigned long)nDone, (unsigned long)findings.count, front ?: @""];
+            if (![psig isEqualToString:lastProgSig]) { lastProgSig = psig; lastProgStep = step; stuckHintN = 0; }
+            [recentSigs addObject:screen ?: @""]; if (recentSigs.count > 6) [recentSigs removeObjectAtIndex:0];
+            NSUInteger rc = recentSigs.count;
+            BOOL cycle = rc >= 5 && [recentSigs[rc - 1] isEqualToString:recentSigs[rc - 3]] && [recentSigs[rc - 3] isEqualToString:recentSigs[rc - 5]] && ![recentSigs[rc - 1] isEqualToString:recentSigs[rc - 2]];
             BOOL lost = NO;
-            if (![tk containsString:@"外卖"] && ![tk containsString:@"秒送"]) {
+            NSString *tk = gTaskDisplay.length ? gTaskDisplay : task;
+            if (compareTask && curShop && ![tk containsString:@"外卖"] && ![tk containsString:@"秒送"]) { // 比价时误入外卖/秒送频道
                 BOOL qs = NO, ys = NO;
                 for (NSDictionary *it in items) {
                     NSString *t = [it[@"text"] description] ?: @"";
@@ -1404,16 +1426,20 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 }
                 if (qs && ys) lost = YES;
             }
-            int idle = step - MAX(shopSinceStep, lastNewFindStep);
-            int nh = [stuckHints[curShop] intValue];
+            int idle = step - lastProgStep;
             if (lost && step - lastLostHintStep >= 3) {
                 lastLostHintStep = step;
-                [history addObject:[NSString stringWithFormat:@"%d. (系统提醒:现在在「%@」的外卖/秒送频道,这里搜不到普通商品。请点左上角返回或底部「首页」回到 App 首页,用首页最上面的主搜索框搜商品;不要在外卖页搜索)", step, curShop]];
+                [history addObject:[NSString stringWithFormat:@"%d. (系统提醒:现在在「%@」的外卖/秒送频道,这里搜不到普通商品。请点左上角返回或底部「首页」回到 App 首页,用首页最上面的主搜索框搜商品)", step, curShop]];
                 agentSay(@"提醒模型:走进了外卖/秒送频道,让它退回首页");
-            } else if (idle >= 8 && nh < 2 && step - lastLostHintStep >= 3) {
-                stuckHints[curShop] = @(nh + 1); lastLostHintStep = step; lastNewFindStep = step;
-                [history addObject:[NSString stringWithFormat:@"%d. (系统提醒:在「%@」已经 %d 步没记到新价格,可能走错页面(外卖、商品详情、推荐流)。请先回到 App 首页,用首页最上面的主搜索框搜任务里的商品,在搜索结果页用 found 记价格)", step, curShop, idle]];
-                agentSay([NSString stringWithFormat:@"提醒模型:在「%@」%d 步没记到新价格", curShop, idle]);
+            } else if ((idle >= 8 || cycle) && stuckHintN < 2 && step - lastLostHintStep >= 3) {
+                stuckHintN++; lastLostHintStep = step;
+                if (cycle) {
+                    [history addObject:[NSString stringWithFormat:@"%d. (系统提醒:最近几步在两个页面之间来回切换,没有进展。请换一条路:用别的入口、搜索,或先返回上一级再走)", step]];
+                    agentSay(@"提醒模型:在两个页面之间来回转");
+                } else {
+                    [history addObject:[NSString stringWithFormat:@"%d. (系统提醒:已经 %d 步任务没有进展(进度、子目标都没变),可能走错了页面。请想清楚当前在哪,先回到上一个正常页面或 App 首页,换一条更直接的路;确实做不到就 ask_user 或 stop)", step, idle]];
+                    agentSay([NSString stringWithFormat:@"提醒模型:%d 步没有进展", idle]);
+                }
             }
         }
         if ([screen isEqualToString:lastSig]) same++; else same = 0;
@@ -1542,7 +1568,9 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             needImage = NO;
             BOOL hq = gEscalate || planning;
             // S2:GLM 的“上一步截图”只在屏幕可能没变化时附上
-            UIImage *prevForModel = (same >= 1 || wasFailed) ? prevImg : nil;
+            // v0.9.25:只有上一步真的点/滑/输入了、屏幕却没变时才附上一步截图对照;其他情况只发一张
+            BOOL physLast = [@[@"tap", @"long_press", @"swipe", @"input_text"] containsObject:lastAction];
+            UIImage *prevForModel = (paOn(@"single_image", YES) ? (same >= 1 && physLast) : (same >= 1 || wasFailed)) ? prevImg : nil;
             dispatch_group_wait(encGroup, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
             NSArray *msgs = hybridMessages2(task, hist, img, hq ? nil : jpgPre, prevForModel, allItems, includeImage, hq, &err);
             if (!msgs) { agentSay([@"截图视觉请求失败:" stringByAppendingString:err ?: @"?"]); break; }

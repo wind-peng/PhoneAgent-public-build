@@ -569,7 +569,7 @@ static NSData *attachJPEG(UIImage *img) {
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"高级设置(v0.9.23)";
+    self.title = @"高级设置(v0.9.25)";
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
     self.popupTV = [UITextView new];
@@ -612,7 +612,9 @@ static NSData *attachJPEG(UIImage *img) {
         [self sw:@"智能等待:动作后等画面稳定(代替固定等待)" key:@"smart_settle" def:YES],
         [self sw:@"输入文字后自动点“搜索”按钮(右上角或键盘上的)" key:@"auto_search" def:YES],
         [self sw:@"自动点搜索前先确认输入框里是要搜的词" key:@"paste_verify" def:YES],
-        [self sw:@"比价时走错页面/卡住提醒模型回首页" key:@"stuck_hint" def:YES],
+        [self sw:@"任务卡住/来回转圈时提醒模型换路" key:@"stuck_hint" def:YES],
+        [self sw:@"被广告带进 App Store/浏览器时自动退回" key:@"stray_return" def:YES],
+        [self sw:@"只在屏幕没变化时才附上一步截图(省 token)" key:@"single_image" def:YES],
         [self sw:@"打开 App / 点搜索后本地等页面加载完(少问模型一次 wait)" key:@"local_load_wait" def:YES],
         [self sw:@"点击没反应时在旁边自动重试一次(敏感按钮除外)" key:@"tap_retry" def:YES],
         [self sw:@"新滑动方式(60Hz 匀速、抬手前停顿防甩动)" key:@"smooth_swipe" def:YES],
