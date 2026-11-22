@@ -723,7 +723,10 @@ NSArray *hybridMessages2(NSString *task, NSString *history, UIImage *img, NSData
             NSString *pos = @""; // v0.9.25:按位置注明无文字图标的常见用途
             if (iy < sc.height * 0.13 && ix < sc.width * 0.18) pos = @" 左上角,常是返回";
             else if (iy < sc.height * 0.13 && ix > sc.width * 0.82) pos = @" 右上角,常是关闭/更多/分享";
-            else if (iy > sc.height * 0.91) pos = @" 底部栏,常是标签页";
+            else if (iy > sc.height * 0.91 && [it[@"w"] doubleValue] > sc.width * 0.4) pos = @" 底部宽条,可能是输入框"; // v0.9.26
+            else if (iy > sc.height * 0.91 && ix < sc.width * 0.15) pos = @" 左下角,聊天页常是语音/键盘切换,不是输入框";
+            else if (iy > sc.height * 0.91 && ix > sc.width * 0.85) pos = @" 右下角,聊天页常是加号/更多";
+            else if (iy > sc.height * 0.91) pos = @" 底部栏,常是标签页或表情";
             else if (iy < sc.height * 0.13) pos = @" 顶部栏";
             [ocr appendFormat:@"[%d] (%d,%d) [图标] %dx%d%@\n", idx, (int)round(ix * k), (int)round(iy * k),
              (int)round([it[@"w"] doubleValue] * k), (int)round([it[@"h"] doubleValue] * k), pos];

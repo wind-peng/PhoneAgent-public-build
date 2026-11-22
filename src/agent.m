@@ -558,8 +558,10 @@ static int agentAsk(NSString *kind, NSString *text) {
 }
 
 // 点击前的敏感检查:0 = 可以执行,1 = 用户拒绝/已由用户本人处理(跳过这一步,原因在 skipNote),-1 = 停止任务
+static BOOL gGuardConfirmed = NO; // v0.9.26:这次点击是用户刚确认过的敏感操作
 static int guardSensitiveTap(NSString *target, NSString *risk, NSArray *items, double x, double y, NSString **skipNote) {
     int cat = 0;
+    gGuardConfirmed = NO;
     NSString *hit = classifyAction(target, risk, items, x, y, &cat);
     if (!hit) return 0;
     NSString *tgt = target.length ? target : @"屏幕上的这个位置";
@@ -578,6 +580,7 @@ static int guardSensitiveTap(NSString *target, NSString *risk, NSArray *items, d
         // 用户刚点击“允许”后，等待确认弹窗完全消失并把触摸焦点交还给目标 App，
         // 避免紧接着发送的 HID 点击被系统弹窗的关闭动画吞掉。
         usleep(1000 * 1000);
+        gGuardConfirmed = YES;
     }
     return 0;
 }
@@ -1344,6 +1347,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     NSMutableOrderedSet *visitedShops = [NSMutableOrderedSet orderedSet]; // 比价任务里进过的购物平台
     NSMutableSet *leaveWarned = [NSMutableSet set];
     NSString *curShop = nil; int compareRejects = 0;
+    int confirmStep = 0; NSString *confirmTgt = nil, *confirmSig = nil; double confirmX = -1, confirmY = -1; // v0.9.26:刚确认过的敏感点击
     int shopSinceStep = 0, lastNewFindStep = 0, lastLostHintStep = -99; // v0.9.23:卡住检测
     NSString *lastProgSig = @""; int lastProgStep = 1, stuckHintN = 0, strayReturns = 0; NSMutableArray *recentSigs = [NSMutableArray array]; // v0.9.25:通用卡住检测/误入 App
     BOOL compareTask = isCompareTask(gTaskDisplay.length ? gTaskDisplay : task) && paOn(@"compare_check", YES);
@@ -1865,6 +1869,15 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             NSString *tgt = usedID ? (usedIcon ? @"" : idText) : ([act[@"target"] description] ?: @"");
             NSString *risk = [act[@"risk"] description] ?: @"";
             NSString *skip = nil;
+            // v0.9.26:刚确认并点过同一个敏感按钮(如“发送”),之后屏幕已经变了 → 很可能已生效,先让模型看截图,不再重复请求确认
+            BOOL sameConfirm = confirmStep && step - confirmStep <= 3 &&
+                ((tgt.length && [tgt isEqualToString:confirmTgt]) || (fabs(x - confirmX) < 20 && fabs(y - confirmY) < 20));
+            if (sameConfirm && localOK && confirmSig && ![sigText isEqualToString:confirmSig]) {
+                [history addObject:[NSString stringWithFormat:@"%d. (未执行:第 %d 步已经点过「%@」(用户已允许),之后屏幕已经变化,很可能已经生效。请看这张截图确认结果,确实没生效再点;已生效就继续下一步或 done)", step, confirmStep, confirmTgt.length ? confirmTgt : @"这个按钮"]];
+                agentSay(@"提示:这个按钮刚确认并点过,屏幕已变化,先让模型看截图确认,不重复请求");
+                confirmSig = [sigText copy]; needImage = YES; [queue removeAllObjects];
+                continue;
+            }
             int g = guardSensitiveTap(tgt, risk, localOK ? items : nil, x, y, &skip);
             if (g < 0) break;
             if (g > 0) {
@@ -1878,6 +1891,12 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             NSString *hline = usedID ? [NSString stringWithFormat:@"%d. %@ id=%ld「%@」", step, action, (long)oid, idText] : [NSString stringWithFormat:@"%d. %@(%.0f,%.0f)", step, action, xpx, ypx];
             expRecord(@{@"a": action, @"t": tgt, @"x": @(x), @"y": @(y), @"anchors": localOK ? expAnchors(items) : @[]});
             afterAction(0.25, 2.5, 2); settled = YES;
+            if (gGuardConfirmed) { // v0.9.26:用户允许后已点击,下一步带截图让模型确认是否生效
+                gGuardConfirmed = NO;
+                confirmStep = step; confirmTgt = [tgt copy]; confirmX = x; confirmY = y; confirmSig = localOK ? [sigText copy] : nil;
+                hline = [hline stringByAppendingString:@" (用户已允许,已经点击;请看下一张截图确认是否已生效,不要重复点)"];
+                needImage = YES;
+            }
             // 4:点击没反应:在旁边 8pt 处本地重试一次(敏感/购物类按钮不重试,避免重复操作)
             if (isTap && paOn(@"tap_retry", YES) && broadcastAlive() && thumbNow) {
                 CFAbsoluteTime ftA = 0; NSData *fA = currentFrame(&ftA);
