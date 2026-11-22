@@ -740,6 +740,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
     int same = 0, parseFails = 0;
     double lastX = -1, lastY = -1;
     NSString *lastActKey = @""; int repeatCnt = 0; // 连续重复同一动作的检测
+    NSString *lastRepScreen = @""; // v0.9.41:滑动时屏幕变了就不算重复
     agentSay([NSString stringWithFormat:@"任务开始[AutoGLM %@]:%@", model, task]);
     int blockedHits = 0;
     {   // 经验库:几乎相同的任务先快速回放,再交给模型
@@ -827,7 +828,11 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
             BOOL track = act.length && ![act isEqualToString:@"wait"] && ![act isEqualToString:@"note"] && ![act isEqualToString:@"call_api"] &&
                          ![act isEqualToString:@"take_over"] && ![act isEqualToString:@"interact"];
             NSString *k = track ? action : @"";
-            if (track && [k isEqualToString:lastActKey]) repeatCnt++; else repeatCnt = track ? 1 : 0;
+            if (track && [k isEqualToString:lastActKey]) {
+                if ([act isEqualToString:@"swipe"] && ![sig isEqualToString:lastRepScreen]) repeatCnt = 1; // 滑动后屏幕在变 = 在正常翻页
+                else repeatCnt++;
+            } else repeatCnt = track ? 1 : 0;
+            lastRepScreen = [sig copy] ?: @"";
             lastActKey = k;
             if (repeatCnt >= 5) { agentSay(@"任务停止:同一个动作已经连续重复 5 次,屏幕没有达到预期,已停止"); break; }
             if (repeatCnt >= 3) pendingNote = [NSString stringWithFormat:@"(系统提示:同一个动作已经连续做了 %d 次,说明这个办法不起作用,请换一种办法,例如换位置、Back 后换入口或改用搜索。)", repeatCnt];
@@ -1368,6 +1373,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     NSString *lastSig = @""; int same = 0;
     NSString *progress = @"";              // 模型最近一次给出的任务进度(放在历史窗口之外,每步都带上)
     NSString *lastActKey = @""; int repeatCnt = 0; // 连续重复同一动作的检测
+    NSString *lastRepScreen = @""; // v0.9.41:滑动时屏幕变了就不算重复
     BOOL failedLast = NO;                  // 上一步执行失败(输入失败、坐标无效、点击没反应等)
     NSMutableArray *plan = [NSMutableArray array], *planDone = [NSMutableArray array]; // 12:子目标
     BOOL needImage = YES, lastUsedXY = NO, doneChecked = NO, doneCheckPending = NO, settled = NO;
@@ -2006,7 +2012,11 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                          [action isEqualToString:@"input_text"] || [action isEqualToString:@"open_app"] || [action isEqualToString:@"set_clipboard"];
             NSString *k = track ? [NSString stringWithFormat:@"%@|%@|%.0f,%.0f|%.0f,%.0f|%@|%@", action, usedID ? idText : @"",
                                    round(x / 8), round(y / 8), round(x2 / 8), round(y2 / 8), [act[@"name"] description] ?: @"", [act[@"text"] description] ?: @""] : @"";
-            if (track && [k isEqualToString:lastActKey]) repeatCnt++; else repeatCnt = track ? 1 : 0;
+            if (track && [k isEqualToString:lastActKey]) {
+                if ([action isEqualToString:@"swipe"] && ![screen isEqualToString:lastRepScreen]) repeatCnt = 1; // 滑动后屏幕在变 = 在正常翻页
+                else repeatCnt++;
+            } else repeatCnt = track ? 1 : 0;
+            lastRepScreen = [screen copy] ?: @"";
             lastActKey = k;
             if (repeatCnt >= 5) { agentSay(@"任务停止:同一个动作已经连续重复 5 次,屏幕没有达到预期,已停止"); break; }
             if (repeatCnt >= 3) {
