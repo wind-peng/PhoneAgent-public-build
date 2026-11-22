@@ -248,6 +248,21 @@ static void axCollect(id el, int depth, NSMutableArray *acc, NSMutableSet *seen,
 }
 
 // 返回元素列表(屏幕点坐标、中心点),每项:text x y w h ax=YES,可带 axbtn / axin(可输入) / axsel(已选中)
+// v0.9.33:无障碍文字整理:人民币→¥;商品卡这类长标签截短,保留价格/销量部分
+static NSString *axTidy(NSString *t) {
+    t = [t stringByReplacingOccurrencesOfString:@"人民币" withString:@"¥"];
+    t = [t stringByReplacingOccurrencesOfString:@"¥ " withString:@"¥"];
+    while ([t containsString:@"  "]) t = [t stringByReplacingOccurrencesOfString:@"  " withString:@" "];
+    if (t.length <= 50) return t;
+    NSRange y = [t rangeOfString:@"¥"];
+    if (y.location != NSNotFound && y.location > 26) {
+        NSString *tail = [t substringFromIndex:y.location];
+        if (tail.length > 28) tail = [tail substringToIndex:28];
+        return [NSString stringWithFormat:@"%@… %@", [t substringToIndex:24], tail];
+    }
+    if (y.location != NSNotFound) return [[t substringToIndex:MIN((NSUInteger)56, t.length)] stringByAppendingString:@"…"];
+    return [NSString stringWithFormat:@"%@…%@", [t substringToIndex:24], [t substringFromIndex:t.length - 26]]; // 没有¥时保留头尾(价格、销量多在末尾)
+}
 NSArray *axReadScreen(NSString *frontBid, int *msOut, NSString **howOut) {
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
     if (msOut) *msOut = 0;
@@ -303,6 +318,7 @@ NSArray *axReadScreen(NSString *frontBid, int *msOut, NSString **howOut) {
             NSString *text = label;
             if ([val isKindOfClass:NSString.class] && val.length && val.length <= 40 && ![label containsString:val]) text = [NSString stringWithFormat:@"%@:%@", label, val];
             if (!text.length) text = @"(无文字)";
+            text = axTidy(text);
             NSString *dk = [NSString stringWithFormat:@"%@|%d|%d", text, (int)CGRectGetMidX(r), (int)CGRectGetMidY(r)];
             if ([dup containsObject:dk]) continue;
             [dup addObject:dk];
@@ -312,6 +328,21 @@ NSArray *axReadScreen(NSString *frontBid, int *msOut, NSString **howOut) {
             else if (t & 0x1ULL) d[@"axbtn"] = @YES;
             if ([label containsString:@"已选中"]) d[@"axsel"] = @YES;
             [out addObject:d];
+        }
+        // v0.9.33:被拆开的价格「¥」+「58.60」按位置拼回一个
+        for (NSInteger i = (NSInteger)out.count - 1; i >= 0; i--) {
+            NSMutableDictionary *a = out[i];
+            if (![a[@"text"] isEqualToString:@"¥"]) continue;
+            for (NSMutableDictionary *b in out) {
+                if (b == a) continue;
+                NSString *bt = b[@"text"];
+                double dx = [b[@"x"] doubleValue] - [a[@"x"] doubleValue], dy = fabs([b[@"y"] doubleValue] - [a[@"y"] doubleValue]);
+                if (dx <= 0 || dx > 40 || dy > 8 || !bt.length) continue;
+                if ([bt rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789.万+"] invertedSet]].location != NSNotFound) continue;
+                b[@"text"] = [@"¥" stringByAppendingString:bt];
+                [out removeObjectAtIndex:i];
+                break;
+            }
         }
         if (msOut) *msOut = (int)((CFAbsoluteTimeGetCurrent() - t0) * 1000);
         return out;

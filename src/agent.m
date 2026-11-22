@@ -1702,6 +1702,10 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             NSString *bad = validateAct(act, allItems.count);
             if (bad) {
                 agentSay([NSString stringWithFormat:@"提示:模型给的动作参数无效(%@),重新询问一次", bad]);
+                { NSMutableDictionary *lg = [act mutableCopy]; [lg removeObjectsForKeys:@[@"thought", @"found", @"plan"]]; // v0.9.33:记下模型到底给了什么
+                  NSData *jd = [NSJSONSerialization dataWithJSONObject:lg options:0 error:nil];
+                  NSString *js = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : [lg description];
+                  agentSay([@"无效动作内容:" stringByAppendingString:js.length > 150 ? [js substringToIndex:150] : js]); }
                 NSMutableArray *m2 = [msgs mutableCopy];
                 [m2 addObject:@{@"role": @"user", @"content": [NSString stringWithFormat:@"(系统提示:你上一个动作参数无效:%@。请重新给出一个参数完整、坐标在 780x1688 范围内的动作。)", bad]}];
                 NSString *e2 = nil;
@@ -1710,6 +1714,15 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 gTokTag = nil;
                 if (!gAgentRunning) break;
                 if (act2 && !validateAct(act2, allItems.count)) act = act2;
+                else { // v0.9.33:重问后还是无效:绝不执行(以前会点到 0,0),改成原地等一步,保留已记下的结果
+                    NSMutableDictionary *ma = [(act2 ?: act) mutableCopy];
+                    if (!ma[@"found"] && act[@"found"]) ma[@"found"] = act[@"found"];
+                    [ma removeObjectsForKeys:@[@"x", @"y", @"x2", @"y2", @"id", @"direction", @"name", @"text"]];
+                    ma[@"action"] = @"wait"; act = ma;
+                    agentSay(@"重问后动作仍无效,本步不执行,下一步带截图重看");
+                    [history addObject:[NSString stringWithFormat:@"%d. (系统:你连续两次给出无效动作,本步没有执行。请用列表里的 id 或有效坐标给出动作)", step]];
+                    needImage = YES;
+                }
             }
             prevImg = img;
             if ([act[@"need_image"] respondsToSelector:@selector(boolValue)] && [act[@"need_image"] boolValue]) needImage = YES;
@@ -1728,6 +1741,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                     }
                     if (f.length < 2) continue;
                     if (f.length > 60) f = [f substringToIndex:60];
+                    if (compareTask && [f rangeOfCharacterFromSet:NSCharacterSet.decimalDigitCharacterSet].location == NSNotFound) continue; // v0.9.33:比价时没有价格数字的“记录”不收
                     NSString *line = [NSString stringWithFormat:@"[%@] %@", tagName, f];
                     if ([findings containsObject:line] || findings.count >= 40) continue;
                     if (findingDup(findings, line)) continue; // v0.9.26:同平台同价格、名字互相包含的视为重复
