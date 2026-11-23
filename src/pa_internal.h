@@ -127,10 +127,8 @@ BOOL paOn(NSString *key, BOOL def);
 void touchAdjust(double *x, double *y);
 void doTapRaw(double x, double y);
 void doSwipeSmooth(double x1, double y1, double x2, double y2, int ms, int holdMs);
-void doEdgeBackSwipe(int variant); // v0.9.45
-uint64_t realTouchSenderID(NSString **info); // v0.9.47
-void doEdgeSwipeExp(int v, uint64_t realID);  // v0.9.47
-NSDictionary *axTopLeftButton(void); // v0.9.45:左上角导航栏的返回按钮(无文字也算)
+NSDictionary *axTopLeftButton(void); // v0.9.45:左上角导航栏的返回按钮(无文字也算);v0.9.49:有其他文字的按钮不算
+BOOL axPerformEscape(NSString **how); // v0.9.49:无障碍“退出”动作(VoiceOver 两指画 Z),标准导航页会返回上一页
 NSData *frameThumb(NSData *jpeg);
 int thumbChangedCells(NSData *a, NSData *b);
 int thumbTotalCells(void);

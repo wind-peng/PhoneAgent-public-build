@@ -294,12 +294,66 @@ NSDictionary *axTopLeftButton(void) {
                 NSString *l = axKV(el, @"label"); if (![l isKindOfClass:NSString.class]) l = @"";
                 unsigned long long t = [axKV(el, @"traits") unsignedLongLongValue];
                 BOOL btn = (t & 0x1ULL) != 0;
-                BOOL backWord = [l containsString:@"返回"] || [l.lowercaseString containsString:@"back"];
+                BOOL backWord = [l containsString:@"返回"] || [l.lowercaseString containsString:@"back"] || [l containsString:@"关闭"] || [l.lowercaseString containsString:@"close"];
                 if (!btn && !backWord) continue;
+                if (l.length && !backWord) continue; // v0.9.49:有别的文字(扫一扫、头像、菜单…)的不是返回,跳过;只收返回/关闭或无文字的箭头
                 return @{@"x": @(CGRectGetMidX(r)), @"y": @(CGRectGetMidY(r)), @"text": l.length ? l : @"(无文字按钮)"};
             }
     } @catch (NSException *e) {}
     return nil;
+}
+
+// v0.9.49:无障碍“退出”动作(VoiceOver 两指画 Z 对应的 accessibilityPerformEscape)。
+// 私有接口的名字没法提前确认,所以运行时在 AXElement 上找名字里带 scape 的无参方法,依次对前台 App 和屏幕中间的元素调用。
+// 只负责“发出去”;有没有真的返回由调用方对比前后画面判断。
+BOOL axPerformEscape(NSString **how) {
+    if (how) *how = @"";
+    @try {
+        axInitOnce();
+        Class cE = NSClassFromString(@"AXElement");
+        if (!cE) { if (how) *how = @"没有 AXElement 类"; return NO; }
+        NSMutableArray *sels = [NSMutableArray array];
+        for (Class c = cE; c && c != NSObject.class; c = class_getSuperclass(c)) {
+            unsigned n = 0; Method *ms = class_copyMethodList(c, &n);
+            for (unsigned i = 0; i < n; i++) {
+                NSString *nm = NSStringFromSelector(method_getName(ms[i]));
+                if ([nm rangeOfString:@":"].location == NSNotFound && [nm.lowercaseString containsString:@"scape"] && ![sels containsObject:nm]) [sels addObject:nm];
+            }
+            free(ms);
+        }
+        if (!sels.count) { if (how) *how = @"系统里没找到无障碍退出方法"; return NO; }
+        CGSize sz = UIScreen.mainScreen.bounds.size;
+        id front = nil;
+        SEL sa = NSSelectorFromString(@"applicationAtCoordinate:");
+        if ([cE respondsToSelector:sa]) front = ((id (*)(id, SEL, CGPoint))objc_msgSend)(cE, sa, CGPointMake(sz.width / 2, sz.height / 2));
+        id mid = axHitAt(CGPointMake(sz.width / 2, sz.height * 0.45));
+        NSMutableArray *targets = [NSMutableArray array];
+        if (front) [targets addObject:@[@"前台App", front]];
+        if (mid) [targets addObject:@[@"屏幕中间元素", mid]];
+        if (!targets.count) { if (how) *how = @"拿不到前台 App 的无障碍对象"; return NO; }
+        // 优先名字最像的
+        [sels sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+            BOOL pa = [a.lowercaseString containsString:@"perform"], pb = [b.lowercaseString containsString:@"perform"];
+            return pa == pb ? [a compare:b] : (pa ? NSOrderedAscending : NSOrderedDescending);
+        }];
+        for (NSArray *tg in targets) {
+            id el = tg[1];
+            for (NSString *nm in sels) {
+                SEL s = NSSelectorFromString(nm);
+                if (![el respondsToSelector:s]) continue;
+                Method m = class_getInstanceMethod(object_getClass(el), s);
+                char rt[32] = {0}; if (m) method_getReturnType(m, rt, sizeof rt);
+                BOOL ok = YES;
+                if (rt[0] == 'B' || rt[0] == 'c') ok = ((BOOL (*)(id, SEL))objc_msgSend)(el, s);
+                else if (rt[0] == 'v') ((void (*)(id, SEL))objc_msgSend)(el, s);
+                else continue; // 返回对象/数字的多半是读属性,不是动作
+                if (how) *how = [NSString stringWithFormat:@"%@.%@%@", tg[0], nm, ok ? @"" : @"(返回NO)"];
+                if (ok) return YES;
+            }
+        }
+        if (how && !(*how).length) *how = [NSString stringWithFormat:@"找到方法 %@ 但对象不支持", [sels componentsJoinedByString:@","]];
+    } @catch (NSException *e) { if (how) *how = [@"无障碍退出异常:" stringByAppendingString:e.reason ?: @""]; }
+    return NO;
 }
 
 NSArray *axReadScreen(NSString *frontBid, int *msOut, NSString **howOut) {

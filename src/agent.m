@@ -441,23 +441,40 @@ static NSString *agGoBack(NSArray *items, BOOL *okOut) {
     if ([frontmostBundleID() isEqualToString:@"com.apple.springboard"]) return @"现在在主屏幕,没有可返回的页面";
     CGSize sc = screenSize();
     CFAbsoluteTime t0 = 0; NSData *th0 = frameThumb(currentFrame(&t0));
-    // v0.9.48:真机实验 5 种模拟侧滑都不触发系统的边缘返回,不再侧滑;直接找左上角返回按钮(文字或无文字的箭头)
+    // v0.9.48:真机实验 5 种模拟侧滑都不触发系统的边缘返回,不再侧滑
+    // v0.9.49:顺序 = 左上角写着“返回/关闭”的按钮 → 无障碍“退出”动作 → 左上角无文字的箭头按钮
     NSDictionary *hit = nil;
     for (NSDictionary *it in items) {
         double x = [it[@"x"] doubleValue], y = [it[@"y"] doubleValue];
         if (y < sc.height * 0.14 && x < sc.width * 0.3 && agIsBackText([it[@"text"] description])) { hit = it; break; }
     }
-    if (!hit) hit = axTopLeftButton();
+    NSDictionary *axBtn = hit ? nil : axTopLeftButton();
+    BOOL axUnlabeled = axBtn && [[axBtn[@"text"] description] isEqualToString:@"(无文字按钮)"];
+    if (!hit && axBtn && !axUnlabeled) hit = axBtn;
+    NSString *escNote = @"";
+    if (!hit) {
+        NSString *how = nil;
+        if (axPerformEscape(&how)) {
+            waitScreenSettle(0.4, 2.0);
+            if (agScreenChanged(th0, t0)) {
+                if (okOut) *okOut = YES;
+                return [NSString stringWithFormat:@"用无障碍“退出”动作返回,屏幕已变化(%@)", how];
+            }
+            escNote = [NSString stringWithFormat:@"无障碍“退出”已发出但屏幕没变化(%@);", how];
+            t0 = 0; th0 = frameThumb(currentFrame(&t0));
+        } else escNote = [NSString stringWithFormat:@"无障碍“退出”不可用(%@);", how ?: @""];
+        if (axUnlabeled) hit = axBtn;
+    }
     if (hit) {
         NSString *t = [hit[@"text"] description];
         doTap([hit[@"x"] doubleValue], [hit[@"y"] doubleValue]);
         waitScreenSettle(0.4, 2.0);
         BOOL ch = agScreenChanged(th0, t0);
         if (okOut) *okOut = ch;
-        return ch ? [NSString stringWithFormat:@"点了左上角的“%@”,屏幕已变化", t]
-                  : [NSString stringWithFormat:@"点了左上角的“%@”,屏幕没变化", t];
+        return ch ? [NSString stringWithFormat:@"%@点了左上角的“%@”,屏幕已变化", escNote, t]
+                  : [NSString stringWithFormat:@"%@点了左上角的“%@”,屏幕没变化", escNote, t];
     }
-    return @"左上角没找到“返回”按钮。这一页可能不支持返回:请点左上角的返回箭头图标(给 x,y)、右上角的关闭/×,或用 home、open_app 换路";
+    return [escNote stringByAppendingString:@"左上角没找到“返回”按钮。这一页可能不支持返回:请点左上角的返回箭头图标(给 x,y)、右上角的关闭/×,或用 home、open_app 换路"];
 }
 
 // ---- v0.9.44:关闭 App。先直接结束它的进程(巨魔安装、无沙盒才可能做到),不行再用多任务界面上划 ----
@@ -978,8 +995,11 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
             }
             if (paOn(@"smart_settle", YES)) waitScreenSettle(1.0, 4.0); else sleep(3);
         } else if ([act isEqualToString:@"back"]) {
-            agentSay([@"返回:" stringByAppendingString:agGoBack(items, NULL)]);
-            expRecord(@{@"a": @"back"});
+            BOOL bok = NO;
+            NSString *bn = agGoBack(items, &bok);
+            agentSay([@"返回:" stringByAppendingString:bn]);
+            if (bok) expRecord(@{@"a": @"back"}); // v0.9.49:没生效的返回不记进经验库
+            else pendingNote = [NSString stringWithFormat:@"(系统提示:上一步返回没有生效:%@)", bn]; // v0.9.49:失败原因告诉模型
         } else if ([act isEqualToString:@"home"]) {
             NSString *hn = nil;
             goHome(&hn);
@@ -2333,7 +2353,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             result = bok ? [@"返回成功,已回到上一页:" stringByAppendingString:bn] : bn;
             agentSay([@"返回:" stringByAppendingString:bn]);
             [history addObject:[NSString stringWithFormat:@"%d. back → %@", step, result]];
-            expRecord(@{@"a": @"back"});
+            if (bok) expRecord(@{@"a": @"back"}); // v0.9.49:没生效的返回不记进经验库
             if (!bok) failedLast = YES;
             settled = YES; checkStale = YES;
             [queue removeAllObjects];
