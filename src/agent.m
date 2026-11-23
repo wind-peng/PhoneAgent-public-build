@@ -2334,8 +2334,10 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
         } else if ([action isEqualToString:@"back"]) { // v0.9.44
             BOOL bok = NO;
             NSString *bn = agGoBack(items, &bok);
-            result = bok ? @"已执行" : bn;
-            [history addObject:[NSString stringWithFormat:@"%d. back → %@", step, bn]];
+            // v0.9.46:成功时也把具体结果(已回到上一页、用了哪种方式)告诉模型和用户,模型才知道返回已经成功
+            result = bok ? [@"返回成功,已回到上一页:" stringByAppendingString:bn] : bn;
+            agentSay([@"返回:" stringByAppendingString:bn]);
+            [history addObject:[NSString stringWithFormat:@"%d. back → %@", step, result]];
             expRecord(@{@"a": @"back"});
             if (!bok) failedLast = YES;
             settled = YES; checkStale = YES;
