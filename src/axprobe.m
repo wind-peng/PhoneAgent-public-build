@@ -394,6 +394,46 @@ NSString *axEscapeDiag(void) {
     return [out componentsJoinedByString:@"\n"];
 }
 
+// v0.9.52:退出实验。1) 查屏幕中间元素/前台 App 支持哪些动作编号(只查询,不执行);2) 依次试 pressTVBackButton、pressTVMenuButton,
+// 每试一个就看屏幕变没变(changed 由调用方给),变了就停
+NSString *axEscapeExperiment(BOOL (^changed)(void)) {
+    NSMutableArray *out = [NSMutableArray array];
+    @try {
+        axInitOnce();
+        CGSize sz = UIScreen.mainScreen.bounds.size;
+        Class cE = NSClassFromString(@"AXElement");
+        id front = nil; SEL sa = NSSelectorFromString(@"applicationAtCoordinate:");
+        if ([cE respondsToSelector:sa]) front = ((id (*)(id, SEL, CGPoint))objc_msgSend)(cE, sa, CGPointMake(sz.width / 2, sz.height / 2));
+        id mid = axHitAt(CGPointMake(sz.width / 2, sz.height * 0.45));
+        SEL sup = NSSelectorFromString(@"supportsAction:");
+        for (NSArray *tg in @[@[@"中间元素", mid ?: NSNull.null], @[@"前台App", front ?: NSNull.null]]) {
+            id el = tg[1];
+            if (el == NSNull.null || ![el respondsToSelector:sup]) { [out addObject:[tg[0] stringByAppendingString:@":不能查"]]; continue; }
+            NSMutableArray *ids = [NSMutableArray array];
+            for (int i = 2000; i < 2100; i++) if (((BOOL (*)(id, SEL, int))objc_msgSend)(el, sup, i)) [ids addObject:@(i)];
+            for (int i = 5000; i < 5100; i++) if (((BOOL (*)(id, SEL, int))objc_msgSend)(el, sup, i)) [ids addObject:@(i)];
+            [out addObject:[NSString stringWithFormat:@"%@支持的动作号:%@", tg[0], ids.count ? [ids componentsJoinedByString:@","] : @"无"]];
+        }
+        for (NSString *nm in @[@"pressTVBackButton", @"pressTVMenuButton"]) {
+            for (NSArray *tg in @[@[@"中间元素", mid ?: NSNull.null], @[@"前台App", front ?: NSNull.null]]) {
+                id el = tg[1]; SEL s = NSSelectorFromString(nm);
+                if (el == NSNull.null || ![el respondsToSelector:s]) continue;
+                Method m = class_getInstanceMethod(object_getClass(el), s);
+                char rt[32] = {0}; if (m) method_getReturnType(m, rt, sizeof rt);
+                NSString *ret = @"";
+                if (rt[0] == 'B' || rt[0] == 'c') ret = ((BOOL (*)(id, SEL))objc_msgSend)(el, s) ? @"返回YES" : @"返回NO";
+                else if (rt[0] == 'v') ((void (*)(id, SEL))objc_msgSend)(el, s);
+                else { [out addObject:[NSString stringWithFormat:@"%@.%@ 类型 %s 跳过", tg[0], nm, rt]]; continue; }
+                usleep(1500 * 1000);
+                BOOL ch = changed ? changed() : NO;
+                [out addObject:[NSString stringWithFormat:@"%@.%@ %@ → %@", tg[0], nm, ret, ch ? @"屏幕变了 ✅" : @"没变"]];
+                if (ch) return [out componentsJoinedByString:@"\n"];
+            }
+        }
+    } @catch (NSException *e) { [out addObject:[@"异常:" stringByAppendingString:e.reason ?: @""]]; }
+    return [out componentsJoinedByString:@"\n"];
+}
+
 NSArray *axReadScreen(NSString *frontBid, int *msOut, NSString **howOut) {
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
     if (msOut) *msOut = 0;

@@ -688,17 +688,17 @@ static NSData *attachJPEG(UIImage *img) {
     agentSay(@"[退出测试] 6 秒后开始,请切到一个能返回的页面");
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         sleep(6);
-        CFAbsoluteTime t0 = 0; NSData *f0 = currentFrame(&t0); NSData *th0 = f0 ? frameThumb(f0) : nil;
-        agentSay([@"[退出测试] 接口诊断:\n" stringByAppendingString:axEscapeDiag()]); // v0.9.51
-        NSString *how = nil;
-        BOOL sent = axPerformEscape(&how);
-        sleep(2);
-        CFAbsoluteTime t1 = 0; NSData *f1 = currentFrame(&t1);
-        NSString *r;
-        if (!sent) r = [@"没发出去:" stringByAppendingString:how ?: @""];
-        else if (!th0 || !f1) r = [NSString stringWithFormat:@"已发出(%@),没开屏幕录制判断不了,请看手机有没有返回", how];
-        else r = [NSString stringWithFormat:@"已发出(%@),%@", how, ((t1 != t0) && thumbChangedCells(th0, frameThumb(f1)) > 1) ? @"屏幕变了 ✅ 生效" : @"屏幕没变 ❌"];
-        agentSay([@"[退出测试] " stringByAppendingString:r]);
+        // v0.9.52:查支持的动作号 + 试 pressTVBackButton / pressTVMenuButton
+        __block CFAbsoluteTime t0 = 0; __block NSData *th0 = frameThumb(currentFrame(&t0));
+        BOOL (^changed)(void) = ^BOOL{
+            CFAbsoluteTime t1 = 0; NSData *f1 = currentFrame(&t1);
+            if (!th0 || !f1) return NO;
+            BOOL ch = (t1 != t0) && thumbChangedCells(th0, frameThumb(f1)) > 1;
+            if (!ch) { t0 = t1; th0 = frameThumb(f1); }
+            return ch;
+        };
+        NSString *r = axEscapeExperiment(changed);
+        agentSay([NSString stringWithFormat:@"[退出测试]%@\n%@", th0 ? @"" : @"(没开屏幕录制,判断不了变化,请看手机)", r]);
     });
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"无障碍“退出”测试" message:@"6 秒后开始。现在切到一个能返回的页面(比如设置里的子页面、微信朋友圈),别碰屏幕,等约 10 秒再回来看执行记录。" preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
