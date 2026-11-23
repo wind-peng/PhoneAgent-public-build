@@ -422,7 +422,7 @@ static BOOL agPasteText(NSString *text, double x, double y, NSString *backHint, 
 }
 
 // iPhone 没有返回键:优先点屏幕左上角的“返回/取消/关闭”文字,否则点左上角箭头的常见位置
-// v0.9.44:返回 = 先从左边缘右滑(iOS 通用的侧滑返回);屏幕没变再点识别到的左上角返回按钮;都不行就如实告诉模型,不再盲点
+// v0.9.48:返回 = 点识别到的左上角返回按钮(模拟侧滑在真机上不触发);找不到就如实告诉模型,不盲点
 static BOOL agScreenChanged(NSData *th0, CFAbsoluteTime t0) {
     CFAbsoluteTime t1 = 0; NSData *f1 = currentFrame(&t1);
     if (!th0 || !f1) return YES; // 拿不到画面就没法核对,按已生效处理
@@ -441,12 +441,7 @@ static NSString *agGoBack(NSArray *items, BOOL *okOut) {
     if ([frontmostBundleID() isEqualToString:@"com.apple.springboard"]) return @"现在在主屏幕,没有可返回的页面";
     CGSize sc = screenSize();
     CFAbsoluteTime t0 = 0; NSData *th0 = frameThumb(currentFrame(&t0));
-    // v0.9.45:两种侧滑各试一次,再找左上角返回按钮(先看已读到的文字,再按坐标问无障碍,无文字的箭头也能找到)
-    for (int v = 0; v < 2; v++) {
-        doEdgeBackSwipe(v);
-        waitScreenSettle(0.4, 2.0);
-        if (agScreenChanged(th0, t0)) { if (okOut) *okOut = YES; return [NSString stringWithFormat:@"从屏幕左边缘右滑返回(方式%d),屏幕已变化", v + 1]; }
-    }
+    // v0.9.48:真机实验 5 种模拟侧滑都不触发系统的边缘返回,不再侧滑;直接找左上角返回按钮(文字或无文字的箭头)
     NSDictionary *hit = nil;
     for (NSDictionary *it in items) {
         double x = [it[@"x"] doubleValue], y = [it[@"y"] doubleValue];
@@ -459,10 +454,10 @@ static NSString *agGoBack(NSArray *items, BOOL *okOut) {
         waitScreenSettle(0.4, 2.0);
         BOOL ch = agScreenChanged(th0, t0);
         if (okOut) *okOut = ch;
-        return ch ? [NSString stringWithFormat:@"侧滑没反应,点了左上角的“%@”,屏幕已变化", t]
-                  : [NSString stringWithFormat:@"侧滑和点左上角的“%@”都没让屏幕变化", t];
+        return ch ? [NSString stringWithFormat:@"点了左上角的“%@”,屏幕已变化", t]
+                  : [NSString stringWithFormat:@"点了左上角的“%@”,屏幕没变化", t];
     }
-    return @"侧滑返回没反应,左上角也没找到“返回”按钮。这一页可能不支持返回:请点左上角的返回箭头图标(给 x,y)、右上角的关闭/×,或用 home、open_app 换路";
+    return @"左上角没找到“返回”按钮。这一页可能不支持返回:请点左上角的返回箭头图标(给 x,y)、右上角的关闭/×,或用 home、open_app 换路";
 }
 
 // ---- v0.9.44:关闭 App。先直接结束它的进程(巨魔安装、无沙盒才可能做到),不行再用多任务界面上划 ----
