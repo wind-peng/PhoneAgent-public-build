@@ -422,17 +422,103 @@ static BOOL agPasteText(NSString *text, double x, double y, NSString *backHint, 
 }
 
 // iPhone 没有返回键:优先点屏幕左上角的“返回/取消/关闭”文字,否则点左上角箭头的常见位置
-static NSString *agGoBack(NSArray *items) {
+// v0.9.44:返回 = 先从左边缘右滑(iOS 通用的侧滑返回);屏幕没变再点识别到的左上角返回按钮;都不行就如实告诉模型,不再盲点
+static BOOL agScreenChanged(NSData *th0, CFAbsoluteTime t0) {
+    CFAbsoluteTime t1 = 0; NSData *f1 = currentFrame(&t1);
+    if (!th0 || !f1) return YES; // 拿不到画面就没法核对,按已生效处理
+    if (t1 == t0) return NO;
+    return thumbChangedCells(th0, frameThumb(f1)) > 1;
+}
+
+static BOOL agIsBackText(NSString *t) {
+    if (!t.length || t.length > 8) return NO;
+    for (NSString *k in @[@"返回", @"Back", @"back", @"取消", @"关闭"]) if ([t containsString:k]) return YES;
+    return [@[@"<", @"＜", @"く", @"〈", @"‹"] containsObject:t];
+}
+
+static NSString *agGoBack(NSArray *items, BOOL *okOut) {
+    if (okOut) *okOut = NO;
+    if ([frontmostBundleID() isEqualToString:@"com.apple.springboard"]) return @"现在在主屏幕,没有可返回的页面";
+    CGSize sc = screenSize();
+    CFAbsoluteTime t0 = 0; NSData *th0 = frameThumb(currentFrame(&t0));
+    doEdgeBackSwipe();
+    waitScreenSettle(0.4, 2.0);
+    if (agScreenChanged(th0, t0)) { if (okOut) *okOut = YES; return @"从屏幕左边缘右滑返回,屏幕已变化"; }
     for (NSDictionary *it in items) {
-        NSString *t = it[@"text"];
+        NSString *t = [it[@"text"] description];
         double x = [it[@"x"] doubleValue], y = [it[@"y"] doubleValue];
-        if (y < 150 && x < 200 && ([t containsString:@"返回"] || [t isEqualToString:@"取消"] || [t isEqualToString:@"关闭"])) {
+        if (y < sc.height * 0.14 && x < sc.width * 0.3 && agIsBackText(t)) {
             doTap(x, y);
-            return [NSString stringWithFormat:@"点击了左上角的“%@”", t];
+            waitScreenSettle(0.4, 2.0);
+            BOOL ch = agScreenChanged(th0, t0);
+            if (okOut) *okOut = ch;
+            return ch ? [NSString stringWithFormat:@"侧滑没反应,点了左上角的“%@”,屏幕已变化", t]
+                      : [NSString stringWithFormat:@"侧滑和点左上角的“%@”都没让屏幕变化", t];
         }
     }
-    doTap(28, 70);
-    return @"点击了左上角返回箭头的常见位置";
+    return @"侧滑返回没反应,左上角也没找到“返回”按钮。这一页可能不支持返回:请点左上角的返回箭头图标(给 x,y)、右上角的关闭/×,或用 home、open_app 换路";
+}
+
+// ---- v0.9.44:关闭 App。先直接结束它的进程(巨魔安装、无沙盒才可能做到),不行再用多任务界面上划 ----
+extern int proc_listallpids(void *buffer, int buffersize);
+extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+
+static NSString *paNormPath(NSString *p) { return [p hasPrefix:@"/private/"] ? [p substringFromIndex:8] : p; }
+
+// 返回这个 App 正在运行的进程号;查不到 App 路径返回 nil
+static NSArray *pidsForBundle(NSString *bid) {
+    Class c = NSClassFromString(@"LSApplicationProxy");
+    if (!c || !bid.length) return nil;
+    id px = ((id (*)(id, SEL, id))objc_msgSend)(c, NSSelectorFromString(@"applicationProxyForIdentifier:"), bid);
+    if (!px || ![px respondsToSelector:NSSelectorFromString(@"bundleURL")]) return nil;
+    NSURL *u = ((id (*)(id, SEL))objc_msgSend)(px, NSSelectorFromString(@"bundleURL"));
+    if (!u.path.length) return nil;
+    NSString *root = paNormPath(u.path.stringByStandardizingPath);
+    if (![root hasSuffix:@"/"]) root = [root stringByAppendingString:@"/"];
+    int n = proc_listallpids(NULL, 0);
+    if (n <= 0) return nil;
+    int cap = n + 64;
+    pid_t *buf = calloc(cap, sizeof(pid_t));
+    if (!buf) return nil;
+    n = proc_listallpids(buf, cap * (int)sizeof(pid_t));
+    NSMutableArray *out = [NSMutableArray array];
+    char path[4096];
+    for (int i = 0; i < n; i++) {
+        if (buf[i] <= 1 || buf[i] == getpid()) continue;
+        if (proc_pidpath(buf[i], path, sizeof path) <= 0) continue;
+        NSString *p = paNormPath([NSString stringWithUTF8String:path] ?: @"");
+        if ([p hasPrefix:root]) [out addObject:@(buf[i])];
+    }
+    free(buf);
+    return out;
+}
+
+static BOOL closeApp(NSString *bid, NSString **note) {
+    if (!bid.length || [bid isEqualToString:NSBundle.mainBundle.bundleIdentifier] || [bid isEqualToString:@"com.apple.springboard"]) {
+        *note = @"不能关闭 PhoneAgent 自己或主屏幕"; return NO;
+    }
+    NSArray *pids = pidsForBundle(bid);
+    if (pids && !pids.count) { *note = @"这个 App 本来就没有在运行"; return YES; }
+    if (pids.count) {
+        int killed = 0, firstErr = 0;
+        for (NSNumber *p in pids) { if (kill(p.intValue, SIGKILL) == 0) killed++; else if (!firstErr) firstErr = errno; }
+        usleep(800 * 1000);
+        NSArray *left = pidsForBundle(bid);
+        if (killed && left && !left.count) { *note = @"已直接结束进程"; sleep(1); return YES; }
+        agentSay([NSString stringWithFormat:@"直接结束进程没成功(%d/%lu,errno %d),改用多任务界面上划", killed, (unsigned long)pids.count, firstErr]);
+    }
+    // 退路:让它到前台,从底部上滑停住打开多任务界面,再把居中的卡片往上甩掉
+    if (![frontmostBundleID() isEqualToString:bid]) { if (!openApp(bid)) { *note = @"打不开这个 App,没法在多任务界面里划掉它"; return NO; } sleep(2); }
+    CGSize sc = screenSize();
+    doSwipeSmooth(sc.width / 2, sc.height - 2, sc.width / 2, sc.height * 0.62, 420, 600);
+    usleep(900 * 1000);
+    doSwipe(sc.width / 2, sc.height * 0.5, sc.width / 2, sc.height * 0.06, 6, 90);
+    usleep(800 * 1000);
+    NSString *hn = nil; goHome(&hn);
+    NSArray *left = pidsForBundle(bid);
+    if (left && !left.count) { *note = @"已在多任务界面划掉"; return YES; }
+    if (!left) { *note = @"已在多任务界面尝试划掉(无法确认是否关闭)"; return YES; }
+    *note = @"多任务界面上划后进程仍在,关闭可能没成功"; return NO;
 }
 
 #pragma mark - 需要用户参与(暂停 / 确认)、敏感操作与禁止 App、经验库回放
@@ -692,7 +778,7 @@ static int expReplay(NSDictionary *entry, NSMutableArray *history, int *done, NS
             NSString *hn = nil; goHome(&hn); sleep(1);
         } else if ([a isEqualToString:@"back"]) {
             NSString *e = nil; NSArray *items = agScreenItems(&e);
-            agGoBack(items); sleep(2);
+            agGoBack(items, NULL);
         } else if ([a isEqualToString:@"ask_user"]) {
             int r = agentAsk(@"pause", st[@"text"] ?: @"需要你处理");
             if (r < 0) return -1;
@@ -891,9 +977,8 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
             }
             if (paOn(@"smart_settle", YES)) waitScreenSettle(1.0, 4.0); else sleep(3);
         } else if ([act isEqualToString:@"back"]) {
-            agentSay([@"返回:" stringByAppendingString:agGoBack(items)]);
+            agentSay([@"返回:" stringByAppendingString:agGoBack(items, NULL)]);
             expRecord(@{@"a": @"back"});
-            if (paOn(@"smart_settle", YES)) waitScreenSettle(0.3, 2.5); else sleep(2);
         } else if ([act isEqualToString:@"home"]) {
             NSString *hn = nil;
             goHome(&hn);
@@ -1238,7 +1323,9 @@ static NSString *validateAct(NSDictionary *act, NSUInteger nItems) {
         if (!hasID && !hasXY) return @"input_text 需要输入框的 id 或 x,y";
     } else if ([a isEqualToString:@"open_app"]) {
         if (![[act[@"name"] description] length]) return @"open_app 需要 name";
-    } else if (![@[@"home", @"wait", @"done", @"stop", @"ask_user", @"set_clipboard"] containsObject:a]) {
+    } else if ([a isEqualToString:@"close_app"]) {
+        if (![[act[@"name"] description] length]) return @"close_app 需要 name";
+    } else if (![@[@"home", @"back", @"wait", @"done", @"stop", @"ask_user", @"set_clipboard"] containsObject:a]) {
         return [NSString stringWithFormat:@"不认识的动作「%@」", a];
     }
     return nil;
@@ -2238,6 +2325,25 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             afterAction(0.3, 2.0, 1); settled = YES;
             checkStale = YES;
             [queue removeAllObjects];
+        } else if ([action isEqualToString:@"back"]) { // v0.9.44
+            BOOL bok = NO;
+            NSString *bn = agGoBack(items, &bok);
+            result = bok ? @"已执行" : bn;
+            [history addObject:[NSString stringWithFormat:@"%d. back → %@", step, bn]];
+            expRecord(@{@"a": @"back"});
+            if (!bok) failedLast = YES;
+            settled = YES; checkStale = YES;
+            [queue removeAllObjects];
+        } else if ([action isEqualToString:@"close_app"]) { // v0.9.44
+            NSString *name = [act[@"name"] description] ?: @"";
+            NSString *info = nil, *cn = nil;
+            NSString *bid = bundleForAppName(name, &info);
+            if (!bid) result = info ?: @"没找到这个 App";
+            else result = closeApp(bid, &cn) ? [NSString stringWithFormat:@"已关闭「%@」:%@。需要的话用 open_app 重新打开", name, cn] : (cn ?: @"关闭失败");
+            [history addObject:[NSString stringWithFormat:@"%d. close_app(%@) → %@", step, name, result]];
+            if ([bid isEqualToString:taskApp]) expectHome = YES;
+            afterAction(0.5, 3.0, 2); settled = YES; checkStale = YES;
+            [queue removeAllObjects];
         } else if ([action isEqualToString:@"wait"]) {
             [history addObject:[NSString stringWithFormat:@"%d. wait", step]];
             usleep(1500 * 1000);
@@ -2280,7 +2386,15 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
 }
 
 // 对外的入口:开始/收尾都在这里处理,中间走原来的逻辑
+static void agentRunClaimed(NSString *task, NSString *base, NSString *key, NSString *model);
+static volatile int gRunClaim = 0; // v0.9.44:同一时间只允许一个 agentRun(两个入口几乎同时触发时,后来的直接放弃)
 void agentRun(NSString *task, NSString *base, NSString *key, NSString *model) {
+    if (!__sync_bool_compare_and_swap(&gRunClaim, 0, 1)) { agentSay(@"已有任务在运行,这个新任务没有启动"); return; }
+    @try { agentRunClaimed(task, base, key, model); }
+    @finally { __sync_lock_release(&gRunClaim); }
+}
+
+static void agentRunClaimed(NSString *task, NSString *base, NSString *key, NSString *model) {
     taskRunBegin(task);
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     if (![ud boolForKey:@"mig_0921"]) { // v0.9.21:经验回放改为默认关,清掉以前保存的开关;精确 OCR 停用

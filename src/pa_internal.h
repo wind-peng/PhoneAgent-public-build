@@ -127,6 +127,7 @@ BOOL paOn(NSString *key, BOOL def);
 void touchAdjust(double *x, double *y);
 void doTapRaw(double x, double y);
 void doSwipeSmooth(double x1, double y1, double x2, double y2, int ms, int holdMs);
+void doEdgeBackSwipe(void);
 NSData *frameThumb(NSData *jpeg);
 int thumbChangedCells(NSData *a, NSData *b);
 int thumbTotalCells(void);

@@ -40,6 +40,9 @@ NSString *loadHID(void) {
 
 // phase: 0=按下 1=移动 2=抬起;nx/ny 是 0~1 的归一化坐标
 void sendFinger(double nx, double ny, int phase) {
+    // v0.9.44:所有注入坐标统一限制在屏幕内(经验回放、AutoGLM 的滑动之前没限制)
+    if (!(nx >= 0)) nx = 0; if (nx > 0.9995) nx = 0.9995;
+    if (!(ny >= 0)) ny = 0; if (ny > 0.9995) ny = 0.9995;
     uint64_t t = mach_absolute_time();
     BOOL touching = (phase != 2);
     uint32_t mask = (phase == 1) ? 0x4 : 0x3;
@@ -85,8 +88,19 @@ void doTap(double x, double y) {
 
 // v0.9.6 新滑动:按约 60Hz 均匀发送移动事件(用 mach_wait_until 保证间隔均匀),
 // 总时长约 ms 毫秒;到终点后原地停留 holdMs 毫秒(期间继续发同位置的移动事件让速度降为 0)再抬起,避免惯性甩动(fling)。
+static void swipeSmoothRaw(double x1, double y1, double x2, double y2, int ms, int holdMs);
 void doSwipeSmooth(double x1, double y1, double x2, double y2, int ms, int holdMs) {
     touchAdjust(&x1, &y1); touchAdjust(&x2, &y2);
+    swipeSmoothRaw(x1, y1, x2, y2, ms, holdMs);
+}
+
+// v0.9.44:iOS 侧滑返回:从屏幕最左边缘(不加校准偏移,偏移会把起点挪出边缘区)向右滑到 3/4 处
+void doEdgeBackSwipe(void) {
+    CGSize s = screenSize();
+    swipeSmoothRaw(0.5, s.height * 0.5, s.width * 0.78, s.height * 0.5, 260, 0);
+}
+
+static void swipeSmoothRaw(double x1, double y1, double x2, double y2, int ms, int holdMs) {
     CGSize s = screenSize();
     if (ms < 120) ms = 120;
     if (ms > 2000) ms = 2000;
@@ -114,6 +128,7 @@ void doSwipeSmooth(double x1, double y1, double x2, double y2, int ms, int holdM
 }
 
 void doSwipe(double x1, double y1, double x2, double y2, int steps, int ms) {
+    touchAdjust(&x1, &y1); touchAdjust(&x2, &y2); // v0.9.44:和平滑滑动一样应用校准偏移(开关默认关)
     CGSize s = screenSize();
     if (gSwipeMode >= 3) { if (steps < 40) steps = 40; if (ms < 700) ms = 700; }
     if (steps < 2) steps = 2;
