@@ -1434,7 +1434,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     NSMutableArray *findings = [NSMutableArray array];   // v0.9.21:模型用 found 记下的结果("[平台] 内容")
     NSMutableOrderedSet *visitedShops = [NSMutableOrderedSet orderedSet]; // 比价任务里进过的购物平台
     NSString *curShop = nil;
-    NSString *sameKey = nil, *sameShop = nil; // v0.9.36:比同款:第一个平台选定的同款搜索词
     BOOL confirmPendingImg = NO; // v0.9.32:确认后的核对:无障碍元素够用就不发截图
     int confirmStep = 0; NSString *confirmTgt = nil, *confirmSig = nil; double confirmX = -1, confirmY = -1; // v0.9.26:刚确认过的敏感点击
     int shopSinceStep = 0, lastNewFindStep = 0;
@@ -1817,12 +1816,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             }
             prevImg = img;
             if ([act[@"need_image"] respondsToSelector:@selector(boolValue)] && [act[@"need_image"] boolValue]) needImage = YES;
-            if (sameMode && !sameKey.length && [[act[@"same_key"] description] length] >= 2) { // v0.9.36
-                sameKey = [[[act[@"same_key"] description] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] copy];
-                if (sameKey.length > 24) sameKey = [sameKey substringToIndex:24];
-                sameShop = [curShop copy];
-                agentSay([NSString stringWithFormat:@"同款关键词:%@(来自%@)", sameKey, curShop ?: @"第一个平台"]);
-            }
             {   // v0.9.21:保存模型记下的结果
                 id fd = act[@"found"];
                 NSString *fs = [fd isKindOfClass:NSString.class] ? fd : ([fd isKindOfClass:NSArray.class] ? [fd componentsJoinedByString:@";"] : nil);

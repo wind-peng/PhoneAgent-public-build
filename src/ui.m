@@ -603,7 +603,6 @@ static NSData *attachJPEG(UIImage *img) {
         [self hdr:@"实验"], axT,
         [self sw:@"每次调用模型都在执行记录里写一行 Token 明细(第几步、几张图、输入/缓存/输出)" key:@"token_step_log" def:YES],
         [self hdr:@"模型请求"],
-        [self sw:@"用函数调用(tools)输出动作(GLM/DeepSeek;不支持时自动退回 JSON)" key:@"use_tool_calls" def:YES],
         [self sw:@"DeepSeek 分档:常规步骤 deepseek-flash,卡住/规划/完成自检用 deepseek-v4-pro" key:@"ds_tiering" def:YES],
         [self sw:@"常规步骤用低思考强度(更快更省)" key:@"easy_low_effort" def:YES],
         [self sw:@"文字步骤:OCR 足够时不发截图(更快更省)" key:@"text_only_steps" def:YES],
