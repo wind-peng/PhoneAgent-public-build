@@ -210,26 +210,25 @@ static NSString *const kAGPrompt =
 @"\n"
 @"必须遵循的规则：\n"
 @"1. 在执行任何操作前，先检查当前app是否是目标app，如果不是，先执行 Launch。\n"
-@"2. 如果进入到了无关页面，请根据屏幕自行判断如何返回。\n"
-@"3. 如果页面未加载出内容，最多连续 Wait 三次，否则返回后重新进入。\n"
-@"4. 如果页面显示网络问题，需要重新加载，请点击重新加载。\n"
-@"5. 如果当前页面找不到目标联系人、商品、店铺等信息，可以尝试 Swipe 滑动查找。\n"
-@"6. 遇到价格区间、时间区间等筛选条件，如果没有完全符合的，可以放宽要求。\n"
-@"7. 在做小红书总结类任务时一定要筛选图文笔记。\n"
-@"8. 购物车全选后再点击全选可以把状态设为全不选，在做购物车任务时，如果购物车里已经有商品被选中时，你需要点击全选后再点击取消全选，再去找需要购买或者删除的商品。\n"
-@"9. 在做外卖任务时，如果相应店铺购物车里已经有其他商品你需要先把购物车清空再去购买用户指定的外卖。\n"
-@"10. 在做点外卖任务时，如果用户需要点多个外卖，请尽量在同一店铺进行购买，如果无法找到可以下单，并说明某个商品未找到。\n"
-@"11. 请严格遵循用户意图执行任务，用户的特殊要求可以执行多次搜索，滑动查找。比如（i）用户要求点一杯咖啡，要咸的，你可以直接搜索咸咖啡，或者搜索咖啡后滑动查找咸的咖啡，比如海盐咖啡。（ii）用户要找到XX群，发一条消息，你可以先搜索XX群，找不到结果后，将\"群\"字去掉，搜索XX重试。（iii）用户要找到宠物友好的餐厅，你可以搜索餐厅，找到筛选，找到设施，选择可带宠物，或者直接搜索可带宠物，必要时可以使用AI搜索。\n"
-@"12. 在选择日期时，如果原滑动方向与预期日期越来越远，请向反方向滑动查找。\n"
-@"13. 执行任务过程中如果有多个可选择的项目栏，请逐个查找每个项目栏，直到完成任务，一定不要在同一项目栏多次查找，从而陷入死循环。\n"
-@"14. 在执行下一步操作前请一定要检查上一步的操作是否生效，如果点击没生效，可能因为app反应较慢，请先稍微等待一下，如果还是不生效请调整一下点击位置重试，如果仍然不生效请跳过这一步继续任务，并在finish message说明点击不生效。\n"
-@"15. 在执行任务中如果遇到滑动不生效的情况，请调整一下起始点位置，增大滑动距离重试，如果还是不生效，有可能是已经滑到底了，请继续向反方向滑动，直到顶部或底部，如果仍然没有符合要求的结果，请跳过这一步继续任务，并在finish message说明但没找到要求的项目。\n"
-@"16. 在做游戏任务时如果在战斗页面如果有自动战斗一定要开启自动战斗，如果多轮历史状态相似要检查自动战斗是否开启。\n"
-@"17. 如果没有合适的搜索结果，可能是因为搜索页面不对，请返回到搜索页面的上一级尝试重新搜索，如果尝试三次返回上一级搜索后仍然没有符合要求的结果，执行 finish(message=\"原因\")。\n"
-@"18. 在结束任务前请一定要仔细检查任务是否完整准确的完成，如果出现错选、漏选、多选的情况，请返回之前的步骤进行纠正。\n"
+@"2. 如果页面未加载出内容，最多连续 Wait 三次。\n"
+@"3. 如果页面显示网络问题，需要重新加载，请点击重新加载。\n"
+@"4. 如果当前页面找不到目标联系人、商品、店铺等信息，可以尝试 Swipe 滑动查找。\n"
+@"5. 遇到价格区间、时间区间等筛选条件，如果没有完全符合的，可以放宽要求。\n"
+@"6. 在做小红书总结类任务时一定要筛选图文笔记。\n"
+@"7. 购物车全选后再点击全选可以把状态设为全不选，在做购物车任务时，如果购物车里已经有商品被选中时，你需要点击全选后再点击取消全选，再去找需要购买或者删除的商品。\n"
+@"8. 在做外卖任务时，如果相应店铺购物车里已经有其他商品你需要先把购物车清空再去购买用户指定的外卖。\n"
+@"9. 在做点外卖任务时，如果用户需要点多个外卖，请尽量在同一店铺进行购买，如果无法找到可以下单，并说明某个商品未找到。\n"
+@"10. 请严格遵循用户意图执行任务，用户的特殊要求可以执行多次搜索，滑动查找。比如（i）用户要求点一杯咖啡，要咸的，你可以直接搜索咸咖啡，或者搜索咖啡后滑动查找咸的咖啡，比如海盐咖啡。（ii）用户要找到XX群，发一条消息，你可以先搜索XX群，找不到结果后，将\"群\"字去掉，搜索XX重试。（iii）用户要找到宠物友好的餐厅，你可以搜索餐厅，找到筛选，找到设施，选择可带宠物，或者直接搜索可带宠物，必要时可以使用AI搜索。\n"
+@"11. 在选择日期时，如果原滑动方向与预期日期越来越远，请向反方向滑动查找。\n"
+@"12. 执行任务过程中如果有多个可选择的项目栏，请逐个查找每个项目栏，直到完成任务，一定不要在同一项目栏多次查找，从而陷入死循环。\n"
+@"13. 在执行下一步操作前请一定要检查上一步的操作是否生效，如果点击没生效，可能因为app反应较慢，请先稍微等待一下，如果还是不生效请调整一下点击位置重试，如果仍然不生效请跳过这一步继续任务，并在finish message说明点击不生效。\n"
+@"14. 在执行任务中如果遇到滑动不生效的情况，请调整一下起始点位置，增大滑动距离重试，如果还是不生效，有可能是已经滑到底了，请继续向反方向滑动，直到顶部或底部，如果仍然没有符合要求的结果，请跳过这一步继续任务，并在finish message说明但没找到要求的项目。\n"
+@"15. 在做游戏任务时如果在战斗页面如果有自动战斗一定要开启自动战斗，如果多轮历史状态相似要检查自动战斗是否开启。\n"
+@"16. 如果没有合适的搜索结果，可能是因为搜索页面不对，请返回到搜索页面的上一级尝试重新搜索，如果尝试三次返回上一级搜索后仍然没有符合要求的结果，执行 finish(message=\"原因\")。\n"
+@"17. 在结束任务前请一定要仔细检查任务是否完整准确的完成，如果出现错选、漏选、多选的情况，请返回之前的步骤进行纠正。\n"
 @"\n"
 @"补充说明（当前设备是 iPhone）：\n"
-@"- iPhone 没有系统返回键，也没有 Back 动作，需要返回时请根据屏幕自行判断怎么操作；Type 由程序通过剪贴板粘贴来实现，无需关心键盘。\n"
+@"- Type 由程序通过剪贴板粘贴来实现，无需关心键盘。\n"
 @"- 涉及支付、转账、输入支付密码等花钱环节，不要自己点击，用 do(action=\"Take_over\", message=\"需要你本人完成付款\") 请用户本人完成；其余任务正常完成。\n"
 @"- finish 的 message 请写成给用户看的完整结果（如果任务是查询或总结信息，把信息完整写在 message 里）。";
 
@@ -834,7 +833,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
         NSString *info = [[NSString alloc] initWithData:infoJSON encoding:NSUTF8StringEncoding] ?: @"{}";
         NSMutableString *text = [NSMutableString stringWithFormat:@"%@** Screen Info **\n\n%@", step == 1 ? [task stringByAppendingString:@"\n\n"] : @"", info];
         if (pendingNote.length) { [text appendFormat:@"\n\n%@", pendingNote]; pendingNote = nil; }
-        if (same >= 2) [text appendString:@"\n\n(系统提示:上一步操作后屏幕没有变化,请换一种方式,例如调整点击位置、先 Wait、或返回后重进。)"];
+        if (same >= 2) [text appendString:@"\n\n(系统提示:上一步操作后屏幕没有变化,请换一种方式,例如调整点击位置、先 Wait。)"];
 
         NSString *b64 = [jpg base64EncodedStringWithOptions:0];
         NSDictionary *userMsg = @{@"role": @"user", @"content": @[
@@ -881,7 +880,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
             lastRepScreen = [sig copy] ?: @"";
             lastActKey = k;
             if (repeatCnt >= 5) { agentSay(@"任务停止:同一个动作已经连续重复 5 次,屏幕没有达到预期,已停止"); break; }
-            if (repeatCnt >= 3) pendingNote = [NSString stringWithFormat:@"(系统提示:同一个动作已经连续做了 %d 次,说明这个办法不起作用,请换一种办法,例如换位置、返回后换入口或改用搜索。)", repeatCnt];
+            if (repeatCnt >= 3) pendingNote = [NSString stringWithFormat:@"(系统提示:同一个动作已经连续做了 %d 次,说明这个办法不起作用,请换一种办法,例如换位置、换入口或改用搜索。)", repeatCnt];
         }
         double ax = 0, ay = 0, bx = 0, by = 0;
         BOOL hasEl = agPoint(action, @"element", &ax, &ay);
@@ -937,7 +936,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
             }
             if (paOn(@"smart_settle", YES)) waitScreenSettle(1.0, 4.0); else sleep(3);
         } else if ([act isEqualToString:@"back"]) { // v0.9.56:iPhone 没有返回键,程序不代点,让模型自己点
-            pendingNote = @"(系统提示:iPhone 没有返回键,Back 不会执行任何操作,请根据屏幕自行判断怎么返回。)";
+            pendingNote = @"(系统提示:Back 不是可用的动作。)";
         } else if ([act isEqualToString:@"home"]) {
             NSString *hn = nil;
             goHome(&hn);
@@ -1284,8 +1283,6 @@ static NSString *validateAct(NSDictionary *act, NSUInteger nItems) {
         if (![[act[@"name"] description] length]) return @"open_app 需要 name";
     } else if ([a isEqualToString:@"close_app"]) {
         if (![[act[@"name"] description] length]) return @"close_app 需要 name";
-    } else if ([a isEqualToString:@"back"]) {
-        return @"没有 back 动作:需要返回时请根据屏幕自行判断怎么操作";
     } else if (![@[@"home", @"wait", @"done", @"stop", @"ask_user", @"set_clipboard"] containsObject:a]) {
         return [NSString stringWithFormat:@"不认识的动作「%@」", a];
     }
@@ -2068,7 +2065,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             lastActKey = k;
             if (repeatCnt >= 5) { agentSay(@"任务停止:同一个动作已经连续重复 5 次,屏幕没有达到预期,已停止"); break; }
             if (repeatCnt >= 3) {
-                [history addObject:[NSString stringWithFormat:@"%d. (系统提示:同一个动作已经连续做了 %d 次,说明这个办法不起作用,请换一种办法,例如换目标、换位置、返回后换入口或改用搜索)", step, repeatCnt]];
+                [history addObject:[NSString stringWithFormat:@"%d. (系统提示:同一个动作已经连续做了 %d 次,说明这个办法不起作用,请换一种办法,例如换目标、换位置、换入口或改用搜索)", step, repeatCnt]];
                 failedLast = YES;
             }
         }
