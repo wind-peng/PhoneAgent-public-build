@@ -347,7 +347,7 @@ BOOL axPerformEscape(NSString **how) {
                 if (rt[0] == 'B' || rt[0] == 'c') ok = ((BOOL (*)(id, SEL))objc_msgSend)(el, s);
                 else if (rt[0] == 'v') ((void (*)(id, SEL))objc_msgSend)(el, s);
                 else continue; // 返回对象/数字的多半是读属性,不是动作
-                if (how) *how = [NSString stringWithFormat:@"%@.%@%@", tg[0], nm, ok ? @"" : @"(返回NO)"];
+                if (how) *how = [NSString stringWithFormat:@"%@.%@%@;候选方法 %@", tg[0], nm, ok ? @"" : @"(返回NO)", [sels componentsJoinedByString:@","]];
                 if (ok) return YES;
             }
         }
