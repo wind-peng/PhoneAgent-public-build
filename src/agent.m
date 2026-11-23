@@ -210,8 +210,8 @@ static NSString *const kAGPrompt =
 @"\n"
 @"必须遵循的规则：\n"
 @"1. 在执行任何操作前，先检查当前app是否是目标app，如果不是，先执行 Launch。\n"
-@"2. 如果进入到了无关页面，请点击页面左上角的返回键进行返回，或者右上角的X号关闭。\n"
-@"3. 如果页面未加载出内容，最多连续 Wait 三次，否则点左上角返回后重新进入。\n"
+@"2. 如果进入到了无关页面，请根据屏幕自行判断如何返回。\n"
+@"3. 如果页面未加载出内容，最多连续 Wait 三次，否则返回后重新进入。\n"
 @"4. 如果页面显示网络问题，需要重新加载，请点击重新加载。\n"
 @"5. 如果当前页面找不到目标联系人、商品、店铺等信息，可以尝试 Swipe 滑动查找。\n"
 @"6. 遇到价格区间、时间区间等筛选条件，如果没有完全符合的，可以放宽要求。\n"
@@ -229,7 +229,7 @@ static NSString *const kAGPrompt =
 @"18. 在结束任务前请一定要仔细检查任务是否完整准确的完成，如果出现错选、漏选、多选的情况，请返回之前的步骤进行纠正。\n"
 @"\n"
 @"补充说明（当前设备是 iPhone）：\n"
-@"- iPhone 没有系统返回键，也没有 Back 动作，返回请直接 Tap 左上角的返回箭头或右上角的 X；Type 由程序通过剪贴板粘贴来实现，无需关心键盘。\n"
+@"- iPhone 没有系统返回键，也没有 Back 动作，需要返回时请根据屏幕自行判断怎么操作；Type 由程序通过剪贴板粘贴来实现，无需关心键盘。\n"
 @"- 涉及支付、转账、输入支付密码等花钱环节，不要自己点击，用 do(action=\"Take_over\", message=\"需要你本人完成付款\") 请用户本人完成；其余任务正常完成。\n"
 @"- finish 的 message 请写成给用户看的完整结果（如果任务是查询或总结信息，把信息完整写在 message 里）。";
 
@@ -834,7 +834,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
         NSString *info = [[NSString alloc] initWithData:infoJSON encoding:NSUTF8StringEncoding] ?: @"{}";
         NSMutableString *text = [NSMutableString stringWithFormat:@"%@** Screen Info **\n\n%@", step == 1 ? [task stringByAppendingString:@"\n\n"] : @"", info];
         if (pendingNote.length) { [text appendFormat:@"\n\n%@", pendingNote]; pendingNote = nil; }
-        if (same >= 2) [text appendString:@"\n\n(系统提示:上一步操作后屏幕没有变化,请换一种方式,例如调整点击位置、先 Wait、或点左上角返回后重进。)"];
+        if (same >= 2) [text appendString:@"\n\n(系统提示:上一步操作后屏幕没有变化,请换一种方式,例如调整点击位置、先 Wait、或返回后重进。)"];
 
         NSString *b64 = [jpg base64EncodedStringWithOptions:0];
         NSDictionary *userMsg = @{@"role": @"user", @"content": @[
@@ -937,7 +937,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
             }
             if (paOn(@"smart_settle", YES)) waitScreenSettle(1.0, 4.0); else sleep(3);
         } else if ([act isEqualToString:@"back"]) { // v0.9.56:iPhone 没有返回键,程序不代点,让模型自己点
-            pendingNote = @"(系统提示:iPhone 没有返回键,Back 不会执行任何操作。请直接 Tap 左上角的返回箭头或“返回”,没有就点右上角的 X/关闭。)";
+            pendingNote = @"(系统提示:iPhone 没有返回键,Back 不会执行任何操作,请根据屏幕自行判断怎么返回。)";
         } else if ([act isEqualToString:@"home"]) {
             NSString *hn = nil;
             goHome(&hn);
@@ -1285,7 +1285,7 @@ static NSString *validateAct(NSDictionary *act, NSUInteger nItems) {
     } else if ([a isEqualToString:@"close_app"]) {
         if (![[act[@"name"] description] length]) return @"close_app 需要 name";
     } else if ([a isEqualToString:@"back"]) {
-        return @"没有 back 动作:请直接 tap 左上角的返回箭头或“返回”,没有就点右上角的关闭/×";
+        return @"没有 back 动作:需要返回时请根据屏幕自行判断怎么操作";
     } else if (![@[@"home", @"wait", @"done", @"stop", @"ask_user", @"set_clipboard"] containsObject:a]) {
         return [NSString stringWithFormat:@"不认识的动作「%@」", a];
     }
