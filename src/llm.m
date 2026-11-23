@@ -328,7 +328,7 @@ static NSArray *agentTools(void) {
             @[@"long_press", @"长按。参数同 tap", xy, @[]],
             @[@"swipe", @"滑动。给 direction(up/down/left/right,手指移动方向)或 x,y,x2,y2", @{@"direction": @{@"type": @"string", @"enum": @[@"up", @"down", @"left", @"right"]}, @"x": num, @"y": num, @"x2": num, @"y2": num}, @[]],
             @[@"home", @"回到主屏幕", @{}, @[]],
-            @[@"close_app", @"关闭(结束)一个 App", @{@"name": @{@"type": @"string", @"description": @"App 中文名"}}, @[@"name"]],
+            @[@"close_app", @"关闭(结束)一个 App,仅在 App 卡死或白屏时用", @{@"name": @{@"type": @"string", @"description": @"App 中文名"}}, @[@"name"]],
             @[@"open_app", @"直接打开 App", @{@"name": @{@"type": @"string", @"description": @"App 中文名"}}, @[@"name"]],
             @[@"input_text", @"在输入框输入完整文字(程序用剪贴板粘贴)", @{@"text": str, @"id": integer, @"x": num, @"y": num, @"app": str}, @[@"text"]],
             @[@"wait", @"等待 1.5 秒", @{}, @[]],
@@ -619,7 +619,7 @@ static NSString *const kAgentSystem =
 @"- swipe: 参数 x,y,x2,y2,或只给 direction(up/down/left/right,手指滑动的方向)。\n"
 @"- home: 回到主屏幕。\n"
 @"- open_app: 参数 name(App 的中文名)。直接打开 App。\n"
-@"- close_app: 参数 name。关闭(结束)这个 App。\n"
+@"- close_app: 参数 name。关闭(结束)这个 App,仅在 App 卡死或白屏时用。\n"
 @"- input_text: 参数 id 或 x,y(输入框),text(完整文字)。程序点输入框并粘贴(替换原有文字),之后核对输入框里有没有这段文字。\n"
 @"- wait: 等待 1.5 秒。\n"
 @"- done: 参数 text。任务已完成;text 是写给用户看的完整结果。\n"
@@ -723,7 +723,7 @@ NSArray *hybridMessages2(NSString *task, NSString *history, UIImage *img, NSData
             continue;
         }
         if ([it[@"box"] boolValue]) { // v0.9.27:截图里找到的空输入框
-            [ocr appendFormat:@"[%d] (%d,%d) [输入框] %dx%d(空的,点它或对它 input_text)\n", idx, (int)round([it[@"x"] doubleValue] * k), (int)round([it[@"y"] doubleValue] * k),
+            [ocr appendFormat:@"[%d] (%d,%d) [输入框] %dx%d(空的)\n", idx, (int)round([it[@"x"] doubleValue] * k), (int)round([it[@"y"] doubleValue] * k),
              (int)round([it[@"w"] doubleValue] * k), (int)round([it[@"h"] doubleValue] * k)];
             continue;
         }
@@ -732,22 +732,22 @@ NSArray *hybridMessages2(NSString *task, NSString *history, UIImage *img, NSData
             double ix = [it[@"x"] doubleValue], iy = [it[@"y"] doubleValue];
             NSString *pos = @""; // v0.9.25:按位置注明无文字图标的常见用途
             if (iy < sc.height * 0.13 && ix < sc.width * 0.18) pos = @" 左上角";
-            else if (iy < sc.height * 0.13 && ix > sc.width * 0.82) pos = @" 右上角,常是关闭/更多/分享";
-            else if (iy > sc.height * 0.91 && [it[@"w"] doubleValue] > sc.width * 0.4) pos = @" 底部宽条,可能是输入框"; // v0.9.26
-            else if (iy > sc.height * 0.91 && ix < sc.width * 0.15) pos = @" 左下角,聊天页常是语音/键盘切换,不是输入框";
-            else if (iy > sc.height * 0.91 && ix > sc.width * 0.85) pos = @" 右下角,聊天页常是加号/更多";
-            else if (iy > sc.height * 0.91) pos = @" 底部栏,常是标签页或表情";
+            else if (iy < sc.height * 0.13 && ix > sc.width * 0.82) pos = @" 右上角";
+            else if (iy > sc.height * 0.91 && [it[@"w"] doubleValue] > sc.width * 0.4) pos = @" 底部宽条";
+            else if (iy > sc.height * 0.91 && ix < sc.width * 0.15) pos = @" 左下角";
+            else if (iy > sc.height * 0.91 && ix > sc.width * 0.85) pos = @" 右下角";
+            else if (iy > sc.height * 0.91) pos = @" 底部栏";
             else if (iy < sc.height * 0.13) pos = @" 顶部栏";
-            if ([it[@"inbox"] boolValue]) pos = @" 在输入框里面(常是语音/清除/扫码按钮,输入文字请点输入框空白处)";
+            if ([it[@"inbox"] boolValue]) pos = @" 在输入框里";
             [ocr appendFormat:@"[%d] (%d,%d) [图标] %dx%d%@\n", idx, (int)round(ix * k), (int)round(iy * k),
              (int)round([it[@"w"] doubleValue] * k), (int)round([it[@"h"] doubleValue] * k), pos];
         }
         else
             [ocr appendFormat:@"[%d] (%d,%d) %@%@\n", idx, (int)round([it[@"x"] doubleValue] * k), (int)round([it[@"y"] doubleValue] * k), t,
-             [it[@"inbox"] boolValue] ? @" (在输入框里,可能是提示文字)" : @""];
+             [it[@"inbox"] boolValue] ? @" (在输入框里)" : @""];
     }
     if (!ocr.length) [ocr appendString:@"(本地 OCR 没有识别到文字)\n"];
-    if (hasAX) [ocr appendString:@"(带【按钮】【…可输入】标记或排在前面的条目来自系统无障碍信息,名字、类型、选中状态都可信;要输入文字就对【可输入】的条目 input_text;同一块区域既有说明文字/【标题】又有【按钮】时点【按钮】,标题和说明文字一般点了没反应。)\n"];
+    if (hasAX) [ocr appendString:@"(带【】标记的条目来自系统无障碍信息)\n"];
     NSString *text = [NSString stringWithFormat:
                       @"任务:%@\n\n最近的动作:\n%@\n本地 OCR 文字列表(格式 [编号] (中心x,中心y) 文字,坐标是 780x1688 截图像素):\n%@\n%@",
                       task, history.length ? history : @"(还没有)", ocr,
