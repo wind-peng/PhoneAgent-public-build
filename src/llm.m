@@ -69,7 +69,7 @@ NSString *bundleForAppName(NSString *name, NSString **info) {
     }
     if (!r) {
         NSArray *shown = userNames.count > 60 ? [userNames subarrayWithRange:NSMakeRange(0, 60)] : userNames;
-        *info = [NSString stringWithFormat:@"没找到名为「%@」的 App。已安装的第三方 App:%@。请改用其中的准确名称重试 open_app;如果目标 App 不在列表里,可能没装,程序会自动回主屏幕并左滑到 App 资源库再找一次。",
+        *info = [NSString stringWithFormat:@"没找到名为「%@」的 App。已安装的第三方 App:%@。",
                  name, [shown componentsJoinedByString:@"、"]];
     }
     return r;

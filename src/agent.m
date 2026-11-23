@@ -614,14 +614,14 @@ static int guardSensitiveTap(NSString *target, NSString *risk, NSArray *items, d
     if (cat == 2) {
         int r = agentAsk(@"pause", [NSString stringWithFormat:@"要点击「%@」,涉及付款或转账。为了安全我不会自动操作,请你本人完成;处理完点“继续”。", tgt]);
         if (r < 0) return -1;
-        *skipNote = [NSString stringWithFormat:@"这一步涉及付款(「%@」),已由用户本人处理,没有点击;请根据新的屏幕继续", tgt];
+        *skipNote = [NSString stringWithFormat:@"这一步涉及付款(「%@」),已由用户本人处理,没有点击", tgt];
         return 1;
     }
     if (cat == 1 && !gConfirmSkipThisTask) {
         NSString *app = agAppName(frontmostBundleID());
         int r = agentAsk(@"confirm", [NSString stringWithFormat:@"在「%@」里要点击「%@」%@%@", app, tgt, risk.length ? @"。后果:" : @"", risk ?: @""]);
         if (r < 0) return -1;
-        if (r == 0) { *skipNote = [NSString stringWithFormat:@"用户拒绝了点击「%@」,没有执行;请换一种方式或结束任务", tgt]; return 1; }
+        if (r == 0) { *skipNote = [NSString stringWithFormat:@"用户拒绝了点击「%@」,没有执行", tgt]; return 1; }
         // 用户刚点击“允许”后，等待确认弹窗完全消失并把触摸焦点交还给目标 App，
         // 避免紧接着发送的 HID 点击被系统弹窗的关闭动画吞掉。
         usleep(1000 * 1000);
@@ -792,7 +792,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
         BOOL replayStopped = NO;
         NSString *replaySummary = expTryReplay(gTaskDisplay.length ? gTaskDisplay : task, [NSMutableArray array], &replayStopped);
         if (replayStopped) { agentSay(@"任务已被停止"); gAgentRunning = NO; return; }
-        if (replaySummary.length) pendingNote = [NSString stringWithFormat:@"(系统提示:%@请根据当前截图核对任务是否已经完成:没完成就继续做,完成了就 finish 并写出结果。)", replaySummary];
+        if (replaySummary.length) pendingNote = [NSString stringWithFormat:@"(系统提示:%@)", replaySummary];
     }
     for (int step = 1; gAgentRunning; step++) { // 不限步数,靠"停止任务"和卡死检测结束
         waitForStableFrame(3.0);
@@ -805,7 +805,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
         NSString *blockedName = enforceBlockedFront();
         if (blockedName) {
             agentSay([NSString stringWithFormat:@"安全:当前在禁止进入的 App「%@」,已自动退回主屏幕", blockedName]);
-            pendingNote = [NSString stringWithFormat:@"(系统提示:程序发现进入了禁止进入的 App「%@」,已退回主屏幕;不要再打开它。)", blockedName];
+            pendingNote = [NSString stringWithFormat:@"(系统提示:程序发现进入了禁止进入的 App「%@」,已退回主屏幕。)", blockedName];
             if (++blockedHits >= 4) { agentSay(@"任务停止:多次进入禁止进入的 App,已停止"); break; }
             lastSig = @""; same = 0;
             continue;
@@ -813,7 +813,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
         if (items.count && paySheetVisible(items)) {
             int r = agentAsk(@"pause", @"看到支付/密码界面。为了安全我不会自动付款,请你本人完成;处理完点“继续”(或点“停止任务”)。");
             if (r < 0) break;
-            pendingNote = @"(系统提示:出现过支付界面,用户已本人处理后点了继续,请根据当前截图继续。)";
+            pendingNote = @"(系统提示:出现过支付界面,用户已本人处理后点了继续。)";
             lastSig = @""; same = 0;
             continue;
         }
@@ -833,7 +833,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
         NSString *info = [[NSString alloc] initWithData:infoJSON encoding:NSUTF8StringEncoding] ?: @"{}";
         NSMutableString *text = [NSMutableString stringWithFormat:@"%@** Screen Info **\n\n%@", step == 1 ? [task stringByAppendingString:@"\n\n"] : @"", info];
         if (pendingNote.length) { [text appendFormat:@"\n\n%@", pendingNote]; pendingNote = nil; }
-        if (same >= 2) [text appendString:@"\n\n(系统提示:上一步操作后屏幕没有变化,请换一种方式,例如调整点击位置、先 Wait。)"];
+        if (same >= 2) [text appendString:@"\n\n(系统提示:上一步操作后屏幕没有变化。)"];
 
         NSString *b64 = [jpg base64EncodedStringWithOptions:0];
         NSDictionary *userMsg = @{@"role": @"user", @"content": @[
@@ -880,7 +880,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
             lastRepScreen = [sig copy] ?: @"";
             lastActKey = k;
             if (repeatCnt >= 5) { agentSay(@"任务停止:同一个动作已经连续重复 5 次,屏幕没有达到预期,已停止"); break; }
-            if (repeatCnt >= 3) pendingNote = [NSString stringWithFormat:@"(系统提示:同一个动作已经连续做了 %d 次,说明这个办法不起作用,请换一种办法,例如换位置、换入口或改用搜索。)", repeatCnt];
+            if (repeatCnt >= 3) pendingNote = [NSString stringWithFormat:@"(系统提示:同一个动作已经连续做了 %d 次。)", repeatCnt];
         }
         double ax = 0, ay = 0, bx = 0, by = 0;
         BOOL hasEl = agPoint(action, @"element", &ax, &ay);
@@ -915,10 +915,10 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
             NSString *note = nil;
             if (!agPasteText(t, lastX, lastY, nil, &note)) {
                 agentSay([@"提示:输入失败:" stringByAppendingString:note ?: @"?"]);
-                pendingNote = [NSString stringWithFormat:@"(系统提示:Type 失败:%@。请重新点击输入框后再试。)", note ?: @""];
+                pendingNote = [NSString stringWithFormat:@"(系统提示:Type 失败:%@。)", note ?: @""];
             } else {
                 expRecord(@{@"a": @"input_text", @"text": t, @"t": nearestItemText(items, lastX, lastY), @"x": @(lastX), @"y": @(lastY), @"anchors": items.count ? expAnchors(items) : @[]});
-                if (note.length) pendingNote = [NSString stringWithFormat:@"(系统提示:已执行输入,但%@。请看当前截图;输入框是空的就重新点击输入框后再 Type。)", note];
+                if (note.length) pendingNote = [NSString stringWithFormat:@"(系统提示:已执行输入,但%@。)", note];
             }
         } else if ([act isEqualToString:@"launch"]) {
             NSString *name = agArg(action, @"app") ?: @"";
@@ -926,13 +926,13 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
             NSString *bid = bundleForAppName(name, &i2);
             if (isBlockedApp(name, nil) || (bid && isBlockedApp(agAppName(bid), bid))) {
                 agentSay([NSString stringWithFormat:@"安全:「%@」是禁止进入的 App,已拒绝打开", name]);
-                pendingNote = [NSString stringWithFormat:@"(系统提示:「%@」在用户设置的禁止进入的 App 列表里,不能打开。请换别的方式完成任务,或用 Take_over 说明。)", name];
+                pendingNote = [NSString stringWithFormat:@"(系统提示:「%@」在用户设置的禁止进入的 App 列表里,不能打开。)", name];
             } else if (bid && openApp(bid)) { gLastApp = bid; lastX = lastY = -1; expRecord(@{@"a": @"open_app", @"name": name}); }
             else {
                 agentSay([@"提示:" stringByAppendingString:i2 ?: @"打开失败"]);
                 NSString *ln = nil;
                 BOOL inLib = enterAppLibrary(&ln);
-                pendingNote = [NSString stringWithFormat:@"(系统提示:%@ 程序已自动尝试进入 App 资源库:%@。%@)", i2 ?: @"打开失败", ln ?: @"", inLib ? @"请点击顶部搜索框,用 Type 输入 App 名称搜索,再点搜索结果打开。" : @"如果仍不在资源库界面,请先 Home 再试,或 finish 说明。"];
+                pendingNote = [NSString stringWithFormat:@"(系统提示:%@ 程序已自动尝试进入 App 资源库:%@。%@)", i2 ?: @"打开失败", ln ?: @"", inLib ? @"已进入" : @"未能进入"];
             }
             if (paOn(@"smart_settle", YES)) waitScreenSettle(1.0, 4.0); else sleep(3);
         } else if ([act isEqualToString:@"back"]) { // v0.9.56:iPhone 没有返回键,程序不代点,让模型自己点
@@ -952,12 +952,12 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
             int r = agentAsk(@"pause", msg);
             if (r < 0) break;
             expRecord(@{@"a": @"ask_user", @"text": msg});
-            pendingNote = @"(系统提示:用户已手动处理完毕并点了继续,请根据当前截图继续任务。)";
+            pendingNote = @"(系统提示:用户已手动处理完毕并点了继续。)";
             lastSig = @""; same = 0;
         } else if ([act isEqualToString:@"note"] || [act isEqualToString:@"call_api"]) {
             // 记录/总结类动作:这里不需要额外操作
         } else {
-            pendingNote = [NSString stringWithFormat:@"(系统提示:无法识别的动作「%@」,请使用规定的指令。)", act];
+            pendingNote = [NSString stringWithFormat:@"(系统提示:无法识别的动作「%@」。)", act];
         }
     }
     if (gAgentRunning) agentSay(@"任务结束");
@@ -1426,7 +1426,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     NSString *pendingSwipeSig = nil;       // 5:上一步滑动前的屏幕签名,下一步对比确认有没有滚动
     NSMutableArray *queue = [NSMutableArray array]; NSArray *queueItems = nil; NSData *queueThumb = nil; // S7:预定的后续动作
     int loadWaits = 0; // v0.9.38:只有“加载中”的屏幕本地等
-    int lastAdN = -1, lastAdRep = 0; NSArray *numGoals = taskNumGoals(gTaskDisplay.length ? gTaskDisplay : task); BOOL goalNudged = NO; // v0.9.37
+    int lastAdN = -1, lastAdRep = 0; NSArray *numGoals = taskNumGoals(gTaskDisplay.length ? gTaskDisplay : task); 
     int adWaits = 0, popupTaps = 0, relaunches = 0, castLost = 0, selfBlocks = 0; // selfBlocks:v0.9.17 拦截点 PhoneAgent 自己界面的次数
     NSString *lastPopupKey = nil;
     NSString *taskApp = nil; BOOL expectHome = NO;
@@ -1438,8 +1438,8 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     NSString *sameKey = nil, *sameShop = nil; // v0.9.36:比同款:第一个平台选定的同款搜索词
     BOOL confirmPendingImg = NO; // v0.9.32:确认后的核对:无障碍元素够用就不发截图
     int confirmStep = 0; NSString *confirmTgt = nil, *confirmSig = nil; double confirmX = -1, confirmY = -1; // v0.9.26:刚确认过的敏感点击
-    int shopSinceStep = 0, lastNewFindStep = 0, lastLostHintStep = -99; // v0.9.23:卡住检测
-    NSString *lastProgSig = @""; int lastProgStep = 1, stuckHintN = 0, strayReturns = 0; NSMutableArray *recentSigs = [NSMutableArray array]; // v0.9.25:通用卡住检测/误入 App
+    int shopSinceStep = 0, lastNewFindStep = 0;
+    int strayReturns = 0; // v0.9.25:误入 App
     BOOL compareTask = isCompareTask(gTaskDisplay.length ? gTaskDisplay : task) && paOn(@"compare_check", YES);
     BOOL sameMode = compareTask && paOn(@"compare_same", YES);
     int needN = sameMode ? 1 : 3, enoughN = sameMode ? 2 : 5;
@@ -1456,7 +1456,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
         startStep = MAX(1, [cp[@"step"] intValue] + 1);
         taskApp = [cp[@"app"] isKindOfClass:NSString.class] && [cp[@"app"] length] ? cp[@"app"] : nil;
         for (id f in cp[@"findings"]) if ([f isKindOfClass:NSString.class]) [findings addObject:f];
-        [history addObject:[NSString stringWithFormat:@"(PhoneAgent 曾被中断,现在从第 %d 步继续;请先看当前屏幕确认状态)", startStep]];
+        [history addObject:[NSString stringWithFormat:@"(PhoneAgent 曾被中断,现在从第 %d 步继续)", startStep]];
         agentSay([NSString stringWithFormat:@"继续上次任务(从第 %d 步):%@", startStep, task]);
         if (taskApp.length && ![frontmostBundleID() isEqualToString:taskApp]) { openApp(taskApp); afterAction(1.0, 4.0, 3); }
     } else {
@@ -1465,7 +1465,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
         BOOL replayStopped = NO;
         NSString *replaySummary = expTryReplay(gTaskDisplay.length ? gTaskDisplay : task, history, &replayStopped);
         if (replayStopped) { agentSay(@"任务已被停止"); gAgentRunning = NO; return; }
-        if (replaySummary.length) [history addObject:[NSString stringWithFormat:@"(%@请根据当前屏幕核对任务是否已经完成:没完成就继续做,完成了就用 done 给出结果。)", replaySummary]];
+        if (replaySummary.length) [history addObject:[NSString stringWithFormat:@"(%@)", replaySummary]];
     }
     for (int step = startStep; gAgentRunning; step++) @autoreleasepool { // 不限步数,靠"停止任务"和卡死检测结束
         gStepNo = step;
@@ -1583,20 +1583,20 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                         strayReturns++;
                         agentSay([NSString stringWithFormat:@"被带进了「%@」,自动回到「%@」", agAppName(front), agAppName(taskApp)]);
                         openApp(taskApp);
-                        [history addObject:[NSString stringWithFormat:@"%d. (上一步把你带进了「%@」(多半是点到广告或链接),程序已自动回到「%@」;不要再点同一个位置)", step, agAppName(front), agAppName(taskApp)]];
+                        [history addObject:[NSString stringWithFormat:@"%d. (上一步后前台变成了「%@」,程序已自动回到「%@」)", step, agAppName(front), agAppName(taskApp)]];
                         afterAction(1.2, 4.0, 3); settled = YES;
                         lastSig = @""; same = 0; [queue removeAllObjects];
                         step--; continue;
                     }
                 }
                 if (taskApp.length && ![front isEqualToString:taskApp] && ![lastAction isEqualToString:@"open_app"])
-                    [history addObject:[NSString stringWithFormat:@"%d. (前台 App 从「%@」变成了「%@」,不是 open_app 打开的;如果不是有意跳转,请用 open_app 回到「%@」)", step, agAppName(taskApp), agAppName(front), agAppName(taskApp)]];
+                    [history addObject:[NSString stringWithFormat:@"%d. (前台 App 从「%@」变成了「%@」,不是 open_app 打开的)", step, agAppName(taskApp), agAppName(front)]];
                 taskApp = front; expectHome = NO;
             } else if (taskApp.length && !expectHome && paOn(@"auto_relaunch", YES) && relaunches < 3 && step > startStep) {
                 relaunches++;
                 agentSay([NSString stringWithFormat:@"「%@」意外退出或被切走了,正在重新打开(第 %d 次)", agAppName(taskApp), relaunches]);
                 openApp(taskApp);
-                [history addObject:[NSString stringWithFormat:@"%d. (目标 App「%@」意外退出/被切走,程序已自动重新打开;当前进度:%@。请看新屏幕从进度处继续)", step, agAppName(taskApp), progress.length ? progress : @"未知"]];
+                [history addObject:[NSString stringWithFormat:@"%d. (目标 App「%@」意外退出/被切走,程序已自动重新打开;当前进度:%@)", step, agAppName(taskApp), progress.length ? progress : @"未知"]];
                 afterAction(1.2, 4.0, 3); settled = YES;
                 lastSig = @""; same = 0; [queue removeAllObjects];
                 step--; continue;
@@ -1606,47 +1606,12 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             NSString *sp = (front.length && ![front isEqualToString:selfID] && ![front isEqualToString:@"com.apple.springboard"]) ? (shopPlatformOf(agAppName(front)) ?: shopPlatformOf(front)) : nil;
             if (sp) { if (![sp isEqualToString:curShop]) shopSinceStep = step; curShop = sp; [visitedShops addObject:sp]; }
         }
-        if (localOK && paOn(@"stuck_hint", YES)) { // v0.9.25:通用卡住检测(所有任务),只往历史里加提醒,不多调用模型
-            NSUInteger nDone = 0; for (id o in planDone) if ([o boolValue]) nDone++;
-            NSString *psig = [NSString stringWithFormat:@"%@|%lu|%lu|%@", progress ?: @"", (unsigned long)nDone, (unsigned long)findings.count, front ?: @""];
-            if (![psig isEqualToString:lastProgSig]) { lastProgSig = psig; lastProgStep = step; stuckHintN = 0; }
-            [recentSigs addObject:screen ?: @""]; if (recentSigs.count > 6) [recentSigs removeObjectAtIndex:0];
-            NSUInteger rc = recentSigs.count;
-            BOOL cycle = rc >= 5 && [recentSigs[rc - 1] isEqualToString:recentSigs[rc - 3]] && [recentSigs[rc - 3] isEqualToString:recentSigs[rc - 5]] && ![recentSigs[rc - 1] isEqualToString:recentSigs[rc - 2]];
-            BOOL lost = NO;
-            NSString *tk = gTaskDisplay.length ? gTaskDisplay : task;
-            if (compareTask && curShop && ![tk containsString:@"外卖"] && ![tk containsString:@"秒送"]) { // 比价时误入外卖/秒送频道
-                BOOL qs = NO, ys = NO;
-                for (NSDictionary *it in items) {
-                    NSString *t = [it[@"text"] description] ?: @"";
-                    if ([t containsString:@"搜秒送"] || [t containsString:@"搜全站"]) lost = YES;
-                    if ([t containsString:@"起送"]) qs = YES;
-                    if ([t containsString:@"月售"]) ys = YES;
-                }
-                if (qs && ys) lost = YES;
-            }
-            int idle = step - lastProgStep;
-            if (lost && step - lastLostHintStep >= 3) {
-                lastLostHintStep = step;
-                [history addObject:[NSString stringWithFormat:@"%d. (系统提醒:现在在「%@」的外卖/秒送频道,这里搜不到普通商品。请点左上角返回或底部「首页」回到 App 首页,用首页最上面的主搜索框搜商品)", step, curShop]];
-                agentSay(@"提醒模型:走进了外卖/秒送频道,让它退回首页");
-            } else if ((idle >= 8 || cycle) && stuckHintN < 2 && step - lastLostHintStep >= 3) {
-                stuckHintN++; lastLostHintStep = step;
-                if (cycle) {
-                    [history addObject:[NSString stringWithFormat:@"%d. (系统提醒:最近几步在两个页面之间来回切换,没有进展。请换一条路:用别的入口、搜索,或先返回上一级再走)", step]];
-                    agentSay(@"提醒模型:在两个页面之间来回转");
-                } else {
-                    [history addObject:[NSString stringWithFormat:@"%d. (系统提醒:已经 %d 步任务没有进展(进度、子目标都没变),可能走错了页面。请想清楚当前在哪,先回到上一个正常页面或 App 首页,换一条更直接的路;确实做不到就 ask_user 或 stop)", step, idle]];
-                    agentSay([NSString stringWithFormat:@"提醒模型:%d 步没有进展", idle]);
-                }
-            }
-        }
         if ([screen isEqualToString:lastSig]) same++; else same = 0;
         lastSig = [screen copy];
         if (same >= 4) { agentSay(@"屏幕连续多步没变化,已停止"); break; }
         if (pendingSwipeSig) { // 5:滑动后确认有没有滚动
             if (localOK && [pendingSwipeSig isEqualToString:sigText]) {
-                [history addObject:[NSString stringWithFormat:@"%d. (上一步滑动后屏幕内容没有变化:可能已经到底/到顶,或滑动没生效;换个起点、加大距离或换方向)", step]];
+                [history addObject:[NSString stringWithFormat:@"%d. (上一步滑动后屏幕内容没有变化:可能已经到底/到顶,或滑动没生效)", step]];
                 failedLast = YES;
             }
             pendingSwipeSig = nil;
@@ -1654,7 +1619,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
         NSString *blockedName = enforceBlockedFront();
         if (blockedName) {
             agentSay([NSString stringWithFormat:@"安全:当前在禁止进入的 App「%@」,已自动退回主屏幕", blockedName]);
-            [history addObject:[NSString stringWithFormat:@"%d. (程序发现进入了禁止进入的 App「%@」,已退回主屏幕;不要再打开它)", step, blockedName]];
+            [history addObject:[NSString stringWithFormat:@"%d. (程序发现进入了禁止进入的 App「%@」,已退回主屏幕)", step, blockedName]];
             if (++blockedHits >= 4) { agentSay(@"任务停止:多次进入禁止进入的 App,已停止"); break; }
             expectHome = YES; [queue removeAllObjects];
             continue;
@@ -1772,8 +1737,8 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             } else if (planning && paOn(@"subgoal_plan", YES)) {
                 [hist appendString:@"(这是第 1 步:请同时在 plan 字段里给出 3-6 个简短的子目标。)\n"];
             }
-            if (onSelf) [hist appendString:@"(系统提示:当前屏幕是 PhoneAgent 自己的界面,也就是正在控制手机执行你这个任务的程序。任务已经开始运行,不需要、也不允许点“开始任务”或这个界面上的任何按钮、输入框。请直接用 open_app 打开完成任务需要的 App;子目标里不要写“点击开始任务”。)\n"];
-            if (same >= 2) [hist appendString:@"(系统提示:最近几步操作后屏幕都没有变化,请换一种办法,例如换个位置点、先返回再进、或用别的入口。)\n"];
+            if (onSelf) [hist appendString:@"(系统提示:当前屏幕是 PhoneAgent 自己的界面,也就是正在控制手机执行你这个任务的程序。任务已经在运行。)\n"];
+            if (same >= 2) [hist appendString:@"(系统提示:最近几步操作后屏幕都没有变化。)\n"];
             NSUInteger from = history.count > 8 ? history.count - 8 : 0;
             if (from > 0) {
                 NSString *sum = compressHistory([history subarrayWithRange:NSMakeRange(0, from)], from - 1 < histProg.count ? histProg[from - 1] : @"");
@@ -1848,7 +1813,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                     [ma removeObjectsForKeys:@[@"x", @"y", @"x2", @"y2", @"id", @"direction", @"name", @"text"]];
                     ma[@"action"] = @"wait"; act = ma;
                     agentSay(@"重问后动作仍无效,本步不执行,下一步带截图重看");
-                    [history addObject:[NSString stringWithFormat:@"%d. (系统:你连续两次给出无效动作,本步没有执行。请用列表里的 id 或有效坐标给出动作)", step]];
+                    [history addObject:[NSString stringWithFormat:@"%d. (系统:你连续两次给出无效动作,本步没有执行)", step]];
                     needImage = YES;
                 }
             }
@@ -1859,14 +1824,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 if (sameKey.length > 24) sameKey = [sameKey substringToIndex:24];
                 sameShop = [curShop copy];
                 agentSay([NSString stringWithFormat:@"同款关键词:%@(来自%@)", sameKey, curShop ?: @"第一个平台"]);
-            }
-            if (numGoals.count && !goalNudged && paOn(@"goal_nudge", YES) && ![[[act[@"action"] description] lowercaseString] isEqualToString:@"done"]) { // v0.9.37:模型自己说已达到任务的数量目标却还在继续
-                NSString *said = [NSString stringWithFormat:@"%@ %@", [act[@"thought"] description] ?: @"", [act[@"progress"] description] ?: @""];
-                if (textClaimsGoal(said, numGoals)) {
-                    goalNudged = YES;
-                    agentSay([NSString stringWithFormat:@"目标核对:模型说已达到「%@」,提醒它确认后直接 done", [numGoals componentsJoinedByString:@"、"]]);
-                    [history addObject:[NSString stringWithFormat:@"%d. (系统提示:你在这一步说已经达到任务目标「%@」。任务只要求这个数量,不要多做。请看当前屏幕核对:确实已达到就关掉挡住的弹窗(如有)后直接 done;没达到才继续)", step + 1, [numGoals componentsJoinedByString:@"、"]]];
-                }
             }
             {   // v0.9.21:保存模型记下的结果
                 id fd = act[@"found"];
@@ -1896,7 +1853,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 if (added) agentSay([NSString stringWithFormat:@"记下 %d 条结果(共 %lu 条)", added, (unsigned long)findings.count]);
                 if (added && compareTask && curShop && pricedCount(findings, curShop) >= enoughN && ![leaveWarned containsObject:[@"enough:" stringByAppendingString:curShop]]) { // v0.9.35:记够就换平台
                     [leaveWarned addObject:[@"enough:" stringByAppendingString:curShop]];
-                    [history addObject:[NSString stringWithFormat:@"%d. (系统:「%@」已记下 %d 个价格,够了。不要再滑动或点进商品详情,直接 open_app 下一个平台;所有平台都记够就直接 done)", step, curShop, pricedCount(findings, curShop)]];
+                    [history addObject:[NSString stringWithFormat:@"%d. (系统:「%@」已记下 %d 个价格)", step, curShop, pricedCount(findings, curShop)]];
                 }
             }
             // 12:子目标
@@ -1960,10 +1917,10 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 NSString *hn = nil; goHome(&hn);
                 afterAction(0.8, 3.0, 2); settled = YES;
                 agentSay(@"模型连续两次想点 PhoneAgent 界面,已回到主屏幕");
-                [history addObject:[NSString stringWithFormat:@"%d. (你又想点 PhoneAgent 自己的界面,程序已拦截并回到主屏幕。任务已在运行,请从主屏幕用 open_app 打开需要的 App)", step]];
+                [history addObject:[NSString stringWithFormat:@"%d. (你又想点 PhoneAgent 自己的界面,程序已拦截并回到主屏幕)", step]];
                 selfBlocks = 0;
             } else {
-                [history addObject:[NSString stringWithFormat:@"%d. (%@ 未执行:当前是 PhoneAgent 自己的界面,任务已经在运行,不要点“开始任务”或这里的任何按钮;请用 open_app 打开需要的 App)", step, action]];
+                [history addObject:[NSString stringWithFormat:@"%d. (%@ 未执行:当前是 PhoneAgent 自己的界面,任务已经在运行)", step, action]];
             }
             lastSig = @""; same = 0; failedLast = NO;
             continue;
@@ -2065,7 +2022,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             lastActKey = k;
             if (repeatCnt >= 5) { agentSay(@"任务停止:同一个动作已经连续重复 5 次,屏幕没有达到预期,已停止"); break; }
             if (repeatCnt >= 3) {
-                [history addObject:[NSString stringWithFormat:@"%d. (系统提示:同一个动作已经连续做了 %d 次,说明这个办法不起作用,请换一种办法,例如换目标、换位置、换入口或改用搜索)", step, repeatCnt]];
+                [history addObject:[NSString stringWithFormat:@"%d. (系统提示:同一个动作已经连续做了 %d 次)", step, repeatCnt]];
                 failedLast = YES;
             }
         }
@@ -2076,7 +2033,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             int r = agentAsk(@"pause", why);
             if (r < 0) break;
             expRecord(@{@"a": @"ask_user", @"text": why});
-            [history addObject:[NSString stringWithFormat:@"%d. ask_user(%@) → 用户已处理并点了继续,请根据新的屏幕继续", step, why]];
+            [history addObject:[NSString stringWithFormat:@"%d. ask_user(%@) → 用户已处理并点了继续", step, why]];
             lastSig = @""; same = 0; needImage = YES; [queue removeAllObjects];
             continue;
         }
@@ -2091,7 +2048,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             BOOL sameConfirm = confirmStep && step - confirmStep <= 3 &&
                 ((tgt.length && [tgt isEqualToString:confirmTgt]) || (fabs(x - confirmX) < 20 && fabs(y - confirmY) < 20));
             if (sameConfirm && localOK && confirmSig && ![sigText isEqualToString:confirmSig]) {
-                [history addObject:[NSString stringWithFormat:@"%d. (未执行:第 %d 步已经点过「%@」(用户已允许),之后屏幕已经变化,很可能已经生效。请看这张截图确认结果,确实没生效再点;已生效就继续下一步或 done)", step, confirmStep, confirmTgt.length ? confirmTgt : @"这个按钮"]];
+                [history addObject:[NSString stringWithFormat:@"%d. (未执行:第 %d 步已经点过「%@」(用户已允许),之后屏幕已经变化,程序没有重复点击)", step, confirmStep, confirmTgt.length ? confirmTgt : @"这个按钮"]];
                 agentSay(@"提示:这个按钮刚确认并点过,屏幕已变化,先让模型看截图确认,不重复请求");
                 confirmSig = [sigText copy]; needImage = YES; [queue removeAllObjects];
                 continue;
@@ -2112,7 +2069,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             if (gGuardConfirmed) { // v0.9.26:用户允许后已点击,下一步带截图让模型确认是否生效
                 gGuardConfirmed = NO;
                 confirmStep = step; confirmTgt = [tgt copy]; confirmX = x; confirmY = y; confirmSig = localOK ? [sigText copy] : nil;
-                hline = [hline stringByAppendingString:@" (用户已允许,已经点击;请看下一屏确认是否已生效,不要重复点)"];
+                hline = [hline stringByAppendingString:@" (用户已允许,已经点击)"];
                 if (paOn(@"ax_tree", YES)) confirmPendingImg = YES; else needImage = YES;
             }
             // 4:点击没反应:在旁边 8pt 处本地重试一次(敏感/购物类按钮不重试,避免重复操作)
@@ -2144,7 +2101,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             checkStale = YES;
         } else if ([action isEqualToString:@"swipe"] && compareTask && curShop && pricedCount(findings, curShop) >= enoughN && ![leaveWarned containsObject:[@"swipe:" stringByAppendingString:curShop]]) {
             [leaveWarned addObject:[@"swipe:" stringByAppendingString:curShop]]; // v0.9.35:比价时这个平台已记够,不再往下翻(只拦一次)
-            result = [NSString stringWithFormat:@"未执行:「%@」已记下 %d 个价格,不用再翻。请 open_app 下一个平台;都记够了就 done", curShop, pricedCount(findings, curShop)];
+            result = [NSString stringWithFormat:@"未执行:「%@」已记下 %d 个价格,本次滑动没有执行", curShop, pricedCount(findings, curShop)];
         } else if ([action isEqualToString:@"swipe"]) {
             if (paOn(@"smooth_swipe", YES)) doSwipeSmooth(x, y, x2, y2, 300, 100); else doSwipe(x, y, x2, y2, 20, 350);
             expRecord(@{@"a": @"swipe", @"x1": @(x), @"y1": @(y), @"x2": @(x2), @"y2": @(y2), @"anchors": localOK ? expAnchors(items) : @[]});
@@ -2158,16 +2115,16 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             NSString *toShop = shopPlatformOf(bid ? agAppName(bid) : name) ?: (shopPlatformOf(bid) ?: shopPlatformOf(name));
             if (compareTask && curShop && ![toShop isEqualToString:curShop] && pricedCount(findings, curShop) < needN && ![leaveWarned containsObject:curShop]) {
                 [leaveWarned addObject:curShop]; // v0.9.21:每个平台只拦一次
-                result = [NSString stringWithFormat:@"未执行:「%@」还没用 found 记下 %d 个商品价格(现在 %d 个)。请先在搜索结果里记下再换平台;确实搜不到就再次 open_app", curShop, needN, pricedCount(findings, curShop)];
+                result = [NSString stringWithFormat:@"未执行:「%@」还没用 found 记下 %d 个商品价格(现在 %d 个)", curShop, needN, pricedCount(findings, curShop)];
             } else if (isBlockedApp(name, nil) || (bid && isBlockedApp(agAppName(bid), bid))) {
-                result = [NSString stringWithFormat:@"「%@」在用户设置的禁止进入的 App 列表里,不能打开。请换别的方式完成,或用 ask_user/stop 说明。", name];
+                result = [NSString stringWithFormat:@"「%@」在用户设置的禁止进入的 App 列表里,不能打开。", name];
             } else if (bid && openApp(bid)) { result = @"已打开"; gLastApp = bid; taskApp = bid; expectHome = NO; checkStale = YES; expRecord(@{@"a": @"open_app", @"name": name}); }
             else {
                 result = info ?: @"打开失败";
                 NSString *ln = nil;
                 expectHome = YES;
                 BOOL inLib = enterAppLibrary(&ln);
-                result = [result stringByAppendingFormat:@"\n程序已自动尝试进入 App 资源库:%@。%@", ln ?: @"", inLib ? @"请点击顶部搜索框,用 input_text 输入 App 名称搜索,再点搜索结果打开。" : @"如果仍不在资源库界面,请用 home 动作回主屏幕后再试,或 stop。"];
+                result = [result stringByAppendingFormat:@"\n程序已自动尝试进入 App 资源库:%@。%@", ln ?: @"", inLib ? @"已进入" : @"未能进入"];
             }
             [history addObject:[NSString stringWithFormat:@"%d. open_app(%@) → %@", step, name, result]];
             afterAction(1.0, 4.0, 3); settled = YES;
@@ -2202,7 +2159,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                     sleep(1);
                     continue;
                 }
-                result = note.length ? [NSString stringWithFormat:@"已尝试粘贴,但%@;请看下一张截图确认输入框里有没有文字,没有就再用 input_text", note]
+                result = note.length ? [NSString stringWithFormat:@"已尝试粘贴,但%@", note]
                                      : @"已把文字粘贴进输入框(键盘快捷键或粘贴菜单),请看下一张截图确认";
                 [history addObject:[NSString stringWithFormat:@"%d. input_text(%@,%@)", step, usedID ? [NSString stringWithFormat:@"id=%ld", (long)oid] : [NSString stringWithFormat:@"%.0f,%.0f", xpx, ypx], text]];
                 expRecord(@{@"a": @"input_text", @"text": text, @"t": usedID ? (usedIcon ? @"" : idText) : ([act[@"target"] description] ?: @""), @"x": @(x), @"y": @(y), @"anchors": localOK ? expAnchors(items) : @[]});
@@ -2247,11 +2204,11 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                         doTap([hit[@"x"] doubleValue], [hit[@"y"] doubleValue]);
                         afterAction(0.3, 2.5, 2);
                         settleUntilLoaded(5.0);
-                        [history addObject:[NSString stringWithFormat:@"%d. (程序已自动点了「搜索」,请看新屏幕)", step]];
+                        [history addObject:[NSString stringWithFormat:@"%d. (程序已自动点了「搜索」)", step]];
                         agentSay(@"粘贴后已自动点“搜索”");
                         [queue removeAllObjects];
                     } else if (!seen) {
-                        result = [NSString stringWithFormat:@"粘贴后屏幕上没看到「%@」,可能点到了别的地方(比如语音按钮)或文字没进输入框;程序没有自动点搜索。请确认输入框,必要时点输入框后再 input_text", text];
+                        result = [NSString stringWithFormat:@"粘贴后屏幕上没看到「%@」,程序没有自动点搜索", text];
                         [history addObject:[NSString stringWithFormat:@"%d. (%@)", step, result]];
                     }
                 }
@@ -2312,7 +2269,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                     agentSay(@"屏幕画面好像卡住了:App 已经切换,但录屏没有送来新画面");
                     int r = agentAsk(@"pause", @"屏幕录制的画面停住了(App 已切换但画面没更新)。请关闭并重新开启屏幕录制,然后点“继续”。");
                     if (r < 0) break;
-                    [history addObject:[NSString stringWithFormat:@"%d. (屏幕录制画面曾卡住,用户已重新开启;请根据新屏幕继续)", step]];
+                    [history addObject:[NSString stringWithFormat:@"%d. (屏幕录制画面曾卡住,用户已重新开启)", step]];
                     lastSig = @""; same = 0; needImage = YES; [queue removeAllObjects];
                 }
             }
