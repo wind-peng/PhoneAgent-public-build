@@ -1438,9 +1438,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     int confirmStep = 0; NSString *confirmTgt = nil, *confirmSig = nil; double confirmX = -1, confirmY = -1; // v0.9.26:刚确认过的敏感点击
     int shopSinceStep = 0, lastNewFindStep = 0;
     int strayReturns = 0; // v0.9.25:误入 App
-    BOOL compareTask = isCompareTask(gTaskDisplay.length ? gTaskDisplay : task) && paOn(@"compare_check", YES);
-    BOOL sameMode = compareTask && paOn(@"compare_same", YES);
-    int needN = sameMode ? 1 : 3;
     BOOL glmModel = [model.lowercaseString hasPrefix:@"glm"];
     CGSize sc = screenSize();
     int startStep = 1;
@@ -1572,32 +1569,9 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
         if (front.length) {
             BOOL third = ![front isEqualToString:@"com.apple.springboard"] && ![front isEqualToString:selfID];
             if (third) {
-                if (taskApp.length && ![front isEqualToString:taskApp] && ![lastAction isEqualToString:@"open_app"] && paOn(@"stray_return", YES) && strayReturns < 3) {
-                    // v0.9.25:被广告/链接带进 App Store 或浏览器(任务没提到它们)→ 自动回到原来的 App
-                    NSString *tk = gTaskDisplay.length ? gTaskDisplay : task;
-                    BOOL store = [front isEqualToString:@"com.apple.AppStore"] && ![tk containsString:@"App Store"] && ![tk containsString:@"商店"] && ![tk containsString:@"下载"] && ![tk containsString:@"安装"] && ![tk containsString:@"更新"];
-                    BOOL web = [front isEqualToString:@"com.apple.mobilesafari"] && ![tk.lowercaseString containsString:@"safari"] && ![tk containsString:@"浏览器"] && ![tk containsString:@"网页"] && ![tk containsString:@"网站"] && ![tk containsString:@"链接"];
-                    if (store || web) {
-                        strayReturns++;
-                        agentSay([NSString stringWithFormat:@"被带进了「%@」,自动回到「%@」", agAppName(front), agAppName(taskApp)]);
-                        openApp(taskApp);
-                        [history addObject:[NSString stringWithFormat:@"%d. (上一步后前台变成了「%@」,程序已自动回到「%@」)", step, agAppName(front), agAppName(taskApp)]];
-                        afterAction(1.2, 4.0, 3); settled = YES;
-                        lastSig = @""; same = 0; [queue removeAllObjects];
-                        step--; continue;
-                    }
-                }
                 if (taskApp.length && ![front isEqualToString:taskApp] && ![lastAction isEqualToString:@"open_app"])
                     [history addObject:[NSString stringWithFormat:@"%d. (前台 App 从「%@」变成了「%@」,不是 open_app 打开的)", step, agAppName(taskApp), agAppName(front)]];
                 taskApp = front; expectHome = NO;
-            } else if (taskApp.length && !expectHome && paOn(@"auto_relaunch", YES) && relaunches < 3 && step > startStep) {
-                relaunches++;
-                agentSay([NSString stringWithFormat:@"「%@」意外退出或被切走了,正在重新打开(第 %d 次)", agAppName(taskApp), relaunches]);
-                openApp(taskApp);
-                [history addObject:[NSString stringWithFormat:@"%d. (目标 App「%@」意外退出/被切走,程序已自动重新打开;当前进度:%@)", step, agAppName(taskApp), progress.length ? progress : @"未知"]];
-                afterAction(1.2, 4.0, 3); settled = YES;
-                lastSig = @""; same = 0; [queue removeAllObjects];
-                step--; continue;
             }
         }
         {   // v0.9.21:记下当前所在的购物平台
@@ -1628,41 +1602,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             [history addObject:[NSString stringWithFormat:@"%d. (出现支付界面,已由用户本人处理后继续)", step]];
             lastSig = @""; same = 0; [queue removeAllObjects];
             continue;
-        }
-        // 6:广告倒计时:本地等待,不调用模型
-        if (paOn(@"local_ad_wait", YES) && adWaits < 8) {
-            int n = localOK ? adCountdownSeconds(items) : 0;
-            if (n > 0 && n <= 2 && n == lastAdN && ++lastAdRep >= 1) n = 0; // v0.9.37:同一个很小的倒计时连着出现,当作广告已结束(倒计时文字残留)
-            else if (n != lastAdN) lastAdRep = 0;
-            if (n > 0) lastAdN = n;
-            if (n > 0) {
-                double secs = MIN(n, 15) + 0.5;
-                if (adWaits == 0) [history addObject:[NSString stringWithFormat:@"%d. (本地检测到广告倒计时约 %d 秒,已原地等待,没有调用模型)", step, n]];
-                agentSay([NSString stringWithFormat:@"检测到广告倒计时 %d 秒,本地等待 %.0f 秒", n, secs]);
-                adWaits++;
-                sleepWhileRunning(secs);
-                lastSig = @""; same = 0;
-                step--; continue;
-            }
-            adWaits = 0; if (n <= 0) { if (lastAdRep) agentSay(@"倒计时停在同一个数字,当作广告已结束"); lastAdN = -1; lastAdRep = 0; }
-        }
-        if (paOn(@"loading_screen_wait", YES) && localOK) { // v0.9.38:屏幕只剩“加载中”之类的字:本地等,不调用模型、不截图
-            BOOL loading = NO; int meaningful = 0;
-            for (NSDictionary *it in items) {
-                NSString *t = [[it[@"text"] description] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-                if (t.length < 2 || [it[@"icon"] boolValue]) continue;
-                meaningful++;
-                NSString *lt = t.lowercaseString;
-                if (t.length <= 14 && ([t containsString:@"加载中"] || [t containsString:@"正在加载"] || [t containsString:@"请稍候"] || [t containsString:@"请稍后"] || [t containsString:@"努力加载"] || [lt hasPrefix:@"loading"])) loading = YES;
-            }
-            if (loading && meaningful <= 5 && loadWaits < 5) {
-                if (loadWaits == 0) { agentSay(@"屏幕在加载中,本地等待"); [history addObject:[NSString stringWithFormat:@"%d. (屏幕显示加载中,程序已原地等待,没有调用模型)", step]]; }
-                loadWaits++;
-                sleepWhileRunning(1.5);
-                lastSig = @""; same = 0;
-                step--; continue;
-            }
-            if (!loading) loadWaits = 0;
         }
         // 7:弹窗规则:完全匹配的小按钮直接点掉(默认关)
         if (paOn(@"auto_popup", NO) && popupTaps < 3 && localOK) {
@@ -1732,8 +1671,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                     if (!d) marked = YES;
                     [hist appendFormat:@"%lu. %@ %@\n", (unsigned long)i + 1, mk, plan[i]];
                 }
-            } else if (planning && paOn(@"subgoal_plan", YES)) {
-                [hist appendString:@"(这是第 1 步:请同时在 plan 字段里给出 3-6 个简短的子目标。)\n"];
             }
             if (onSelf) [hist appendString:@"(系统提示:当前屏幕是 PhoneAgent 自己的界面,也就是正在控制手机执行你这个任务的程序。任务已经在运行。)\n"];
             if (same >= 2) [hist appendString:@"(系统提示:最近几步操作后屏幕都没有变化。)\n"];
@@ -1780,16 +1717,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 if (guess.length) { NSMutableDictionary *ma = [act mutableCopy]; ma[@"name"] = guess; act = ma; agentSay([NSString stringWithFormat:@"open_app 没给 App 名,按子目标补成「%@」", guess]); }
             }
             NSString *bad = validateAct(act, allItems.count);
-            if (bad && paOn(@"target_resolve", YES)) { // v0.9.37:只给了 target 没给 id:本地按文字找唯一匹配,不再重问
-                NSString *an = [[act[@"action"] description] lowercaseString];
-                if (([an isEqualToString:@"tap"] || [an isEqualToString:@"long_press"]) && [[act[@"target"] description] length]) {
-                    NSInteger rid = resolveTargetId([act[@"target"] description], allItems);
-                    if (rid > 0) {
-                        NSMutableDictionary *ma = [act mutableCopy]; ma[@"id"] = @(rid); [ma removeObjectsForKeys:@[@"x", @"y"]];
-                        if (!validateAct(ma, allItems.count)) { act = ma; bad = nil; agentSay([NSString stringWithFormat:@"动作没给 id,按目标文字「%@」匹配到 id=%ld", [act[@"target"] description], (long)rid]); }
-                    }
-                }
-            }
             if (bad) {
                 agentSay([NSString stringWithFormat:@"提示:模型给的动作参数无效(%@),重新询问一次", bad]);
                 { NSMutableDictionary *lg = [act mutableCopy]; [lg removeObjectsForKeys:@[@"thought", @"found", @"plan"]]; // v0.9.33:记下模型到底给了什么
@@ -1831,10 +1758,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                     }
                     if (f.length < 2) continue;
                     if (f.length > 60) f = [f substringToIndex:60];
-                    if (compareTask) { // v0.9.34:比价记录要有价格(¥/元/小数),「31CM」这种不算
-                        static NSRegularExpression *prx; if (!prx) prx = [NSRegularExpression regularExpressionWithPattern:@"[¥￥]\\s*\\d|\\d\\s*元|\\d+\\.\\d+|价\\s*\\d" options:0 error:nil];
-                        if (prx && ![prx firstMatchInString:f options:0 range:NSMakeRange(0, f.length)]) continue;
-                    } // v0.9.33:比价时没有价格数字的“记录”不收
                     NSString *line = [NSString stringWithFormat:@"[%@] %@", tagName, f];
                     if ([findings containsObject:line] || findings.count >= 40) continue;
                     if (findingDup(findings, line)) continue; // v0.9.26:同平台同价格、名字互相包含的视为重复
@@ -1957,24 +1880,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
         }
 
         if ([action isEqualToString:@"done"] || [action isEqualToString:@"stop"]) {
-            BOOL compareOK = NO; // v0.9.22:比价任务每个平台都记够了价格,就不再做子目标自检(省一次调用)
-            if ([action isEqualToString:@"done"] && compareTask && visitedShops.count) {
-                compareOK = YES;
-                for (NSString *sp in visitedShops) if (pricedCount(findings, sp) < needN) { compareOK = NO; break; }
-            }
-            BOOL justFound = (findings.count && lastNewFindStep >= step - 1) || (confirmStep && step - confirmStep <= 2);
-            if (!justFound && numGoals.count && [action isEqualToString:@"done"] && textClaimsGoal([act[@"text"] description], numGoals)) justFound = YES; // v0.9.37:done 结果已写明达到数量目标,不再自检 // v0.9.26:刚用 found 记下了完成证据,不再自检(省一次调用)
-            if ([action isEqualToString:@"done"] && plan.count && !doneChecked && !compareOK && !justFound && paOn(@"subgoal_plan", YES)) { // S8:完成自检
-                NSMutableArray *left = [NSMutableArray array];
-                for (NSUInteger i = 0; i < plan.count; i++) if (![planDone[i] boolValue]) [left addObject:[NSString stringWithFormat:@"%lu", (unsigned long)i + 1]];
-                if (left.count) {
-                    doneChecked = YES; doneCheckPending = YES;
-                    agentSay(@"完成自检:还有子目标没标记完成,请模型再核对一次");
-                    [history addObject:[NSString stringWithFormat:@"%d. (系统提示:你给出了 done,但子目标 %@ 还没有标记完成。请核对当前屏幕:确实已经全部完成就再次调用 done(给出完整结果),否则继续操作)", step, [left componentsJoinedByString:@"、"]]];
-                    lastSig = @""; same = 0;
-                    continue;
-                }
-            }
             NSString *doneText = [[act[@"text"] description] ?: @"" stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
             if (!doneText.length && [action isEqualToString:@"done"] && findings.count) { // v0.9.26:模型没写结果,用已记录的结果代替
                 NSUInteger n0 = findings.count > 5 ? findings.count - 5 : 0;
@@ -2106,18 +2011,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             if (appHint.length) { NSString *i2 = nil; hintBid = bundleForAppName(appHint, &i2); }
             if (!hintBid.length && taskApp.length) hintBid = taskApp;
             NSString *note = nil;
-            if (typing && usedID && (usedIcon || [allItems[oid - 1][@"axbtn"] boolValue]) && paOn(@"input_box_detect", YES)) { // v0.9.27:对着小图标 input_text,同一行有输入框 → 改点输入框(避免点到语音按钮)
-                for (NSDictionary *it in allItems) {
-                    BOOL isBox = [it[@"box"] boolValue], inText = [it[@"inbox"] boolValue] && ![it[@"icon"] boolValue];
-                    BOOL isAX = it[@"axin"] != nil;
-                    if (!isBox && !inText && !isAX) continue;
-                    double by = [it[@"y"] doubleValue], bh = MAX(24.0, [it[@"h"] doubleValue]);
-                    if (fabs(by - y) > bh) continue;
-                    double nx = isBox ? [it[@"x"] doubleValue] - [it[@"w"] doubleValue] * 0.15 : [it[@"x"] doubleValue];
-                    agentSay([NSString stringWithFormat:@"input_text 对着的是小图标,同一行有输入框,改点输入框 (%.0f,%.0f)pt", nx, by]);
-                    x = nx; y = by; break;
-                }
-            }
             if (typing) {
                 BOOL ok = agPasteText(text, x, y, hintBid, &note);
                 if (!ok) {
@@ -2132,54 +2025,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 [history addObject:[NSString stringWithFormat:@"%d. input_text(%@,%@)", step, usedID ? [NSString stringWithFormat:@"id=%ld", (long)oid] : [NSString stringWithFormat:@"%.0f,%.0f", xpx, ypx], text]];
                 expRecord(@{@"a": @"input_text", @"text": text, @"t": usedID ? (usedIcon ? @"" : idText) : ([act[@"target"] description] ?: @""), @"x": @(x), @"y": @(y), @"anchors": localOK ? expAnchors(items) : @[]});
                 afterAction(0.2, 1.5, 1); settled = YES;
-                if (!note.length && paOn(@"auto_search", YES)) { // v0.9.21:粘贴后找到“搜索”按钮(右上角或键盘右下角)就自动点
-                    NSString *e3 = nil;
-                    UIImage *im3 = takeScreenshot(&e3);
-                    NSArray *it3 = im3 ? ocrImage(im3, &e3) : nil;
-                    NSDictionary *hit = nil;
-                    BOOL seen = !paOn(@"paste_verify", YES); // v0.9.23:先确认输入框里确实是要搜的词(本地 OCR,不调用模型)
-                    NSString *want = [[text stringByReplacingOccurrencesOfString:@" " withString:@""] lowercaseString];
-                    NSMutableSet *wset = [NSMutableSet set];
-                    [want enumerateSubstringsInRange:NSMakeRange(0, want.length) options:NSStringEnumerationByComposedCharacterSequences usingBlock:^(NSString *c, NSRange r1, NSRange r2, BOOL *stop) { [wset addObject:c]; }];
-                    for (NSDictionary *it in it3) {
-                        if (seen || !wset.count) break;
-                        NSString *t = [[[it[@"text"] description] stringByReplacingOccurrencesOfString:@" " withString:@""] lowercaseString];
-                        if ([it[@"y"] doubleValue] > sc.height * 0.55 && t.length < 2 && want.length >= 2) continue; // v0.9.26:下半屏只跳过单个字(键盘按键),聊天输入框在底部/键盘上方也要看
-                        if (!t.length || t.length > want.length + 14) continue;
-                        if ([t containsString:want]) { seen = YES; break; }
-                        __block NSUInteger hitc = 0;
-                        for (NSString *c in wset) if ([t containsString:c]) hitc++;
-                        if (hitc * 10 >= wset.count * 7) seen = YES;
-                    }
-                    if (!wset.count) seen = YES;
-                    if (!seen && paOn(@"ax_tree", YES)) { // v0.9.32:用输入框自己的内容核对(无障碍),OCR 漏看时不误报
-                        int am = 0;
-                        NSArray *axl2 = axReadScreen(frontmostBundleID(), &am, NULL);
-                        for (NSDictionary *a in axl2) {
-                            NSString *t = [[[a[@"text"] description] stringByReplacingOccurrencesOfString:@" " withString:@""] lowercaseString];
-                            if (want.length && [t containsString:want]) { seen = YES; break; }
-                        }
-                    }
-                    for (NSDictionary *it in (seen ? it3 : @[])) {
-                        NSString *t = [[[it[@"text"] description] stringByReplacingOccurrencesOfString:@" " withString:@""] lowercaseString];
-                        if (![t isEqualToString:@"搜索"] && ![t isEqualToString:@"search"]) continue;
-                        double ix = [it[@"x"] doubleValue], iy = [it[@"y"] doubleValue];
-                        BOOL topRight = iy < sc.height * 0.15 && ix > sc.width * 0.6;
-                        BOOL keyRet = iy > sc.height * 0.55 && ix > sc.width * 0.65;
-                        if (topRight || keyRet) { hit = it; if (topRight) break; }
-                    }
-                    if (hit) {
-                        doTap([hit[@"x"] doubleValue], [hit[@"y"] doubleValue]);
-                        afterAction(0.3, 2.5, 2);
-                        settleUntilLoaded(5.0);
-                        [history addObject:[NSString stringWithFormat:@"%d. (程序已自动点了「搜索」)", step]];
-                        agentSay(@"粘贴后已自动点“搜索”");
-                        [queue removeAllObjects];
-                    } else if (!seen) {
-                        result = [NSString stringWithFormat:@"粘贴后屏幕上没看到「%@」,程序没有自动点搜索", text];
-                        [history addObject:[NSString stringWithFormat:@"%d. (%@)", step, result]];
-                    }
-                }
             } else {
                 BOOL stranded = NO;
                 BOOL ok = writeClipboardInForeground(text, hintBid, &note, &stranded);
