@@ -132,7 +132,6 @@ int thumbChangedCells(NSData *a, NSData *b);
 int thumbTotalCells(void);
 NSData *currentFrame(CFAbsoluteTime *t);
 void waitScreenSettle(double minWait, double cap);
-int adCountdownSeconds(NSArray *items);
 NSString *defaultPopupWords(void);
 NSArray *popupWords(void);
 NSDictionary *popupTarget(NSArray *items);

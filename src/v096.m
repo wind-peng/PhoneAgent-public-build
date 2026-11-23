@@ -88,40 +88,6 @@ void waitScreenSettle(double minWait, double cap) {
 
 static NSArray *kCloseWords(void) { return @[@"跳过", @"关闭", @"关闭广告", @"×", @"X", @"x", @"✕", @"领取成功", @"已领取", @"我知道了"]; }
 
-// 屏幕上有广告倒计时(“5秒”“5s后”“15 秒后可领奖”等)且没有可点的关闭/跳过按钮:返回秒数,否则 0
-int adCountdownSeconds(NSArray *items) {
-    static NSRegularExpression *re; static dispatch_once_t once;
-    dispatch_once(&once, ^{ re = [NSRegularExpression regularExpressionWithPattern:@"(\\d{1,2})\\s*(?:秒|[sS](?![a-zA-Z]))" options:0 error:nil]; });
-    BOOL adCtx = NO;
-    for (NSDictionary *it in items) {
-        NSString *t = [it[@"text"] description];
-        for (NSString *w in @[@"广告", @"奖励", @"领取", @"后可", @"可领", @"试玩"]) if ([t containsString:w]) { adCtx = YES; break; }
-        if (adCtx) break;
-    }
-    int found = 0;
-    for (NSDictionary *it in items) {
-        NSString *t = [[it[@"text"] description] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-        if (!t.length || t.length > 20) continue;
-        if ([it[@"icon"] boolValue]) continue;
-        NSTextCheckingResult *m = [re firstMatchInString:t options:0 range:NSMakeRange(0, t.length)];
-        if (!m) continue;
-        int n = [[t substringWithRange:[m rangeAtIndex:1]] intValue];
-        if (n < 1 || n > 60) continue;
-        BOOL ctx = NO;
-        for (NSString *w in @[@"后", @"跳过", @"领", @"奖励", @"广告", @"关闭"]) if ([t containsString:w]) { ctx = YES; break; }
-        if (!ctx && !(t.length <= 4 && adCtx)) continue;
-        if ([t containsString:@"前"]) continue; // “5秒前”是时间戳
-        found = MAX(found, n);
-    }
-    if (!found) return 0;
-    // 已经有不带数字的关闭/跳过按钮:交给模型(或弹窗规则)去点
-    for (NSDictionary *it in items) {
-        NSString *t = [[it[@"text"] description] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-        if ([t rangeOfCharacterFromSet:NSCharacterSet.decimalDigitCharacterSet].location != NSNotFound) continue;
-        for (NSString *w in kCloseWords()) if ([t isEqualToString:w]) return 0;
-    }
-    return found;
-}
 
 NSString *defaultPopupWords(void) { return @"跳过\n我知道了\n暂不\n以后再说\n关闭广告"; }
 

@@ -1226,41 +1226,6 @@ static NSArray *trimOCRItems(NSArray *items) {
 }
 
 // A2:本地参数校验,返回问题描述;没问题返回 nil
-// v0.9.37:任务里的数量目标(如 14天、3条),用于判断模型是否已说达标
-static NSArray *taskNumGoals(NSString *t) {
-    NSMutableArray *r = [NSMutableArray array]; if (!t.length) return r;
-    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"(\\d+)\\s*(天|个|次|条|张|首|集|篇|元|分钟|小时|页|位|人|份|局|关|级)" options:0 error:nil];
-    for (NSTextCheckingResult *m in [re matchesInString:t options:0 range:NSMakeRange(0, t.length)]) {
-        NSString *g = [[t substringWithRange:[m rangeAtIndex:1]] stringByAppendingString:[t substringWithRange:[m rangeAtIndex:2]]];
-        if (![r containsObject:g]) [r addObject:g];
-    }
-    return r;
-}
-static BOOL textClaimsGoal(NSString *s, NSArray *goals) {
-    if (!s.length || !goals.count) return NO;
-    NSString *z = [[s stringByReplacingOccurrencesOfString:@" " withString:@""] stringByReplacingOccurrencesOfString:@"\u3000" withString:@""];
-    if ([z containsString:@"未达"] || [z containsString:@"还差"] || [z containsString:@"还没"] || [z containsString:@"尚未"] || [z containsString:@"还要"] || [z containsString:@"还需"]) return NO;
-    BOOL claim = NO;
-    for (NSString *w in @[@"已领", @"已达", @"已满", @"已够", @"已完成", @"已获得", @"已拿到", @"已累计", @"累计领到", @"达到", @"达成", @"已经"]) if ([z containsString:w]) { claim = YES; break; }
-    if (!claim) return NO;
-    for (NSString *g in goals) if (![z containsString:g]) return NO;
-    return YES;
-}
-// v0.9.37:tap 只给了 target 文字没给 id:在元素列表里找唯一匹配
-static NSInteger resolveTargetId(NSString *target, NSArray *items) {
-    NSCharacterSet *junk = [NSCharacterSet characterSetWithCharactersInString:@" ,，、。.×xX「」\"'()（）:：按钮"];
-    NSString *(^norm)(NSString *) = ^NSString *(NSString *v) { return [[v componentsSeparatedByCharactersInSet:junk] componentsJoinedByString:@""]; };
-    NSString *tg = norm(target ?: @""); if (tg.length < 1) return 0;
-    NSInteger exact = 0, nExact = 0, part = 0, nPart = 0;
-    for (NSUInteger i = 0; i < items.count && i < 80; i++) {
-        NSString *tx = norm([items[i][@"text"] description] ?: @""); if (!tx.length) continue;
-        if ([tx isEqualToString:tg]) { exact = i + 1; nExact++; }
-        else if (tg.length >= 2 && ([tx containsString:tg] || [tg containsString:tx]) && tx.length <= tg.length + 8) { part = i + 1; nPart++; }
-    }
-    if (nExact == 1) return exact;
-    if (!nExact && nPart == 1) return part;
-    return 0;
-}
 static NSString *validateAct(NSDictionary *act, NSUInteger nItems) {
     NSString *a = [[act[@"action"] description] lowercaseString] ?: @"";
     BOOL hasID = NO; id idv = act[@"id"];
@@ -1335,18 +1300,7 @@ static NSString *shopPlatformOf(NSString *name) {
     if (bids[l]) return bids[l];
     return nil;
 }
-static BOOL isCompareTask(NSString *t) {
-    for (NSString *k in @[@"比价", @"比较价格", @"价格比较", @"对比价格", @"价格对比", @"哪家便宜", @"哪个便宜", @"最便宜"])
-        if ([t containsString:k]) return YES;
-    return NO;
-}
 static BOOL hasDigitStr(NSString *t) { return [t rangeOfCharacterFromSet:NSCharacterSet.decimalDigitCharacterSet].location != NSNotFound; }
-// 某个平台记下的、带数字(价格)的结果条数
-static int pricedCount(NSArray *findings, NSString *plat) {
-    int n = 0; NSString *tag = [NSString stringWithFormat:@"[%@]", plat];
-    for (NSString *f in findings) if ([f hasPrefix:tag] && hasDigitStr([f substringFromIndex:tag.length])) n++;
-    return n;
-}
 
 // v0.9.26:结果去重用:去掉空格标点后比较
 static NSString *findNorm(NSString *s) {
@@ -1426,7 +1380,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     NSString *pendingSwipeSig = nil;       // 5:上一步滑动前的屏幕签名,下一步对比确认有没有滚动
     NSMutableArray *queue = [NSMutableArray array]; NSArray *queueItems = nil; NSData *queueThumb = nil; // S7:预定的后续动作
     int loadWaits = 0; // v0.9.38:只有“加载中”的屏幕本地等
-    int lastAdN = -1, lastAdRep = 0; NSArray *numGoals = taskNumGoals(gTaskDisplay.length ? gTaskDisplay : task); 
+    int lastAdN = -1, lastAdRep = 0; 
     int adWaits = 0, popupTaps = 0, relaunches = 0, castLost = 0, selfBlocks = 0; // selfBlocks:v0.9.17 拦截点 PhoneAgent 自己界面的次数
     NSString *lastPopupKey = nil;
     NSString *taskApp = nil; BOOL expectHome = NO;
@@ -1437,7 +1391,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     BOOL confirmPendingImg = NO; // v0.9.32:确认后的核对:无障碍元素够用就不发截图
     int confirmStep = 0; NSString *confirmTgt = nil, *confirmSig = nil; double confirmX = -1, confirmY = -1; // v0.9.26:刚确认过的敏感点击
     int shopSinceStep = 0, lastNewFindStep = 0;
-    int strayReturns = 0; // v0.9.25:误入 App
     BOOL glmModel = [model.lowercaseString hasPrefix:@"glm"];
     CGSize sc = screenSize();
     int startStep = 1;
