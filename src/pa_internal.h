@@ -127,7 +127,6 @@ BOOL paOn(NSString *key, BOOL def);
 void touchAdjust(double *x, double *y);
 void doTapRaw(double x, double y);
 void doSwipeSmooth(double x1, double y1, double x2, double y2, int ms, int holdMs);
-NSDictionary *axTopLeftButton(void); // v0.9.45:左上角导航栏的返回按钮(无文字也算);v0.9.49:有其他文字的按钮不算
 NSData *frameThumb(NSData *jpeg);
 int thumbChangedCells(NSData *a, NSData *b);
 int thumbTotalCells(void);

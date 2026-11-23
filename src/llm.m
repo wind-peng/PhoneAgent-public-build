@@ -328,7 +328,6 @@ static NSArray *agentTools(void) {
             @[@"long_press", @"长按。参数同 tap", xy, @[]],
             @[@"swipe", @"滑动。给 direction(up/down/left/right,手指移动方向)或 x,y,x2,y2", @{@"direction": @{@"type": @"string", @"enum": @[@"up", @"down", @"left", @"right"]}, @"x": num, @"y": num, @"x2": num, @"y2": num}, @[]],
             @[@"home", @"回到主屏幕", @{}, @[]],
-            @[@"back", @"返回上一页(程序先从左边缘右滑,不行再点左上角返回)", @{}, @[]],
             @[@"close_app", @"关闭(结束)一个 App,用于 App 卡死或需要重启时", @{@"name": @{@"type": @"string", @"description": @"App 中文名"}}, @[@"name"]],
             @[@"open_app", @"直接打开 App", @{@"name": @{@"type": @"string", @"description": @"App 中文名"}}, @[@"name"]],
             @[@"input_text", @"在输入框输入完整文字(程序用剪贴板粘贴)", @{@"text": str, @"id": integer, @"x": num, @"y": num, @"app": str}, @[@"text"]],
@@ -619,7 +618,7 @@ static NSString *const kAgentSystem =
 @"- long_press: 参数 id 或 x,y。长按。\n"
 @"- swipe: 参数 x,y,x2,y2,或只给 direction(up/down/left/right,表示手指滑动的方向)。往下看更多内容用 up。本设备上滑动可能不稳定,能用别的办法就别滑。\n"
 @"- home: 回到主屏幕。需要回主屏幕时只用这个动作,不要用 swipe。\n"
-@"- back: 返回上一页。程序会点左上角的返回按钮(含无文字的箭头);想返回时优先用它。模拟的边缘侧滑在本机不生效,不要用 swipe 从屏幕边缘右滑来返回。\n"
+@"- 返回上一页:没有专门的返回动作,直接 tap 左上角的返回箭头或“返回”,没有就点右上角的关闭/×。模拟的边缘侧滑在本机不生效,不要用 swipe 从屏幕边缘右滑来返回。\n"
 @"- open_app: 参数 name(App 的中文名)。直接打开 App。\n"
 @"- close_app: 参数 name。关闭(结束)这个 App。只在 App 卡死、白屏、一直转圈或需要重启时用,之后用 open_app 重新打开。\n"
 @"- input_text: 参数 id 或 x,y(输入框),text(要输入的完整文字)。程序点输入框并粘贴(替换原有文字),之后会核对输入框里有没有这段文字。\n"

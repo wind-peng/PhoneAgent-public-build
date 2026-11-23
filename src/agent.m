@@ -201,8 +201,6 @@ static NSString *const kAGPrompt =
 @"    Double Tap在屏幕上的特定点快速连续点按两次。使用此操作可以激活双击交互，如缩放、选择文本或打开项目。坐标系统从左上角 (0,0) 开始到右下角（999,999）结束。此操作完成后，您将自动收到结果状态的截图。\n"
 @"- do(action=\"Take_over\", message=\"xxx\")\n"
 @"    Take_over是接管操作，表示在登录和验证阶段需要用户协助。\n"
-@"- do(action=\"Back\")\n"
-@"    导航返回到上一个屏幕或关闭当前对话框。使用此操作可以从更深的屏幕返回、关闭弹出窗口或退出当前上下文。此操作完成后，您将自动收到结果状态的截图。\n"
 @"- do(action=\"Home\")\n"
 @"    Home是回到系统桌面的操作。使用此操作可退出当前应用并返回主屏幕，或从已知状态启动新任务。此操作完成后，您将自动收到结果状态的截图。\n"
 @"- do(action=\"Wait\", duration=\"x seconds\")\n"
@@ -212,8 +210,8 @@ static NSString *const kAGPrompt =
 @"\n"
 @"必须遵循的规则：\n"
 @"1. 在执行任何操作前，先检查当前app是否是目标app，如果不是，先执行 Launch。\n"
-@"2. 如果进入到了无关页面，先执行 Back。如果执行Back后页面没有变化，请点击页面左上角的返回键进行返回，或者右上角的X号关闭。\n"
-@"3. 如果页面未加载出内容，最多连续 Wait 三次，否则执行 Back重新进入。\n"
+@"2. 如果进入到了无关页面，请点击页面左上角的返回键进行返回，或者右上角的X号关闭。\n"
+@"3. 如果页面未加载出内容，最多连续 Wait 三次，否则点左上角返回后重新进入。\n"
 @"4. 如果页面显示网络问题，需要重新加载，请点击重新加载。\n"
 @"5. 如果当前页面找不到目标联系人、商品、店铺等信息，可以尝试 Swipe 滑动查找。\n"
 @"6. 遇到价格区间、时间区间等筛选条件，如果没有完全符合的，可以放宽要求。\n"
@@ -231,7 +229,7 @@ static NSString *const kAGPrompt =
 @"18. 在结束任务前请一定要仔细检查任务是否完整准确的完成，如果出现错选、漏选、多选的情况，请返回之前的步骤进行纠正。\n"
 @"\n"
 @"补充说明（当前设备是 iPhone）：\n"
-@"- iPhone 没有系统返回键，Back 会由程序点击左上角返回按钮来实现；Type 由程序通过剪贴板粘贴来实现，无需关心键盘。\n"
+@"- iPhone 没有系统返回键，也没有 Back 动作，返回请直接 Tap 左上角的返回箭头或右上角的 X；Type 由程序通过剪贴板粘贴来实现，无需关心键盘。\n"
 @"- 涉及支付、转账、输入支付密码等花钱环节，不要自己点击，用 do(action=\"Take_over\", message=\"需要你本人完成付款\") 请用户本人完成；其余任务正常完成。\n"
 @"- finish 的 message 请写成给用户看的完整结果（如果任务是查询或总结信息，把信息完整写在 message 里）。";
 
@@ -419,46 +417,6 @@ static BOOL agPasteText(NSString *text, double x, double y, NSString *backHint, 
     NSDictionary *allow = agFindOnScreen(@[@"允许粘贴"], @[@"不允许"], &e);
     if (allow) { doTap([allow[@"x"] doubleValue], [allow[@"y"] doubleValue]); usleep(900 * 1000); }
     return YES;
-}
-
-// iPhone 没有返回键:优先点屏幕左上角的“返回/取消/关闭”文字,否则点左上角箭头的常见位置
-// v0.9.48:返回 = 点识别到的左上角返回按钮(模拟侧滑在真机上不触发);找不到就如实告诉模型,不盲点
-static BOOL agScreenChanged(NSData *th0, CFAbsoluteTime t0) {
-    CFAbsoluteTime t1 = 0; NSData *f1 = currentFrame(&t1);
-    if (!th0 || !f1) return YES; // 拿不到画面就没法核对,按已生效处理
-    if (t1 == t0) return NO;
-    return thumbChangedCells(th0, frameThumb(f1)) > 1;
-}
-
-static BOOL agIsBackText(NSString *t) {
-    if (!t.length || t.length > 8) return NO;
-    for (NSString *k in @[@"返回", @"Back", @"back", @"取消", @"关闭"]) if ([t containsString:k]) return YES;
-    return [@[@"<", @"＜", @"く", @"〈", @"‹"] containsObject:t];
-}
-
-static NSString *agGoBack(NSArray *items, BOOL *okOut) {
-    if (okOut) *okOut = NO;
-    if ([frontmostBundleID() isEqualToString:@"com.apple.springboard"]) return @"现在在主屏幕,没有可返回的页面";
-    CGSize sc = screenSize();
-    CFAbsoluteTime t0 = 0; NSData *th0 = frameThumb(currentFrame(&t0));
-    // v0.9.48:真机实验 5 种模拟侧滑都不触发系统的边缘返回,不再侧滑
-    // v0.9.53:顺序 = 左上角写着“返回/关闭”的按钮 → 左上角无文字的箭头按钮(无障碍“退出”真机实测无效,已去掉)
-    NSDictionary *hit = nil;
-    for (NSDictionary *it in items) {
-        double x = [it[@"x"] doubleValue], y = [it[@"y"] doubleValue];
-        if (y < sc.height * 0.14 && x < sc.width * 0.3 && agIsBackText([it[@"text"] description])) { hit = it; break; }
-    }
-    if (!hit) hit = axTopLeftButton();
-    if (hit) {
-        NSString *t = [hit[@"text"] description];
-        doTap([hit[@"x"] doubleValue], [hit[@"y"] doubleValue]);
-        waitScreenSettle(0.4, 2.0);
-        BOOL ch = agScreenChanged(th0, t0);
-        if (okOut) *okOut = ch;
-        return ch ? [NSString stringWithFormat:@"点了左上角的“%@”,屏幕已变化", t]
-                  : [NSString stringWithFormat:@"点了左上角的“%@”,屏幕没变化", t];
-    }
-    return @"左上角没找到“返回”按钮。这一页可能不支持返回:请点左上角的返回箭头图标(给 x,y)、右上角的关闭/×,或用 home、open_app 换路";
 }
 
 // ---- v0.9.44:关闭 App。先直接结束它的进程(巨魔安装、无沙盒才可能做到),不行再用多任务界面上划 ----
@@ -778,9 +736,9 @@ static int expReplay(NSDictionary *entry, NSMutableArray *history, int *done, NS
             if (paOn(@"smart_settle", YES)) waitScreenSettle(0.3, 2.5); else sleep(2);
         } else if ([a isEqualToString:@"home"]) {
             NSString *hn = nil; goHome(&hn); sleep(1);
-        } else if ([a isEqualToString:@"back"]) {
-            NSString *e = nil; NSArray *items = agScreenItems(&e);
-            agGoBack(items, NULL);
+        } else if ([a isEqualToString:@"back"]) { // v0.9.56:不再有 back 动作,旧记录到这一步就交给模型
+            *why = @"记录里有“返回”一步,现在由模型自己点返回";
+            return 1;
         } else if ([a isEqualToString:@"ask_user"]) {
             int r = agentAsk(@"pause", st[@"text"] ?: @"需要你处理");
             if (r < 0) return -1;
@@ -876,7 +834,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
         NSString *info = [[NSString alloc] initWithData:infoJSON encoding:NSUTF8StringEncoding] ?: @"{}";
         NSMutableString *text = [NSMutableString stringWithFormat:@"%@** Screen Info **\n\n%@", step == 1 ? [task stringByAppendingString:@"\n\n"] : @"", info];
         if (pendingNote.length) { [text appendFormat:@"\n\n%@", pendingNote]; pendingNote = nil; }
-        if (same >= 2) [text appendString:@"\n\n(系统提示:上一步操作后屏幕没有变化,请换一种方式,例如调整点击位置、先 Wait、或 Back 后重进。)"];
+        if (same >= 2) [text appendString:@"\n\n(系统提示:上一步操作后屏幕没有变化,请换一种方式,例如调整点击位置、先 Wait、或点左上角返回后重进。)"];
 
         NSString *b64 = [jpg base64EncodedStringWithOptions:0];
         NSDictionary *userMsg = @{@"role": @"user", @"content": @[
@@ -923,7 +881,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
             lastRepScreen = [sig copy] ?: @"";
             lastActKey = k;
             if (repeatCnt >= 5) { agentSay(@"任务停止:同一个动作已经连续重复 5 次,屏幕没有达到预期,已停止"); break; }
-            if (repeatCnt >= 3) pendingNote = [NSString stringWithFormat:@"(系统提示:同一个动作已经连续做了 %d 次,说明这个办法不起作用,请换一种办法,例如换位置、Back 后换入口或改用搜索。)", repeatCnt];
+            if (repeatCnt >= 3) pendingNote = [NSString stringWithFormat:@"(系统提示:同一个动作已经连续做了 %d 次,说明这个办法不起作用,请换一种办法,例如换位置、返回后换入口或改用搜索。)", repeatCnt];
         }
         double ax = 0, ay = 0, bx = 0, by = 0;
         BOOL hasEl = agPoint(action, @"element", &ax, &ay);
@@ -978,12 +936,8 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
                 pendingNote = [NSString stringWithFormat:@"(系统提示:%@ 程序已自动尝试进入 App 资源库:%@。%@)", i2 ?: @"打开失败", ln ?: @"", inLib ? @"请点击顶部搜索框,用 Type 输入 App 名称搜索,再点搜索结果打开。" : @"如果仍不在资源库界面,请先 Home 再试,或 finish 说明。"];
             }
             if (paOn(@"smart_settle", YES)) waitScreenSettle(1.0, 4.0); else sleep(3);
-        } else if ([act isEqualToString:@"back"]) {
-            BOOL bok = NO;
-            NSString *bn = agGoBack(items, &bok);
-            agentSay([@"返回:" stringByAppendingString:bn]);
-            if (bok) expRecord(@{@"a": @"back"}); // v0.9.49:没生效的返回不记进经验库
-            else pendingNote = [NSString stringWithFormat:@"(系统提示:上一步返回没有生效:%@)", bn]; // v0.9.49:失败原因告诉模型
+        } else if ([act isEqualToString:@"back"]) { // v0.9.56:iPhone 没有返回键,程序不代点,让模型自己点
+            pendingNote = @"(系统提示:iPhone 没有返回键,Back 不会执行任何操作。请直接 Tap 左上角的返回箭头或“返回”,没有就点右上角的 X/关闭。)";
         } else if ([act isEqualToString:@"home"]) {
             NSString *hn = nil;
             goHome(&hn);
@@ -1330,7 +1284,9 @@ static NSString *validateAct(NSDictionary *act, NSUInteger nItems) {
         if (![[act[@"name"] description] length]) return @"open_app 需要 name";
     } else if ([a isEqualToString:@"close_app"]) {
         if (![[act[@"name"] description] length]) return @"close_app 需要 name";
-    } else if (![@[@"home", @"back", @"wait", @"done", @"stop", @"ask_user", @"set_clipboard"] containsObject:a]) {
+    } else if ([a isEqualToString:@"back"]) {
+        return @"没有 back 动作:请直接 tap 左上角的返回箭头或“返回”,没有就点右上角的关闭/×";
+    } else if (![@[@"home", @"wait", @"done", @"stop", @"ask_user", @"set_clipboard"] containsObject:a]) {
         return [NSString stringWithFormat:@"不认识的动作「%@」", a];
     }
     return nil;
@@ -2329,17 +2285,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             expRecord(@{@"a": @"home"});
             afterAction(0.3, 2.0, 1); settled = YES;
             checkStale = YES;
-            [queue removeAllObjects];
-        } else if ([action isEqualToString:@"back"]) { // v0.9.44
-            BOOL bok = NO;
-            NSString *bn = agGoBack(items, &bok);
-            // v0.9.46:成功时也把具体结果(已回到上一页、用了哪种方式)告诉模型和用户,模型才知道返回已经成功
-            result = bok ? [@"返回成功,已回到上一页:" stringByAppendingString:bn] : bn;
-            agentSay([@"返回:" stringByAppendingString:bn]);
-            [history addObject:[NSString stringWithFormat:@"%d. back → %@", step, result]];
-            if (bok) expRecord(@{@"a": @"back"}); // v0.9.49:没生效的返回不记进经验库
-            if (!bok) failedLast = YES;
-            settled = YES; checkStale = YES;
             [queue removeAllObjects];
         } else if ([action isEqualToString:@"close_app"]) { // v0.9.44
             NSString *name = [act[@"name"] description] ?: @"";
