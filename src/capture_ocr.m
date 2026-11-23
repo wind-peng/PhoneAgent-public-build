@@ -198,7 +198,8 @@ static UIImage *prepareOCRImage(UIImage *src) {
     [filter setValue:@0.0 forKey:kCIInputSaturationKey];
     [filter setValue:@1.18 forKey:kCIInputContrastKey];
     [filter setValue:@0.02 forKey:kCIInputBrightnessKey];
-    CIContext *ctx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @YES}];
+    static CIContext *ctx = nil; static dispatch_once_t once; // v0.9.43:只建一次
+    dispatch_once(&once, ^{ ctx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @YES}]; });
     CGImageRef cg = [ctx createCGImage:filter.outputImage fromRect:filter.outputImage.extent];
     if (!cg) return scaled;
     UIImage *out = [UIImage imageWithCGImage:cg scale:1 orientation:UIImageOrientationUp];
@@ -624,7 +625,6 @@ NSArray *ocrLive(UIImage *img, NSString **err) {
 NSArray *ocrImage(UIImage *img, NSString **err) {
     if (!img.CGImage) { if (err) *err = @"截图没有有效图像"; return nil; }
     // 先放大、灰度化并提高对比度，再交给稳定的 Revision 1/Fast，改善小字识别。
-    UIImage *ocrImg = prepareOCRImage(img);
     NSMutableString *notes = [NSMutableString string];
     // 广播帧的 NV12 缓冲由 ReplayKit 提供，格式和 IOSurface 能力随系统版本变化。
     // 直接把它交给 Vision 在部分设备上会触发 CoreVideo/Vision 原生崩溃；
@@ -635,6 +635,7 @@ NSArray *ocrImage(UIImage *img, NSString **err) {
     NSArray *lr = ocrLive(img, &le);
     if (lr.count) return lr;
     if (!gLiveFailedNoted) { gLiveFailedNoted = YES; [notes appendFormat:@"[LiveText]%@ ", le ?: @"没识别到文字"]; }
+    UIImage *ocrImg = prepareOCRImage(img); // v0.9.43:Live Text 用原图,失败了才做预处理
     NSArray *r = ocrRun(ocrImg.CGImage, NULL, CGRectZero, &e2);
     if (r) return postOCR(img, r);
     [notes appendFormat:@"[图片路径]%@", e2];

@@ -569,7 +569,7 @@ static NSData *attachJPEG(UIImage *img) {
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"高级设置(v0.9.42)";
+    self.title = @"高级设置(v0.9.43)";
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
     self.popupTV = [UITextView new];
@@ -609,7 +609,6 @@ static NSData *attachJPEG(UIImage *img) {
         [self sw:@"文字步骤:OCR 足够时不发截图(更快更省)" key:@"text_only_steps" def:YES],
         [self sw:@"允许模型一次给出多个连续动作(逐个核对屏幕)" key:@"multi_action" def:YES],
         [self sw:@"子目标规划 + 完成前自检" key:@"subgoal_plan" def:YES],
-        [self sw:@"经验宏回放(相同任务先本地回放,OCR 核对;默认关)" key:@"macro_replay" def:NO],
         [self sw:@"比价任务:每个进过的平台记下商品价格才算完成" key:@"compare_check" def:YES],
         [self sw:@"只显示“加载中”的屏幕本地等待,不调用模型" key:@"loading_screen_wait" def:YES],
         [self sw:@"元素列表标出【标题】(一般不可点)" key:@"ax_header_tag" def:YES],
@@ -1356,8 +1355,8 @@ static NSData *attachJPEG(UIImage *img) {
     {   // 通知:注册带按钮的类别并请求权限
         UNUserNotificationCenter *nc = UNUserNotificationCenter.currentNotificationCenter;
         nc.delegate = self;
-        UNNotificationAction *aOK = [UNNotificationAction actionWithIdentifier:@"allow" title:@"允许" options:UNNotificationActionOptionNone];
-        UNNotificationAction *aAll = [UNNotificationAction actionWithIdentifier:@"allowall" title:@"允许,本次任务不再问" options:UNNotificationActionOptionNone];
+        UNNotificationAction *aOK = [UNNotificationAction actionWithIdentifier:@"allow" title:@"允许" options:UNNotificationActionOptionAuthenticationRequired];
+        UNNotificationAction *aAll = [UNNotificationAction actionWithIdentifier:@"allowall" title:@"允许,本次任务不再问" options:UNNotificationActionOptionAuthenticationRequired];
         UNNotificationAction *aNo = [UNNotificationAction actionWithIdentifier:@"deny" title:@"拒绝(跳过这一步)" options:UNNotificationActionOptionDestructive];
         UNNotificationAction *aStop = [UNNotificationAction actionWithIdentifier:@"stop" title:@"停止任务" options:UNNotificationActionOptionDestructive];
         UNNotificationAction *aCont = [UNNotificationAction actionWithIdentifier:@"resume" title:@"继续" options:UNNotificationActionOptionNone];

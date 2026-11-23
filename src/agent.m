@@ -708,7 +708,7 @@ static int expReplay(NSDictionary *entry, NSMutableArray *history, int *done, NS
 // 返回给模型看的一句说明;没有可用经验返回 nil;用户停止了任务时 *stopped = YES
 static NSString *expTryReplay(NSString *task, NSMutableArray *history, BOOL *stopped) {
     *stopped = NO;
-    if (!expEnabled() || !expReplayEnabled() || !paOn(@"macro_replay", NO)) return nil;
+    if (!expEnabled() || !expReplayEnabled()) return nil; // v0.9.43:只看经验库页的“相同任务先快速回放”一个开关
     double score = 0;
     NSMutableDictionary *e = expFind(task, &score);
     if (!e || score < 0.85 || [e[@"steps"] count] < 2) return nil;
@@ -960,10 +960,10 @@ static void memoryLearn(NSString *task, NSString *result) {
     if ([lm containsString:@"autoglm"]) return; // 手机专用模型不适合做文字提炼
     NSString *mem = memoryText();
     NSString *prompt = [NSString stringWithFormat:
-        @"你是用户个人助手的记忆模块。下面是已有记忆、用户刚刚下达的手机任务和执行结果。请只提取值得长期记住的用户偏好或稳定事实(例如常用的 App、喜欢的品牌/口味/尺码、常去的地点、说话习惯、对结果格式的要求)。"
+        @"你是用户个人助手的记忆模块。下面是已有记忆和用户刚刚亲自下达的手机任务原文。请只提取值得长期记住的用户偏好或稳定事实(例如常用的 App、喜欢的品牌/口味/尺码、常去的地点、说话习惯、对结果格式的要求)。"
         @"不要记录一次性的事情;不要记录密码、验证码、银行卡号、身份证号、手机号、支付信息等敏感内容;不要重复已有记忆。"
-        @"每条一行,以“- ”开头,每条不超过 40 个字;没有新内容就只输出“无”。\n\n已有记忆:\n%@\n\n任务:%@\n\n结果:%@",
-        mem.length ? mem : @"(空)", task ?: @"", result ?: @""];
+        @"每条一行,以“- ”开头,每条不超过 40 个字;没有新内容就只输出“无”。\n\n已有记忆:\n%@\n\n任务:%@",
+        mem.length ? mem : @"(空)", task ?: @""]; // v0.9.43:只从任务原文学,不读执行结果(结果可能含网页/消息里的文字)
     BOOL glm = [lm hasPrefix:@"glm"];
     NSDictionary *body = @{@"model": model, @"messages": @[@{@"role": @"user", @"content": prompt}],
                            @"temperature": glm ? @1.0 : @0.2, @"max_tokens": glm ? @4096 : @2000}; // DeepSeek 等默认思考,300 会被思考吃光
