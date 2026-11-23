@@ -281,9 +281,10 @@ NSDictionary *axTopLeftButton(void) {
         axInitOnce();
         CGSize sz = UIScreen.mainScreen.bounds.size;
         CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        NSDictionary *unlabeled = nil; // v0.9.54:先要写着返回/关闭的,扫完都没有才用无文字箭头
         for (CGFloat y = 50; y <= 112; y += 10)
             for (CGFloat x = 14; x <= 62; x += 16) {
-                if (CFAbsoluteTimeGetCurrent() - t0 > 0.8) return nil;
+                if (CFAbsoluteTimeGetCurrent() - t0 > 0.8) return unlabeled;
                 id el = axHitAt(CGPointMake(x, y));
                 if (!el) continue;
                 id fv = axKV(el, @"frame");
@@ -297,8 +298,10 @@ NSDictionary *axTopLeftButton(void) {
                 BOOL backWord = [l containsString:@"返回"] || [l.lowercaseString containsString:@"back"] || [l containsString:@"关闭"] || [l.lowercaseString containsString:@"close"];
                 if (!btn && !backWord) continue;
                 if (l.length && !backWord) continue; // v0.9.49:有别的文字(扫一扫、头像、菜单…)的不是返回,跳过;只收返回/关闭或无文字的箭头
-                return @{@"x": @(CGRectGetMidX(r)), @"y": @(CGRectGetMidY(r)), @"text": l.length ? l : @"(无文字按钮)"};
+                if (backWord) return @{@"x": @(CGRectGetMidX(r)), @"y": @(CGRectGetMidY(r)), @"text": l};
+                if (!unlabeled) unlabeled = @{@"x": @(CGRectGetMidX(r)), @"y": @(CGRectGetMidY(r)), @"text": @"(无文字按钮)"};
             }
+        return unlabeled;
     } @catch (NSException *e) {}
     return nil;
 }
