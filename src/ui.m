@@ -615,7 +615,6 @@ static NSData *attachJPEG(UIImage *img) {
         [self sw:@"智能等待:动作后等画面稳定(代替固定等待)" key:@"smart_settle" def:YES],
         [self sw:@"只在屏幕没变化时才附上一步截图(省 token)" key:@"single_image" def:YES],
         [self sw:@"打开 App / 点搜索后本地等页面加载完(少问模型一次 wait)" key:@"local_load_wait" def:YES],
-        [self sw:@"点击没反应时在旁边自动重试一次(敏感按钮除外)" key:@"tap_retry" def:YES],
         [self sw:@"新滑动方式(60Hz 匀速、抬手前停顿防甩动)" key:@"smooth_swipe" def:YES],
         [self sw:@"应用触摸校准偏移(先在校准页自检)" key:@"apply_touch_offset" def:NO],
         cal,

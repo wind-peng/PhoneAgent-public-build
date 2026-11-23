@@ -129,30 +129,6 @@ static BOOL goHome(NSString **note) {
 
 static void waitForStableFrame(double maxWait); // 定义在下面
 
-// 找不到 App 时的兜底:回主屏幕,向左滑到最后一页进入"App 资源库"(检测到"资源库"字样即成功)
-static BOOL enterAppLibrary(NSString **note) {
-    NSString *hn = nil;
-    goHome(&hn);
-    CGSize sc = screenSize();
-    for (int i = 0; i < 9 && gAgentRunning; i++) {
-        NSString *e = nil;
-        waitForStableFrame(2.0);
-        UIImage *img = takeScreenshot(&e);
-        NSArray *items = img ? ocrImage(img, &e) : nil;
-        for (NSDictionary *it in items) {
-            NSString *t = it[@"text"];
-            if ([t containsString:@"资源库"] || [t localizedCaseInsensitiveContainsString:@"App Library"]) {
-                *note = @"已进入 App 资源库";
-                return YES;
-            }
-        }
-        doSwipe(sc.width * 0.88, sc.height * 0.5, sc.width * 0.12, sc.height * 0.5, 20, 320);
-        sleep(1);
-    }
-    *note = @"左滑多次仍没有进入 App 资源库(滑动可能没生效)";
-    return NO;
-}
-
 // 等广播画面静止:最近 0.8 秒内没有新帧,说明动画/转场结束了(最多等 maxWait 秒)
 static void waitForStableFrame(double maxWait) {
     CFAbsoluteTime end = CFAbsoluteTimeGetCurrent() + maxWait;
@@ -283,6 +259,34 @@ static NSString *agArg(NSString *s, NSString *key) {
     v = [v stringByReplacingOccurrencesOfString:@"\\n" withString:@"\n"];
     v = [v stringByReplacingOccurrencesOfString:@"\\\\" withString:@"\\"];
     return v;
+}
+
+// v0.9.64:finish(message="...") 的内容里可能自带引号,按最后一个 ") 取完整内容;再去掉 **、#、` 这类 markdown 记号
+static NSString *agFinishMessage(NSString *s) {
+    NSRange m = [s rangeOfString:@"message="];
+    if (m.location == NSNotFound) return agArg(s, @"message");
+    NSUInteger i = NSMaxRange(m);
+    while (i < s.length && [s characterAtIndex:i] == ' ') i++;
+    if (i >= s.length) return @"";
+    unichar q = [s characterAtIndex:i];
+    NSString *v;
+    if (q == '"' || q == '\'') {
+        NSString *rest = [s substringFromIndex:i + 1];
+        NSString *t = [rest stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if ([t hasSuffix:@")"]) t = [[t substringToIndex:t.length - 1] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        NSRange lq = [t rangeOfString:[NSString stringWithCharacters:&q length:1] options:NSBackwardsSearch];
+        v = lq.location != NSNotFound ? [t substringToIndex:lq.location] : t;
+    } else {
+        v = [s substringFromIndex:i];
+        if ([v hasSuffix:@")"]) v = [v substringToIndex:v.length - 1];
+    }
+    v = [v stringByReplacingOccurrencesOfString:@"\\\"" withString:@"\""];
+    v = [v stringByReplacingOccurrencesOfString:@"\\n" withString:@"\n"];
+    v = [v stringByReplacingOccurrencesOfString:@"**" withString:@""];
+    v = [v stringByReplacingOccurrencesOfString:@"`" withString:@""];
+    NSRegularExpression *h = [NSRegularExpression regularExpressionWithPattern:@"(?m)^\\s*#{1,6}\\s*" options:0 error:nil];
+    v = [h stringByReplacingMatchesInString:v options:0 range:NSMakeRange(0, v.length) withTemplate:@""];
+    return [v stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }
 
 // 取 element=[x,y] / start=[x,y] / end=[x,y]
@@ -865,7 +869,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
         agentSay([NSString stringWithFormat:@"第%d步[%@]:%@ → %@", step, appName, think.length > 120 ? [think substringToIndex:120] : think, action]);
 
         if ([action hasPrefix:@"finish"]) {
-            agentSay([NSString stringWithFormat:@"任务完成:%@", agArg(action, @"message") ?: @""]);
+            agentSay([NSString stringWithFormat:@"任务完成:%@", agFinishMessage(action) ?: @""]);
             break;
         }
         NSString *act = [agArg(action, @"action") ?: @"" lowercaseString];
@@ -930,9 +934,7 @@ static void agentRunAutoGLM(NSString *task, NSString *base, NSString *key, NSStr
             } else if (bid && openApp(bid)) { gLastApp = bid; lastX = lastY = -1; expRecord(@{@"a": @"open_app", @"name": name}); }
             else {
                 agentSay([@"提示:" stringByAppendingString:i2 ?: @"打开失败"]);
-                NSString *ln = nil;
-                BOOL inLib = enterAppLibrary(&ln);
-                pendingNote = [NSString stringWithFormat:@"(系统提示:%@ 程序已自动尝试进入 App 资源库:%@。%@)", i2 ?: @"打开失败", ln ?: @"", inLib ? @"已进入" : @"未能进入"];
+                pendingNote = [NSString stringWithFormat:@"(系统提示:%@)", i2 ?: @"打开失败"];
             }
             if (paOn(@"smart_settle", YES)) waitScreenSettle(1.0, 4.0); else sleep(3);
         } else if ([act isEqualToString:@"back"]) { // v0.9.56:iPhone 没有返回键,程序不代点,让模型自己点
@@ -1331,27 +1333,6 @@ static BOOL findingDup(NSArray *findings, NSString *line) {
     return NO;
 }
 
-// v0.9.26:从“打开淘宝搜索…/进入微信…”这类文字里取出 App 名(必须是真装了的 App 才算)
-static NSString *guessAppName(NSArray *texts) {
-    NSCharacterSet *stop = [NSCharacterSet characterSetWithCharactersInString:@"，,。.;；、→ \n"];
-    NSArray *stopWords = @[@"搜索", @"找", @"并", @"给", @"里", @"中", @"的", @"发", @"输入", @"点", @"查", @"看", @"记录", @"设置一", @"定", @"导航", @"打开", @"然后"];
-    for (NSString *t in texts) {
-        for (NSString *verb in @[@"打开", @"进入", @"切换到", @"回到", @"去"]) {
-            NSRange r = [t rangeOfString:verb];
-            if (r.location == NSNotFound) continue;
-            NSString *rest = [t substringFromIndex:NSMaxRange(r)];
-            NSRange sr = [rest rangeOfCharacterFromSet:stop];
-            if (sr.location != NSNotFound) rest = [rest substringToIndex:sr.location];
-            for (NSString *w in stopWords) { NSRange wr = [rest rangeOfString:w]; if (wr.location != NSNotFound && wr.location > 0) rest = [rest substringToIndex:wr.location]; }
-            rest = [rest stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-            if (rest.length < 2 || rest.length > 12) continue;
-            NSString *info = nil;
-            if (bundleForAppName(rest, &info)) return rest;
-        }
-    }
-    return nil;
-}
-
 static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString *model) {
     if ([model.lowercaseString containsString:@"autoglm"]) { agentRunAutoGLM(task, base, key, model); return; }
     gCurrentModel = model;
@@ -1660,15 +1641,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 ma[@"direction"] = @"up"; act = ma;
                 agentSay(@"swipe 没给方向,按上滑处理");
             }
-            if ([[[act[@"action"] description] lowercaseString] isEqualToString:@"open_app"] && ![[act[@"name"] description] length]) { // v0.9.26:open_app 漏了 name,从子目标/任务里补,不再重问
-                NSMutableArray *srcs = [NSMutableArray array];
-                for (NSUInteger i = 0; i < plan.count; i++) if (![planDone[i] boolValue]) [srcs addObject:plan[i]];
-                if (!plan.count && [act[@"plan"] isKindOfClass:NSArray.class]) for (id p in act[@"plan"]) if ([p isKindOfClass:NSString.class]) [srcs addObject:p];
-                if ([[act[@"thought"] description] length]) [srcs addObject:[act[@"thought"] description]];
-                [srcs addObject:gTaskDisplay.length ? gTaskDisplay : task];
-                NSString *guess = guessAppName(srcs);
-                if (guess.length) { NSMutableDictionary *ma = [act mutableCopy]; ma[@"name"] = guess; act = ma; agentSay([NSString stringWithFormat:@"open_app 没给 App 名,按子目标补成「%@」", guess]); }
-            }
             NSString *bad = validateAct(act, allItems.count);
             if (bad) {
                 agentSay([NSString stringWithFormat:@"提示:模型给的动作参数无效(%@),重新询问一次", bad]);
@@ -1905,30 +1877,11 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                 hline = [hline stringByAppendingString:@" (用户已允许,已经点击)"];
                 if (paOn(@"ax_tree", YES)) confirmPendingImg = YES; else needImage = YES;
             }
-            // 4:点击没反应:在旁边 8pt 处本地重试一次(敏感/购物类按钮不重试,避免重复操作)
-            if (isTap && paOn(@"tap_retry", YES) && broadcastAlive() && thumbNow) {
+            // v0.9.64:点完屏幕没变化只如实记下,不再自动在旁边重点
+            if (isTap && broadcastAlive() && thumbNow) {
                 CFAbsoluteTime ftA = 0; NSData *fA = currentFrame(&ftA);
                 int c = (ftA == frameT0) ? 0 : thumbChangedCells(thumbNow, frameThumb(fA));
-                if (c >= 0 && c <= 1) {
-                    int cat = 0;
-                    NSString *blob = [NSString stringWithFormat:@"%@ %@", tgt, nearestItemText(items, x, y)];
-                    BOOL risky = risk.length || classifyAction(tgt, risk, localOK ? items : nil, x, y, &cat) != nil;
-                    for (NSString *w in @[@"购物车", @"购买", @"关注", @"点赞", @"收藏", @"发送", @"确定", @"确认", @"提交", @"删除", @"支付", @"下单"]) if ([blob containsString:w]) { risky = YES; break; }
-                    if (!risky) {
-                        double dx = x < sc.width / 2 ? 8 : -8, dy = usedID ? 0 : (y < sc.height / 2 ? 8 : -8);
-                        double rx2 = MAX(0, MIN(sc.width - 1, x + dx)), ry2 = MAX(0, MIN(sc.height - 1, y + dy));
-                        CFAbsoluteTime ftB = ftA;
-                        doTap(rx2, ry2);
-                        afterAction(0.25, 2.5, 2);
-                        CFAbsoluteTime ftC = 0; NSData *fC = currentFrame(&ftC);
-                        int c2 = (ftC == ftB) ? 0 : thumbChangedCells(thumbNow, frameThumb(fC));
-                        BOOL ok2 = c2 > 1;
-                        hline = [hline stringByAppendingFormat:@" → 屏幕没变化,程序已在旁边 8pt 处(%.0f,%.0f)自动重试一次:%@", rx2 / kx, ry2 / ky, ok2 ? @"这次有变化" : @"仍没有变化"];
-                        if (!ok2) { failedLast = YES; [queue removeAllObjects]; }
-                    } else {
-                        hline = [hline stringByAppendingString:@" → 屏幕暂时没有明显变化"];
-                    }
-                }
+                if (c >= 0 && c <= 1) hline = [hline stringByAppendingString:@" → 屏幕暂时没有明显变化"];
             }
             [history addObject:hline];
             checkStale = YES;
@@ -1947,10 +1900,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             } else if (bid && openApp(bid)) { result = @"已打开"; gLastApp = bid; taskApp = bid; expectHome = NO; checkStale = YES; expRecord(@{@"a": @"open_app", @"name": name}); }
             else {
                 result = info ?: @"打开失败";
-                NSString *ln = nil;
-                expectHome = YES;
-                BOOL inLib = enterAppLibrary(&ln);
-                result = [result stringByAppendingFormat:@"\n程序已自动尝试进入 App 资源库:%@。%@", ln ?: @"", inLib ? @"已进入" : @"未能进入"];
             }
             [history addObject:[NSString stringWithFormat:@"%d. open_app(%@) → %@", step, name, result]];
             afterAction(1.0, 4.0, 3); settled = YES;
