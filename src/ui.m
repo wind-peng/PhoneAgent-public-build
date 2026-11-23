@@ -600,7 +600,7 @@ static NSData *attachJPEG(UIImage *img) {
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
         [self hdr:@"Token 统计(每次任务结束也会在执行记录里显示本次用量)"],
         self.tokL, tokClr, cacheT,
-        [self hdr:@"实验"], axT,
+        [self hdr:@"实验"], axT, [self edgeExpBtn],
         [self sw:@"每次调用模型都在执行记录里写一行 Token 明细(第几步、几张图、输入/缓存/输出)" key:@"token_step_log" def:YES],
         [self hdr:@"模型请求"],
         [self sw:@"用函数调用(tools)输出动作(GLM/DeepSeek;不支持时自动退回 JSON)" key:@"use_tool_calls" def:YES],
@@ -678,6 +678,36 @@ static NSData *attachJPEG(UIImage *img) {
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"无障碍探测" message:@"6 秒后开始。现在切到要测的 App(比如微信聊天页、淘宝首页),停 10 秒左右再回来,结果写在执行记录里。不会点击任何东西。" preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
+}
+- (UIButton *)edgeExpBtn { // v0.9.47
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    [b setTitle:@"侧滑返回实验(先开屏幕录制;点后 6 秒内切到微信某个聊天页,别碰屏幕,等约 15 秒再回来看执行记录)" forState:UIControlStateNormal];
+    b.titleLabel.numberOfLines = 0;
+    [b addTarget:self action:@selector(onEdgeExp) forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+- (void)onEdgeExp {
+    if (gAgentRunning) return;
+    agentSay(@"[侧滑实验] 6 秒后开始,请切到一个有返回的页面(如微信聊天页)");
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *info = nil;
+        uint64_t rid = realTouchSenderID(&info);
+        agentSay([@"[侧滑实验] " stringByAppendingString:info ?: @""]);
+        sleep(6);
+        NSArray *names = @[@"方式1 现在的写法", @"方式2 起点贴最边", @"方式3 移动带完整触摸标记", @"方式4 用真实触摸屏ID", @"方式5 真实ID+贴边+完整标记"];
+        for (int v = 0; v < 5; v++) {
+            if ((v == 3 || v == 4) && !rid) { agentSay([NSString stringWithFormat:@"[侧滑实验] %@:跳过(没找到触摸屏 ID)", names[v]]); continue; }
+            CFAbsoluteTime t0 = 0; NSData *f0 = currentFrame(&t0); NSData *th0 = f0 ? frameThumb(f0) : nil;
+            doEdgeSwipeExp(v, rid);
+            sleep(2);
+            CFAbsoluteTime t1 = 0; NSData *f1 = currentFrame(&t1);
+            if (!th0 || !f1) { agentSay([NSString stringWithFormat:@"[侧滑实验] %@:已执行(没开屏幕录制,判断不了,请看手机有没有返回)", names[v]]); continue; }
+            BOOL ch = (t1 != t0) && thumbChangedCells(th0, frameThumb(f1)) > 1;
+            agentSay([NSString stringWithFormat:@"[侧滑实验] %@:%@", names[v], ch ? @"屏幕变了 ✅ 成功,后面的不再试" : @"没反应"]);
+            if (ch) return;
+        }
+        agentSay(@"[侧滑实验] 结束:都没反应");
+    });
 }
 - (void)onTokClear { tokClearTotal(); self.tokL.text = tokSummary(YES); }
 - (void)onCacheTest:(UIButton *)btn {

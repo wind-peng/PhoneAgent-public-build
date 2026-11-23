@@ -18,6 +18,8 @@ static void (*pSetSender)(IOHIDEventRef, uint64_t);
 static void (*pSetFloat)(IOHIDEventRef, uint32_t, double);
 static IOHIDEventRef (*pCreateKeyboard)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, Boolean, uint32_t);
 static IOHIDEventSystemClientRef gClient;
+uint32_t gMoveMaskOverride = 0;   // v0.9.47 侧滑实验:移动事件的掩码(0 = 不改)
+uint64_t gSenderOverride = 0;     // v0.9.47 侧滑实验:改用真实触摸屏的 sender ID(0 = 不改)
 int gSwipeMode = 0; // 0 基础;1 +触点半径;2 +半径且移动事件带 Touch;3 +半径、慢速并在起止停顿;4 = 3 + 移动事件带 Range|Touch
 
 NSString *loadHID(void) {
@@ -47,6 +49,7 @@ void sendFinger(double nx, double ny, int phase) {
     BOOL touching = (phase != 2);
     uint32_t mask = (phase == 1) ? 0x4 : 0x3;
     if (phase == 1) { if (gSwipeMode == 2) mask = 0x6; else if (gSwipeMode == 4) mask = 0x7; }
+    if (phase == 1 && gMoveMaskOverride) mask = gMoveMaskOverride;
     IOHIDEventRef hand = pCreateDigitizer(kCFAllocatorDefault, t, 3, 0, 0, mask, 0,
                                           nx, ny, 0, 0, 0, touching, touching, 0);
     pSetInt(hand, 0xb0019, 1);
@@ -55,7 +58,7 @@ void sendFinger(double nx, double ny, int phase) {
     if (gSwipeMode >= 1 && pSetFloat) { pSetFloat(finger, 0xb0014, 0.04); pSetFloat(finger, 0xb0015, 0.04); } // 触点半径
     pAppend(hand, finger, 0);
     CFRelease(finger);
-    pSetSender(hand, 0x8000000817319372ULL);
+    pSetSender(hand, gSenderOverride ? gSenderOverride : 0x8000000817319372ULL);
     pDispatch(gClient, hand);
     CFRelease(hand);
 }
@@ -200,4 +203,55 @@ BOOL doHomeKey(void) {
         usleep(80 * 1000);
     }
     return YES;
+}
+
+// ---- v0.9.47 侧滑返回实验 ----
+// 找本机真实触摸屏的 sender ID(系统可能靠它判断“从屏幕边缘起手”)
+uint64_t realTouchSenderID(NSString **info) {
+    void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+    CFArrayRef (*copySvc)(IOHIDEventSystemClientRef) = dlsym(h, "IOHIDEventSystemClientCopyServices");
+    CFTypeRef (*copyProp)(void *, CFStringRef) = dlsym(h, "IOHIDServiceClientCopyProperty");
+    CFTypeRef (*regID)(void *) = dlsym(h, "IOHIDServiceClientGetRegistryID");
+    IOHIDEventSystemClientRef (*createT)(CFAllocatorRef, int, CFDictionaryRef) = dlsym(h, "IOHIDEventSystemClientCreateWithType");
+    if (!copySvc || !copyProp || !regID) { if (info) *info = @"缺少查询触摸屏的系统函数"; return 0; }
+    CFArrayRef svcs = gClient ? copySvc(gClient) : NULL;
+    if ((!svcs || !CFArrayGetCount(svcs)) && createT) {
+        if (svcs) CFRelease(svcs);
+        IOHIDEventSystemClientRef mon = createT(kCFAllocatorDefault, 1, NULL);
+        svcs = mon ? copySvc(mon) : NULL;
+    }
+    if (!svcs) { if (info) *info = @"拿不到输入设备列表"; return 0; }
+    uint64_t found = 0; int n = (int)CFArrayGetCount(svcs);
+    for (int i = 0; i < n && !found; i++) {
+        void *sv = (void *)CFArrayGetValueAtIndex(svcs, i);
+        NSNumber *pg = CFBridgingRelease(copyProp(sv, CFSTR("PrimaryUsagePage")));
+        NSNumber *us = CFBridgingRelease(copyProp(sv, CFSTR("PrimaryUsage")));
+        if ([pg isKindOfClass:NSNumber.class] && [us isKindOfClass:NSNumber.class] && pg.intValue == 0x0D && us.intValue == 0x04) {
+            id r = (__bridge id)regID(sv);
+            if ([r isKindOfClass:NSNumber.class]) found = [(NSNumber *)r unsignedLongLongValue];
+        }
+    }
+    CFRelease(svcs);
+    if (info) *info = found ? [NSString stringWithFormat:@"找到触摸屏 ID 0x%llx(共 %d 个输入设备)", found, n] : [NSString stringWithFormat:@"%d 个输入设备里没找到触摸屏", n];
+    return found;
+}
+
+// 方式 0:现在的写法(起点 2pt);1:起点 0;2:移动事件带 Range|Touch|Position;3:真实触摸屏 ID;4:真实 ID + 起点 0 + 带 Range|Touch|Position
+void doEdgeSwipeExp(int v, uint64_t realID) {
+    CGSize s = screenSize();
+    double x1 = (v == 1 || v == 4) ? 0.0 : 2.0, y = s.height * 0.45, x2 = s.width * 0.82;
+    int saved = gSwipeMode; if (gSwipeMode < 1) gSwipeMode = 1;
+    gMoveMaskOverride = (v == 2 || v == 4) ? 0x7 : 0;
+    gSenderOverride = (v == 3 || v == 4) ? realID : 0;
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+    uint64_t per = (uint64_t)(8.333e6 * tb.denom / tb.numer);
+    int steps = 30;
+    sendFinger(x1 / s.width, y / s.height, 0);
+    uint64_t t = mach_absolute_time();
+    for (int i = 1; i <= steps; i++) {
+        sendFinger((x1 + (x2 - x1) * i / steps) / s.width, y / s.height, 1);
+        t += per; mach_wait_until(t);
+    }
+    sendFinger(x2 / s.width, y / s.height, 2);
+    gMoveMaskOverride = 0; gSenderOverride = 0; gSwipeMode = saved;
 }
