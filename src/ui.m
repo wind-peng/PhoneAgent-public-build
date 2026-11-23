@@ -689,6 +689,7 @@ static NSData *attachJPEG(UIImage *img) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         sleep(6);
         CFAbsoluteTime t0 = 0; NSData *f0 = currentFrame(&t0); NSData *th0 = f0 ? frameThumb(f0) : nil;
+        agentSay([@"[退出测试] 接口诊断:\n" stringByAppendingString:axEscapeDiag()]); // v0.9.51
         NSString *how = nil;
         BOOL sent = axPerformEscape(&how);
         sleep(2);

@@ -317,7 +317,8 @@ BOOL axPerformEscape(NSString **how) {
             unsigned n = 0; Method *ms = class_copyMethodList(c, &n);
             for (unsigned i = 0; i < n; i++) {
                 NSString *nm = NSStringFromSelector(method_getName(ms[i]));
-                if ([nm rangeOfString:@":"].location == NSNotFound && [nm.lowercaseString containsString:@"scape"] && ![sels containsObject:nm]) [sels addObject:nm];
+                BOOL query = [nm hasPrefix:@"can"] || [nm hasPrefix:@"is"] || [nm hasPrefix:@"has"] || [nm hasPrefix:@"should"]; // v0.9.51:canPerformEscape 这类是“能不能”的查询,不是动作
+                if (!query && [nm rangeOfString:@":"].location == NSNotFound && [nm.lowercaseString containsString:@"scape"] && ![sels containsObject:nm]) [sels addObject:nm];
             }
             free(ms);
         }
@@ -354,6 +355,43 @@ BOOL axPerformEscape(NSString **how) {
         if (how && !(*how).length) *how = [NSString stringWithFormat:@"找到方法 %@ 但对象不支持", [sels componentsJoinedByString:@","]];
     } @catch (NSException *e) { if (how) *how = [@"无障碍退出异常:" stringByAppendingString:e.reason ?: @""]; }
     return NO;
+}
+
+// v0.9.51:找真正能执行“退出”的接口用。列出无障碍类里和动作有关的方法名,并查前台 App/屏幕中间元素的 canPerformEscape
+NSString *axEscapeDiag(void) {
+    NSMutableArray *out = [NSMutableArray array];
+    @try {
+        axInitOnce();
+        for (NSString *cn in @[@"AXElement", @"AXUIElement"]) {
+            Class c = NSClassFromString(cn);
+            if (!c) { [out addObject:[cn stringByAppendingString:@":无"]]; continue; }
+            NSMutableArray *ms = [NSMutableArray array];
+            for (int meta = 0; meta < 2; meta++) {
+                unsigned n = 0; Method *ml = class_copyMethodList(meta ? object_getClass(c) : c, &n);
+                for (unsigned i = 0; i < n; i++) {
+                    NSString *nm = NSStringFromSelector(method_getName(ml[i]));
+                    NSString *lo = nm.lowercaseString;
+                    if ([lo containsString:@"perform"] || [lo containsString:@"action"] || [lo containsString:@"scape"] || [lo containsString:@"press"])
+                        [ms addObject:meta ? [@"+" stringByAppendingString:nm] : nm];
+                }
+                free(ml);
+            }
+            [out addObject:[NSString stringWithFormat:@"%@(%lu):%@", cn, (unsigned long)ms.count, [ms componentsJoinedByString:@" "]]];
+        }
+        CGSize sz = UIScreen.mainScreen.bounds.size;
+        Class cE = NSClassFromString(@"AXElement");
+        id front = nil; SEL sa = NSSelectorFromString(@"applicationAtCoordinate:");
+        if ([cE respondsToSelector:sa]) front = ((id (*)(id, SEL, CGPoint))objc_msgSend)(cE, sa, CGPointMake(sz.width / 2, sz.height / 2));
+        id mid = axHitAt(CGPointMake(sz.width / 2, sz.height * 0.45));
+        SEL cp = NSSelectorFromString(@"canPerformEscape");
+        for (NSArray *tg in @[@[@"前台App", front ?: NSNull.null], @[@"屏幕中间元素", mid ?: NSNull.null]]) {
+            id el = tg[1];
+            if (el == NSNull.null) { [out addObject:[tg[0] stringByAppendingString:@":拿不到"]]; continue; }
+            NSString *v = [el respondsToSelector:cp] ? (((BOOL (*)(id, SEL))objc_msgSend)(el, cp) ? @"YES" : @"NO") : @"不支持";
+            [out addObject:[NSString stringWithFormat:@"%@ 类=%@ canPerformEscape=%@", tg[0], NSStringFromClass([el class]), v]];
+        }
+    } @catch (NSException *e) { [out addObject:[@"异常:" stringByAppendingString:e.reason ?: @""]]; }
+    return [out componentsJoinedByString:@"\n"];
 }
 
 NSArray *axReadScreen(NSString *frontBid, int *msOut, NSString **howOut) {
