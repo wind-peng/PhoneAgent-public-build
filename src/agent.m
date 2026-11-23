@@ -442,39 +442,23 @@ static NSString *agGoBack(NSArray *items, BOOL *okOut) {
     CGSize sc = screenSize();
     CFAbsoluteTime t0 = 0; NSData *th0 = frameThumb(currentFrame(&t0));
     // v0.9.48:真机实验 5 种模拟侧滑都不触发系统的边缘返回,不再侧滑
-    // v0.9.49:顺序 = 左上角写着“返回/关闭”的按钮 → 无障碍“退出”动作 → 左上角无文字的箭头按钮
+    // v0.9.53:顺序 = 左上角写着“返回/关闭”的按钮 → 左上角无文字的箭头按钮(无障碍“退出”真机实测无效,已去掉)
     NSDictionary *hit = nil;
     for (NSDictionary *it in items) {
         double x = [it[@"x"] doubleValue], y = [it[@"y"] doubleValue];
         if (y < sc.height * 0.14 && x < sc.width * 0.3 && agIsBackText([it[@"text"] description])) { hit = it; break; }
     }
-    NSDictionary *axBtn = hit ? nil : axTopLeftButton();
-    BOOL axUnlabeled = axBtn && [[axBtn[@"text"] description] isEqualToString:@"(无文字按钮)"];
-    if (!hit && axBtn && !axUnlabeled) hit = axBtn;
-    NSString *escNote = @"";
-    if (!hit) {
-        NSString *how = nil;
-        if (axPerformEscape(&how)) {
-            waitScreenSettle(0.4, 2.0);
-            if (agScreenChanged(th0, t0)) {
-                if (okOut) *okOut = YES;
-                return [NSString stringWithFormat:@"用无障碍“退出”动作返回,屏幕已变化(%@)", how];
-            }
-            escNote = [NSString stringWithFormat:@"无障碍“退出”已发出但屏幕没变化(%@);", how];
-            t0 = 0; th0 = frameThumb(currentFrame(&t0));
-        } else escNote = [NSString stringWithFormat:@"无障碍“退出”不可用(%@);", how ?: @""];
-        if (axUnlabeled) hit = axBtn;
-    }
+    if (!hit) hit = axTopLeftButton();
     if (hit) {
         NSString *t = [hit[@"text"] description];
         doTap([hit[@"x"] doubleValue], [hit[@"y"] doubleValue]);
         waitScreenSettle(0.4, 2.0);
         BOOL ch = agScreenChanged(th0, t0);
         if (okOut) *okOut = ch;
-        return ch ? [NSString stringWithFormat:@"%@点了左上角的“%@”,屏幕已变化", escNote, t]
-                  : [NSString stringWithFormat:@"%@点了左上角的“%@”,屏幕没变化", escNote, t];
+        return ch ? [NSString stringWithFormat:@"点了左上角的“%@”,屏幕已变化", t]
+                  : [NSString stringWithFormat:@"点了左上角的“%@”,屏幕没变化", t];
     }
-    return [escNote stringByAppendingString:@"左上角没找到“返回”按钮。这一页可能不支持返回:请点左上角的返回箭头图标(给 x,y)、右上角的关闭/×,或用 home、open_app 换路"];
+    return @"左上角没找到“返回”按钮。这一页可能不支持返回:请点左上角的返回箭头图标(给 x,y)、右上角的关闭/×,或用 home、open_app 换路";
 }
 
 // ---- v0.9.44:关闭 App。先直接结束它的进程(巨魔安装、无沙盒才可能做到),不行再用多任务界面上划 ----

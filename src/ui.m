@@ -597,14 +597,10 @@ static NSData *attachJPEG(UIImage *img) {
     [axT setTitle:@"无障碍探测(点后 6 秒内切到微信/淘宝/美团等,停 10 秒再回来看执行记录)" forState:UIControlStateNormal];
     axT.titleLabel.numberOfLines = 0;
     [axT addTarget:self action:@selector(onAXProbe) forControlEvents:UIControlEventTouchUpInside];
-    UIButton *escT = [UIButton buttonWithType:UIButtonTypeSystem]; // v0.9.50
-    [escT setTitle:@"无障碍“退出”测试(先开屏幕录制;点后 6 秒内切到一个能返回的页面,别碰屏幕,等约 10 秒回来看执行记录)" forState:UIControlStateNormal];
-    escT.titleLabel.numberOfLines = 0;
-    [escT addTarget:self action:@selector(onEscTest) forControlEvents:UIControlEventTouchUpInside];
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
         [self hdr:@"Token 统计(每次任务结束也会在执行记录里显示本次用量)"],
         self.tokL, tokClr, cacheT,
-        [self hdr:@"实验"], axT, escT,
+        [self hdr:@"实验"], axT,
         [self sw:@"每次调用模型都在执行记录里写一行 Token 明细(第几步、几张图、输入/缓存/输出)" key:@"token_step_log" def:YES],
         [self hdr:@"模型请求"],
         [self sw:@"用函数调用(tools)输出动作(GLM/DeepSeek;不支持时自动退回 JSON)" key:@"use_tool_calls" def:YES],
@@ -680,27 +676,6 @@ static NSData *attachJPEG(UIImage *img) {
 - (void)onAXProbe {
     axProbeAfterDelay();
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"无障碍探测" message:@"6 秒后开始。现在切到要测的 App(比如微信聊天页、淘宝首页),停 10 秒左右再回来,结果写在执行记录里。不会点击任何东西。" preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:a animated:YES completion:nil];
-}
-- (void)onEscTest { // v0.9.50:只发无障碍“退出”,不点任何东西,前后对比画面
-    if (gAgentRunning) return;
-    agentSay(@"[退出测试] 6 秒后开始,请切到一个能返回的页面");
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        sleep(6);
-        // v0.9.52:查支持的动作号 + 试 pressTVBackButton / pressTVMenuButton
-        __block CFAbsoluteTime t0 = 0; __block NSData *th0 = frameThumb(currentFrame(&t0));
-        BOOL (^changed)(void) = ^BOOL{
-            CFAbsoluteTime t1 = 0; NSData *f1 = currentFrame(&t1);
-            if (!th0 || !f1) return NO;
-            BOOL ch = (t1 != t0) && thumbChangedCells(th0, frameThumb(f1)) > 1;
-            if (!ch) { t0 = t1; th0 = frameThumb(f1); }
-            return ch;
-        };
-        NSString *r = axEscapeExperiment(changed);
-        agentSay([NSString stringWithFormat:@"[退出测试]%@\n%@", th0 ? @"" : @"(没开屏幕录制,判断不了变化,请看手机)", r]);
-    });
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"无障碍“退出”测试" message:@"6 秒后开始。现在切到一个能返回的页面(比如设置里的子页面、微信朋友圈),别碰屏幕,等约 10 秒再回来看执行记录。" preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
 }
