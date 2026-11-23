@@ -441,20 +441,26 @@ static NSString *agGoBack(NSArray *items, BOOL *okOut) {
     if ([frontmostBundleID() isEqualToString:@"com.apple.springboard"]) return @"现在在主屏幕,没有可返回的页面";
     CGSize sc = screenSize();
     CFAbsoluteTime t0 = 0; NSData *th0 = frameThumb(currentFrame(&t0));
-    doEdgeBackSwipe();
-    waitScreenSettle(0.4, 2.0);
-    if (agScreenChanged(th0, t0)) { if (okOut) *okOut = YES; return @"从屏幕左边缘右滑返回,屏幕已变化"; }
+    // v0.9.45:两种侧滑各试一次,再找左上角返回按钮(先看已读到的文字,再按坐标问无障碍,无文字的箭头也能找到)
+    for (int v = 0; v < 2; v++) {
+        doEdgeBackSwipe(v);
+        waitScreenSettle(0.4, 2.0);
+        if (agScreenChanged(th0, t0)) { if (okOut) *okOut = YES; return [NSString stringWithFormat:@"从屏幕左边缘右滑返回(方式%d),屏幕已变化", v + 1]; }
+    }
+    NSDictionary *hit = nil;
     for (NSDictionary *it in items) {
-        NSString *t = [it[@"text"] description];
         double x = [it[@"x"] doubleValue], y = [it[@"y"] doubleValue];
-        if (y < sc.height * 0.14 && x < sc.width * 0.3 && agIsBackText(t)) {
-            doTap(x, y);
-            waitScreenSettle(0.4, 2.0);
-            BOOL ch = agScreenChanged(th0, t0);
-            if (okOut) *okOut = ch;
-            return ch ? [NSString stringWithFormat:@"侧滑没反应,点了左上角的“%@”,屏幕已变化", t]
-                      : [NSString stringWithFormat:@"侧滑和点左上角的“%@”都没让屏幕变化", t];
-        }
+        if (y < sc.height * 0.14 && x < sc.width * 0.3 && agIsBackText([it[@"text"] description])) { hit = it; break; }
+    }
+    if (!hit) hit = axTopLeftButton();
+    if (hit) {
+        NSString *t = [hit[@"text"] description];
+        doTap([hit[@"x"] doubleValue], [hit[@"y"] doubleValue]);
+        waitScreenSettle(0.4, 2.0);
+        BOOL ch = agScreenChanged(th0, t0);
+        if (okOut) *okOut = ch;
+        return ch ? [NSString stringWithFormat:@"侧滑没反应,点了左上角的“%@”,屏幕已变化", t]
+                  : [NSString stringWithFormat:@"侧滑和点左上角的“%@”都没让屏幕变化", t];
     }
     return @"侧滑返回没反应,左上角也没找到“返回”按钮。这一页可能不支持返回:请点左上角的返回箭头图标(给 x,y)、右上角的关闭/×,或用 home、open_app 换路";
 }

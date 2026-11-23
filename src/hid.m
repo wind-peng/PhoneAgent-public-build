@@ -94,10 +94,27 @@ void doSwipeSmooth(double x1, double y1, double x2, double y2, int ms, int holdM
     swipeSmoothRaw(x1, y1, x2, y2, ms, holdMs);
 }
 
-// v0.9.44:iOS 侧滑返回:从屏幕最左边缘(不加校准偏移,偏移会把起点挪出边缘区)向右滑到 3/4 处
-void doEdgeBackSwipe(void) {
+// v0.9.45:iOS 侧滑返回。v0.9.44 的版本(x=0.5pt、缓入缓出)在微信聊天页完全没触发。
+// 改为:带触点半径、起点按下后立刻匀速向右移动(边缘手势要求一开始就往里走),按 variant 换起点/速度
+// variant 0:起点 2pt、220ms;1:起点 8pt、380ms 并在终点稍停
+void doEdgeBackSwipe(int variant) {
     CGSize s = screenSize();
-    swipeSmoothRaw(0.5, s.height * 0.5, s.width * 0.78, s.height * 0.5, 260, 0);
+    double x1 = variant == 0 ? 2.0 : 8.0, y = s.height * 0.45, x2 = s.width * 0.82;
+    int ms = variant == 0 ? 220 : 380, hold = variant == 0 ? 0 : 80;
+    int saved = gSwipeMode; if (gSwipeMode < 1) gSwipeMode = 1; // 触点半径
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+    uint64_t per = (uint64_t)(8.333e6 * tb.denom / tb.numer); // 120Hz,起步阶段位移更细
+    int steps = MAX(8, (int)lround(ms / 8.333));
+    sendFinger(x1 / s.width, y / s.height, 0);
+    uint64_t t = mach_absolute_time();
+    for (int i = 1; i <= steps; i++) {
+        double k = (double)i / steps;
+        sendFinger((x1 + (x2 - x1) * k) / s.width, y / s.height, 1);
+        t += per; mach_wait_until(t);
+    }
+    for (int i = 0; i < hold / 8; i++) { sendFinger(x2 / s.width, y / s.height, 1); t += per; mach_wait_until(t); }
+    sendFinger(x2 / s.width, y / s.height, 2);
+    gSwipeMode = saved;
 }
 
 static void swipeSmoothRaw(double x1, double y1, double x2, double y2, int ms, int holdMs) {

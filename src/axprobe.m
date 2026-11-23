@@ -275,6 +275,33 @@ static NSString *axTidy(NSString *t) {
     if (y.location != NSNotFound) return [[t substringToIndex:MIN((NSUInteger)56, t.length)] stringByAppendingString:@"…"];
     return [NSString stringWithFormat:@"%@…%@", [t substringToIndex:24], [t substringFromIndex:t.length - 26]]; // 没有¥时保留头尾(价格、销量多在末尾)
 }
+// v0.9.45:找左上角导航栏里的按钮。微信等的返回箭头没有文字,axReadScreen 会把它丢掉;这里按坐标直接问无障碍
+NSDictionary *axTopLeftButton(void) {
+    @try {
+        axInitOnce();
+        CGSize sz = UIScreen.mainScreen.bounds.size;
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        for (CGFloat y = 50; y <= 112; y += 10)
+            for (CGFloat x = 14; x <= 62; x += 16) {
+                if (CFAbsoluteTimeGetCurrent() - t0 > 0.8) return nil;
+                id el = axHitAt(CGPointMake(x, y));
+                if (!el) continue;
+                id fv = axKV(el, @"frame");
+                if (![fv isKindOfClass:NSValue.class] || strcmp([(NSValue *)fv objCType], @encode(CGRect)) != 0) continue;
+                CGRect r = [(NSValue *)fv CGRectValue];
+                if (r.size.width < 8 || r.size.height < 8 || r.size.width > sz.width * 0.4 || r.size.height > 80) continue;
+                if (CGRectGetMidX(r) > sz.width * 0.3 || CGRectGetMidY(r) > sz.height * 0.15 || CGRectGetMidY(r) < 40) continue;
+                NSString *l = axKV(el, @"label"); if (![l isKindOfClass:NSString.class]) l = @"";
+                unsigned long long t = [axKV(el, @"traits") unsignedLongLongValue];
+                BOOL btn = (t & 0x1ULL) != 0;
+                BOOL backWord = [l containsString:@"返回"] || [l.lowercaseString containsString:@"back"];
+                if (!btn && !backWord) continue;
+                return @{@"x": @(CGRectGetMidX(r)), @"y": @(CGRectGetMidY(r)), @"text": l.length ? l : @"(无文字按钮)"};
+            }
+    } @catch (NSException *e) {}
+    return nil;
+}
+
 NSArray *axReadScreen(NSString *frontBid, int *msOut, NSString **howOut) {
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
     if (msOut) *msOut = 0;
