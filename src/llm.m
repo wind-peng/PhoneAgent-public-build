@@ -91,18 +91,37 @@ static BOOL quoteEndsString(NSString *s, NSUInteger i) {
     return YES;
 }
 
+// 本次修改:英文引号开头的字符串里遇到中文右引号时,只有后面紧跟 } / ],
+// 或者“逗号 + 英文引号”(也就是下一个字段名)才当作字符串结尾;
+// 这样 "按钮“取消”，“确定”" 这类正常的中文写法不会再被提前截断。
+static BOOL cnQuoteEndsAsciiString(NSString *s, NSUInteger i) {
+    NSUInteger j = i + 1;
+    while (j < s.length) { unichar c = [s characterAtIndex:j]; if (c == ' ' || c == '\n' || c == '\r' || c == '\t') j++; else break; }
+    if (j >= s.length) return YES;
+    unichar c = [s characterAtIndex:j];
+    if (c == '}' || c == ']') return YES;
+    if (c != ',' && c != 0xFF0C) return NO;
+    j++;
+    while (j < s.length) { unichar d = [s characterAtIndex:j]; if (d == ' ' || d == '\n' || d == '\r' || d == '\t') j++; else break; }
+    return j >= s.length || [s characterAtIndex:j] == '"';
+}
+
 // 宽松修复:只替换字符串外面的中文标点;字符串里的中文引号原样保留,裸英文引号转义;
 // 输出被截断时补上引号和括号。truncated 返回是否做了截断补全。
 static NSString *repairJSON(NSString *s, BOOL *truncated) {
     NSMutableString *o = [NSMutableString string];
     NSMutableArray *stack = [NSMutableArray array];
     BOOL inStr = NO;
+    unichar openQ = 0; // 当前字符串是用哪种引号开头的
     for (NSUInteger i = 0; i < s.length; i++) {
         unichar c = [s characterAtIndex:i];
         if (inStr) {
             if (c == '\\' && i + 1 < s.length) { [o appendFormat:@"%C%C", c, [s characterAtIndex:i + 1]]; i++; continue; }
             if (c == '"' || c == 0x201C || c == 0x201D) {
-                if (quoteEndsString(s, i)) { [o appendString:@"\""]; inStr = NO; }
+                BOOL ends;
+                if (openQ == '"' && c != '"') ends = (c == 0x201D) && cnQuoteEndsAsciiString(s, i); // 英文开头:中文引号多半是内容
+                else ends = quoteEndsString(s, i);
+                if (ends) { [o appendString:@"\""]; inStr = NO; }
                 else if (c == '"') [o appendString:@"\\\""];
                 else [o appendFormat:@"%C", c];
                 continue;
@@ -112,7 +131,7 @@ static NSString *repairJSON(NSString *s, BOOL *truncated) {
             [o appendFormat:@"%C", c];
             continue;
         }
-        if (c == '"' || c == 0x201C || c == 0x201D) { [o appendString:@"\""]; inStr = YES; continue; }
+        if (c == '"' || c == 0x201C || c == 0x201D) { [o appendString:@"\""]; inStr = YES; openQ = c; continue; }
         if (c == 0xFF1A) c = ':';
         if (c == 0xFF0C) c = ',';
         if (c == '{' || c == '[') [stack addObject:@(c)];

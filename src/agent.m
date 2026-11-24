@@ -372,11 +372,83 @@ static NSDictionary *agFindOnScreen(NSArray *words, NSArray *excludes, NSString 
     return nil;
 }
 
+// ---- 粘贴校验(本次修改):只看输入框附近的文字 ----
+// 原来用整帧 JPEG 的哈希判断"画面变没变",光标闪烁、时间跳分钟都会让它变,几乎总是判定成功。
+// 现在改成:截图 OCR,只取点击点上方 70pt 到下方 40pt 这一横条里的文字(输入框和里面的字),
+// 去掉空白和容易被识别成光标的竖线类字符后,比较粘贴前后有没有变化。
+
+// 去掉空白,以及 OCR 可能把光标认成的字符(| 丨 I l),只用于前后对比
+static NSString *agPasteNorm(NSString *s) {
+    NSMutableString *o = [NSMutableString string];
+    NSCharacterSet *ws = NSCharacterSet.whitespaceAndNewlineCharacterSet;
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if ([ws characterIsMember:c]) continue;
+        if (c == '|' || c == 0x4E28 /* 丨 */ || c == 'I' || c == 'l') continue;
+        [o appendFormat:@"%C", c];
+    }
+    return o;
+}
+
+// needle 在 hay 里出现的次数
+static NSUInteger agCountOf(NSString *hay, NSString *needle) {
+    if (!hay.length || !needle.length) return 0;
+    NSUInteger n = 0, from = 0;
+    while (from < hay.length) {
+        NSRange f = [hay rangeOfString:needle options:0 range:NSMakeRange(from, hay.length - from)];
+        if (f.location == NSNotFound) break;
+        n++; from = f.location + f.length;
+    }
+    return n;
+}
+
+// 截一次图做 OCR:band = 输入框那一横条的文字,all = 全屏文字(不含状态栏),都按阅读顺序排好并归一化。
+// 截图或 OCR 失败返回 NO(这时不能拿来下结论)。
+static BOOL agPasteSnapshot(double y, NSString **band, NSString **all) {
+    *band = @""; *all = @"";
+    waitForStableFrame(2.0);
+    NSString *e = nil;
+    UIImage *img = takeScreenshot(&e);
+    if (!img) return NO;
+    NSArray *items = ocrImage(img, &e);
+    if (!items) return NO;
+    NSArray *sorted = [items sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        int ya = [a[@"y"] intValue] / 12, yb = [b[@"y"] intValue] / 12;
+        if (ya != yb) return ya < yb ? NSOrderedAscending : NSOrderedDescending;
+        double xa = [a[@"x"] doubleValue], xb = [b[@"x"] doubleValue];
+        return xa < xb ? NSOrderedAscending : (xa > xb ? NSOrderedDescending : NSOrderedSame);
+    }];
+    NSMutableString *b = [NSMutableString string], *a = [NSMutableString string];
+    for (NSDictionary *it in sorted) {
+        NSString *t = [it[@"text"] description] ?: @"";
+        double iy = [it[@"y"] doubleValue];
+        if (iy < 45) continue; // 状态栏(时间、电量)
+        [a appendFormat:@"%@\n", t];
+        if (iy >= y - 70 && iy <= y + 40) [b appendFormat:@"%@\n", t];
+    }
+    *band = agPasteNorm(b); *all = agPasteNorm(a);
+    return YES;
+}
+
+// 根据粘贴前后两次快照判断有没有粘上:
+//  ① 输入框那一横条的文字变了(包括密码框的圆点变多);
+//  ② 要输入的文字(开头 6 个字或结尾 6 个字)在全屏出现的次数变多了(输入框位置变了也能认出来)。
+static BOOL agPasteChanged(NSString *text, NSString *band0, NSString *all0, NSString *band1, NSString *all1) {
+    if (![band0 isEqualToString:band1]) return YES;
+    NSString *flat = agPasteNorm(text);
+    if (!flat.length) return YES;
+    NSString *head = flat.length > 6 ? [flat substringToIndex:6] : flat;
+    NSString *tail = flat.length > 6 ? [flat substringFromIndex:flat.length - 6] : flat;
+    if (agCountOf(all1, head) > agCountOf(all0, head)) return YES;
+    if (agCountOf(all1, tail) > agCountOf(all0, tail)) return YES; // 长文字在单行框里只露出结尾
+    return NO;
+}
+
 // 在 (x,y) 的输入框里输入文字:写剪贴板(必须在前台) -> 回到原 App -> 点输入框聚焦
 // 方法一:硬件键盘快捷键 Cmd+A(替换旧内容)+ Cmd+V,并自动点掉 iOS 的“允许粘贴”确认框。
-//   判断有没有生效:出现过“允许粘贴”框 / Cmd+V 前后画面变了 / OCR 在屏幕上看到了粘贴的文字,任一成立就算成功。
-// 方法二(方法一看不出效果时):长按输入框 -> (有“全选”就先全选) -> 点“粘贴” -> 点“允许粘贴”。
-// 两种都无法确认时也返回 YES,但 note 里写明“没能确认”,让模型看下一张截图自己判断(输入其实经常是成功的)。
+//   判断有没有生效:出现过“允许粘贴”框,或输入框附近的文字前后有变化,任一成立就算成功。
+// 方法二(方法一确认没有效果时):长按输入框 -> (有“全选”就先全选) -> 点“粘贴” -> 点“允许粘贴”。
+// 截图/OCR 不可用、没法核对时不走方法二(避免已经粘上的文字再粘一遍),返回 YES 并在 note 里写明“没能确认”。
 static BOOL agPasteText(NSString *text, double x, double y, NSString *backHint, NSString **note) {
     NSString *n = nil; BOOL stranded = NO;
     *note = nil;
@@ -389,27 +461,21 @@ static BOOL agPasteText(NSString *text, double x, double y, NSString *backHint, 
 
     BOOL sent = doCmdKey(0x04);                 // Cmd+A:选中旧内容(没有旧内容就什么也不发生)
     usleep(500 * 1000);
-    waitForStableFrame(2.0);
-    NSData *f1 = agLatestJPEG(&e);
-    NSString *sig1 = f1 ? agFrameSig(f1) : @"";
+    NSString *band0 = nil, *all0 = nil;
+    BOOL snap0 = agPasteSnapshot(y, &band0, &all0); // 粘贴前:输入框附近有什么字
     sent = doCmdKey(0x19) && sent;              // Cmd+V
     usleep(900 * 1000);
     NSDictionary *allow1 = agFindOnScreen(@[@"允许粘贴"], @[@"不允许"], &e);
     if (allow1) { doTap([allow1[@"x"] doubleValue], [allow1[@"y"] doubleValue]); usleep(900 * 1000); }
-    waitForStableFrame(2.0);
-    NSData *f2 = agLatestJPEG(&e);
-    NSString *sig2 = f2 ? agFrameSig(f2) : @"";
     if (sent) {
-        if (allow1) return YES;
-        if (sig1.length && sig2.length && ![sig1 isEqualToString:sig2]) return YES;
-        NSString *flat = [[text componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] componentsJoinedByString:@""];
-        NSString *snip = flat.length > 6 ? [flat substringToIndex:6] : flat;
-        if (!snip.length) return YES;
-        UIImage *img = takeScreenshot(&e);
-        NSArray *items = img ? ocrImage(img, &e) : nil;
-        for (NSDictionary *it in items) if ([it[@"text"] containsString:snip]) return YES;
+        if (allow1) return YES;                 // 系统弹了“允许粘贴”,说明粘贴确实触发了
+        NSString *band1 = nil, *all1 = nil;
+        BOOL snap1 = agPasteSnapshot(y, &band1, &all1);
+        if (!snap0 || !snap1) { *note = @"没能确认文字是否输入成功(截图或文字识别不可用)"; return YES; }
+        if (agPasteChanged(text, band0, all0, band1, all1)) return YES;
     }
 
+    // 方法二:长按菜单粘贴
     doLongPress(x, y, 1100);
     NSDictionary *all = agFindOnScreen(@[@"全选"], @[], &e);
     if (all) { doTap([all[@"x"] doubleValue], [all[@"y"] doubleValue]); usleep(800 * 1000); }
@@ -418,7 +484,12 @@ static BOOL agPasteText(NSString *text, double x, double y, NSString *backHint, 
     doTap([paste[@"x"] doubleValue], [paste[@"y"] doubleValue]);
     usleep(900 * 1000);
     NSDictionary *allow = agFindOnScreen(@[@"允许粘贴"], @[@"不允许"], &e);
-    if (allow) { doTap([allow[@"x"] doubleValue], [allow[@"y"] doubleValue]); usleep(900 * 1000); }
+    if (allow) { doTap([allow[@"x"] doubleValue], [allow[@"y"] doubleValue]); usleep(900 * 1000); return YES; }
+    if (snap0) { // 再核对一次,没变化就如实告诉模型
+        NSString *band2 = nil, *all2 = nil;
+        if (agPasteSnapshot(y, &band2, &all2) && !agPasteChanged(text, band0, all0, band2, all2))
+            *note = @"已用长按菜单粘贴,但输入框附近的文字没有变化,可能没输入进去";
+    }
     return YES;
 }
 
