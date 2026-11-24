@@ -1355,23 +1355,18 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     NSString *lastActKey = @""; int repeatCnt = 0; // 连续重复同一动作的检测
     NSString *lastRepScreen = @""; // v0.9.41:滑动时屏幕变了就不算重复
     BOOL failedLast = NO;                  // 上一步执行失败(输入失败、坐标无效、点击没反应等)
-    NSMutableArray *plan = [NSMutableArray array], *planDone = [NSMutableArray array]; // 12:子目标
-    BOOL needImage = YES, lastUsedXY = NO, doneChecked = NO, doneCheckPending = NO, settled = NO;
+    BOOL needImage = YES, lastUsedXY = NO, settled = NO;
     NSString *lastAction = @"";
     NSString *pendingSwipeSig = nil;       // 5:上一步滑动前的屏幕签名,下一步对比确认有没有滚动
     NSMutableArray *queue = [NSMutableArray array]; NSArray *queueItems = nil; NSData *queueThumb = nil; // S7:预定的后续动作
-    int loadWaits = 0; // v0.9.38:只有“加载中”的屏幕本地等
-    int lastAdN = -1, lastAdRep = 0; 
-    int adWaits = 0, popupTaps = 0, relaunches = 0, castLost = 0, selfBlocks = 0; // selfBlocks:v0.9.17 拦截点 PhoneAgent 自己界面的次数
+    int popupTaps = 0, castLost = 0, selfBlocks = 0; // selfBlocks:v0.9.17 拦截点 PhoneAgent 自己界面的次数
     NSString *lastPopupKey = nil;
     NSString *taskApp = nil; BOOL expectHome = NO;
     UIImage *prevImg = nil;
     NSMutableArray *findings = [NSMutableArray array];   // v0.9.21:模型用 found 记下的结果("[平台] 内容")
-    NSMutableOrderedSet *visitedShops = [NSMutableOrderedSet orderedSet]; // 比价任务里进过的购物平台
     NSString *curShop = nil;
     BOOL confirmPendingImg = NO; // v0.9.32:确认后的核对:无障碍元素够用就不发截图
     int confirmStep = 0; NSString *confirmTgt = nil, *confirmSig = nil; double confirmX = -1, confirmY = -1; // v0.9.26:刚确认过的敏感点击
-    int shopSinceStep = 0, lastNewFindStep = 0;
     BOOL glmModel = [model.lowercaseString hasPrefix:@"glm"];
     CGSize sc = screenSize();
     int startStep = 1;
@@ -1380,8 +1375,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
     if (cp && [cp[@"task"] isEqualToString:task]) { // 11:从断点继续
         for (id h in cp[@"history"]) if ([h isKindOfClass:NSString.class]) { [history addObject:h]; [histProg addObject:@""]; }
         progress = [cp[@"progress"] isKindOfClass:NSString.class] ? cp[@"progress"] : @"";
-        for (id p in cp[@"plan"]) if ([p isKindOfClass:NSString.class]) [plan addObject:p];
-        for (NSUInteger i = 0; i < plan.count; i++) [planDone addObject:@([cp[@"planDone"] isKindOfClass:NSArray.class] && i < [cp[@"planDone"] count] ? [cp[@"planDone"][i] boolValue] : NO)];
         startStep = MAX(1, [cp[@"step"] intValue] + 1);
         taskApp = [cp[@"app"] isKindOfClass:NSString.class] && [cp[@"app"] length] ? cp[@"app"] : nil;
         for (id f in cp[@"findings"]) if ([f isKindOfClass:NSString.class]) [findings addObject:f];
@@ -1510,7 +1503,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
         }
         {   // v0.9.21:记下当前所在的购物平台
             NSString *sp = (front.length && ![front isEqualToString:selfID] && ![front isEqualToString:@"com.apple.springboard"]) ? (shopPlatformOf(agAppName(front)) ?: shopPlatformOf(front)) : nil;
-            if (sp) { if (![sp isEqualToString:curShop]) shopSinceStep = step; curShop = sp; [visitedShops addObject:sp]; }
+            if (sp) curShop = sp;
         }
         if ([screen isEqualToString:lastSig]) same++; else same = 0;
         lastSig = [screen copy];
@@ -1553,11 +1546,11 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             }
             if (!pt) { popupTaps = 0; lastPopupKey = nil; }
         }
-        // 上一步失败或屏幕没变化:这一步想得更深;第 1 步(规划)/完成自检至少 high;常规步骤用低思考
+        // 上一步失败或屏幕没变化:这一步想得更深(DeepSeek 升到 v4-pro);其余步骤一律用低思考
         gEscalate = (step > startStep && same >= 1) || failedLast;
-        BOOL planning = (step == startStep);
-        gEffortHigh = planning || doneCheckPending;
-        gEffortLow = !gEscalate && !gEffortHigh && step > startStep;
+        BOOL planning = (step == startStep); // 第 1 步:一定附截图
+        gEffortHigh = NO;
+        gEffortLow = !gEscalate;
         BOOL wasFailed = failedLast;
         failedLast = NO;
 
@@ -1596,16 +1589,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             NSMutableString *hist = [NSMutableString string];
             if (progress.length) [hist appendFormat:@"当前进度:%@\n", progress]; // 进度放在 8 条历史窗口之外,始终带上
             if (findings.count) [hist appendFormat:@"已记录的结果(程序保存,写 done 时据此汇总):\n%@\n", [findings componentsJoinedByString:@"\n"]];
-            if (plan.count) {
-                [hist appendString:@"子目标:\n"];
-                BOOL marked = NO;
-                for (NSUInteger i = 0; i < plan.count; i++) {
-                    BOOL d = [planDone[i] boolValue];
-                    NSString *mk = d ? @"[✓]" : (!marked ? @"[→ 当前]" : @"[ ]");
-                    if (!d) marked = YES;
-                    [hist appendFormat:@"%lu. %@ %@\n", (unsigned long)i + 1, mk, plan[i]];
-                }
-            }
             if (onSelf) [hist appendString:@"(系统提示:当前屏幕是 PhoneAgent 自己的界面,也就是正在控制手机执行你这个任务的程序。任务已经在运行。)\n"];
             if (same >= 2) [hist appendString:@"(系统提示:最近几步操作后屏幕都没有变化。)\n"];
             NSUInteger from = history.count > 8 ? history.count - 8 : 0;
@@ -1644,7 +1627,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
             NSString *bad = validateAct(act, allItems.count);
             if (bad) {
                 agentSay([NSString stringWithFormat:@"提示:模型给的动作参数无效(%@),重新询问一次", bad]);
-                { NSMutableDictionary *lg = [act mutableCopy]; [lg removeObjectsForKeys:@[@"thought", @"found", @"plan"]]; // v0.9.33:记下模型到底给了什么
+                { NSMutableDictionary *lg = [act mutableCopy]; [lg removeObjectsForKeys:@[@"thought", @"found"]]; // v0.9.33:记下模型到底给了什么
                   NSData *jd = [NSJSONSerialization dataWithJSONObject:lg options:0 error:nil];
                   NSString *js = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : [lg description];
                   agentSay([@"无效动作内容:" stringByAppendingString:js.length > 150 ? [js substringToIndex:150] : js]); }
@@ -1688,21 +1671,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                     if (findingDup(findings, line)) continue; // v0.9.26:同平台同价格、名字互相包含的视为重复
                     [findings addObject:line]; added++;
                 }
-                if (added) lastNewFindStep = step;
                 if (added) agentSay([NSString stringWithFormat:@"记下 %d 条结果(共 %lu 条)", added, (unsigned long)findings.count]);
-            }
-            // 12:子目标
-            id pl = act[@"plan"];
-            if ([pl isKindOfClass:NSArray.class] && [pl count] && (!plan.count || planning)) {
-                [plan removeAllObjects]; [planDone removeAllObjects];
-                for (id p in pl) {
-                    if (![p isKindOfClass:NSString.class] || ![p length]) continue;
-                    if ([p containsString:@"开始任务"]) continue; // v0.9.17:任务已经在运行,这一条子目标不要
-                    [plan addObject:[p length] > 30 ? [p substringToIndex:30] : p];
-                    [planDone addObject:@NO];
-                    if (plan.count >= 6) break;
-                }
-                if (plan.count) agentSay([NSString stringWithFormat:@"子目标:%@", [plan componentsJoinedByString:@" → "]]);
             }
             // S7:多动作:剩下的排队
             [queue removeAllObjects];
@@ -1712,14 +1681,6 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                     for (id m in act[@"_more"]) if ([m isKindOfClass:NSDictionary.class] && !validateAct(m, allItems.count)) [queue addObject:m];
                     queueItems = allItems; queueThumb = thumbNow;
                 }
-            }
-        }
-        doneCheckPending = NO;
-        {
-            id sg = act[@"subgoal_done"];
-            if ([sg respondsToSelector:@selector(integerValue)]) {
-                NSInteger k = [sg integerValue];
-                if (k >= 1 && k <= (NSInteger)planDone.count) planDone[k - 1] = @YES;
             }
         }
 
@@ -1997,7 +1958,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
                             progress.length ? [NSString stringWithFormat:@"(进度:%@)", progress] : @"", [tail componentsJoinedByString:@" / "]];
             NSUInteger h0 = history.count > 30 ? history.count - 30 : 0;
             cpSave(@{@"task": task ?: @"", @"display": gTaskDisplay ?: @"", @"step": @(step), @"progress": progress ?: @"",
-                     @"history": [history subarrayWithRange:NSMakeRange(h0, history.count - h0)], @"plan": [plan copy], @"planDone": [planDone copy],
+                     @"history": [history subarrayWithRange:NSMakeRange(h0, history.count - h0)],
                      @"app": taskApp ?: @"", @"model": model ?: @"", @"findings": [findings copy]});
         }
     }
