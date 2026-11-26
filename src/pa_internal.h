@@ -146,6 +146,13 @@ NSString *hudStart(NSString *bid);
 NSString *hudStop(void);
 NSString *hudReadLog(void);
 NSString *hudKey(void);
+// v0.9.73 悬浮层模式:PhoneAgent ↔ 悬浮层进程
+BOOL hudGeo(double *ox, double *oy, double *k);
+void hudWriteGeo(double ox, double oy, double k);
+BOOL hudRemoteOpen(NSString *bid, NSString **note);
+void hudRemoteClose(void);
+UIImage *hudRemoteSnapshot(NSString **err);
+void winShutdown(void);
 void touchAdjust(double *x, double *y);
 void doTapRaw(double x, double y);
 void doSwipeSmooth(double x1, double y1, double x2, double y2, int ms, int holdMs);

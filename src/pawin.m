@@ -39,6 +39,7 @@ void winRefreshOrigin(void) {
     UIView *h = gWHost ?: gWWin.rootViewController.view;
     CGPoint p = [h convertPoint:CGPointZero toView:nil];
     gWOX = gWWin.frame.origin.x + p.x; gWOY = gWWin.frame.origin.y + p.y;
+    if (gWHud) hudWriteGeo(gWOX, gWOY, kWinK);
 }
 
 static Class wC(NSString *n) { return NSClassFromString(n); }
@@ -46,16 +47,21 @@ static BOOL wHas(id o, const char *s) { return o && [o respondsToSelector:sel_re
 static void wMain(dispatch_block_t b) { if (NSThread.isMainThread) b(); else dispatch_sync(dispatch_get_main_queue(), b); }
 
 BOOL winEnabled(void) { return paOn(@"win_mode", NO); }
-BOOL winActive(void) { return gWActive; }
-NSString *winBid(void) { return gWActive ? gWBid : nil; }
-BOOL winTouchBlocked(void) { return gWActive && !gPAFront; }
+// v0.9.73:悬浮层模式。PhoneAgent 里调这些函数时转给悬浮层进程(pahud.m 的 hudRemote*),悬浮层进程里才真的动场景
+static volatile BOOL gRActive = NO;       // PhoneAgent 这边:悬浮小窗里有 App
+static NSString *gRBid;
+BOOL winActive(void) { return gWHud ? gWActive : gRActive; }
+NSString *winBid(void) { return gWHud ? (gWActive ? gWBid : nil) : (gRActive ? gRBid : nil); }
+BOOL winTouchBlocked(void) { return gWHud ? (gWActive && !gPAFront) : NO; } // 悬浮窗盖在所有界面上,PhoneAgent 在后台也能点
 
 // 触摸坐标(0~1,按整屏算)换到小窗里:屏幕点 = 小窗左上角 + App 坐标 × 0.3
 void winMapNorm(double *nx, double *ny) {
-    if (!gWActive) return;
+    double ox = gWOX, oy = gWOY, k = kWinK;
+    if (gWHud) { if (!gWActive) return; }
+    else { if (!gRActive || !hudGeo(&ox, &oy, &k)) return; }
     CGSize s = screenSize();
-    *nx = (gWOX + *nx * s.width * kWinK) / s.width;
-    *ny = (gWOY + *ny * s.height * kWinK) / s.height;
+    *nx = (ox + *nx * s.width * k) / s.width;
+    *ny = (oy + *ny * s.height * k) / s.height;
 }
 
 static void wWatchFront(void) {
@@ -84,7 +90,7 @@ void winKill(NSString *bid) {
     } @catch (NSException *e) {}
 }
 
-void winClose(void) {
+static void lClose(void) {
     wMain(^{
         gWActive = NO;
         @try {
@@ -185,7 +191,7 @@ static long wContentState(void) {
 }
 
 // 在小窗里打开 App(后台线程调用;会等到 App 画出第一帧,最多约 10 秒)
-BOOL winOpen(NSString *bid, NSString **note) {
+static BOOL lOpen(NSString *bid, NSString **note) {
     if (!bid.length) { if (note) *note = @"包名为空"; return NO; }
     if (NSThread.isMainThread) { if (note) *note = @"不能在主线程打开小窗"; return NO; }
     wWatchFront();
@@ -196,7 +202,7 @@ BOOL winOpen(NSString *bid, NSString **note) {
                       @"UIApplicationSceneSpecification", @"FBSMutableSceneParameters",
                       @"UIMutableApplicationSceneSettings", @"UIMutableApplicationSceneClientSettings"];
     for (NSString *n in need) if (!wC(n)) { if (note) *note = [@"系统缺少 " stringByAppendingString:n]; return NO; }
-    winClose();
+    lClose();
     winKill(bid);
     __block NSString *fail = @"启动超时";
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
@@ -233,12 +239,12 @@ BOOL winOpen(NSString *bid, NSString **note) {
     });
     if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC))) != 0) {
         keepTx = nil;
-        winClose();
+        lClose();
         if (note) *note = @"启动超时(10 秒)";
         return NO;
     }
     keepTx = nil;
-    if (fail) { winClose(); if (note) *note = fail; return NO; }
+    if (fail) { lClose(); if (note) *note = fail; return NO; }
     for (int i = 0; i < 40 && wContentState() != 2; i++) usleep(200 * 1000); // 等 App 画出第一帧(微信约 2~4 秒)
     usleep(500 * 1000);
     if (note) *note = wContentState() == 2 ? @"已在小窗打开" : @"已在小窗打开(画面可能还在加载)";
@@ -246,7 +252,7 @@ BOOL winOpen(NSString *bid, NSString **note) {
 }
 
 // 小窗 App 的整屏快照(像素尺寸,如 1170×2532);深拷贝一份,免得快照对象释放后图被回收
-UIImage *winSnapshot(NSString **err) {
+static UIImage *lSnapshot(NSString **err) {
     if (!gWActive) { if (err) *err = @"小窗没开"; return nil; }
     __block UIImage *out = nil; __block NSString *e = nil;
     wMain(^{
@@ -269,4 +275,30 @@ UIImage *winSnapshot(NSString **err) {
     });
     if (!out && err) *err = e;
     return out;
+}
+
+// ---------- v0.9.73 对外接口:悬浮层进程里直接做,PhoneAgent 里转给悬浮层 ----------
+BOOL winOpen(NSString *bid, NSString **note) {
+    if (gWHud) return lOpen(bid, note);
+    NSString *n = nil;
+    BOOL ok = hudRemoteOpen(bid, &n);
+    gRActive = ok; gRBid = ok ? [bid copy] : nil;
+    if (note) *note = n;
+    return ok;
+}
+void winClose(void) {
+    if (gWHud) { lClose(); return; }
+    if (gRActive) hudRemoteClose();
+    gRActive = NO; gRBid = nil;
+}
+UIImage *winSnapshot(NSString **err) {
+    if (gWHud) return lSnapshot(err);
+    if (!gRActive) { if (err) *err = @"小窗没开"; return nil; }
+    return hudRemoteSnapshot(err);
+}
+// 任务结束:关掉悬浮层进程
+void winShutdown(void) {
+    if (gWHud) return;
+    gRActive = NO; gRBid = nil;
+    hudStop();
 }

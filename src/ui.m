@@ -605,7 +605,7 @@ static NSData *attachJPEG(UIImage *img) {
         [self hdr:@"Token 统计(每次任务结束也会在执行记录里显示本次用量)"],
         self.tokL, tokClr, cacheT,
         [self hdr:@"实验"],
-        [self sw:@"小窗模式(测试):任务里的 App 在右上角小窗里运行,不用屏幕录制、不来回切 App" key:@"win_mode" def:NO],
+        [self sw:@"小窗模式(测试):任务里的 App 在悬浮小窗里运行,盖在主屏和其他 App 上,可拖动、可缩放;不用屏幕录制" key:@"win_mode" def:NO],
         labB, axT,
         [self sw:@"每次调用模型都在执行记录里写一行 Token 明细(第几步、几张图、输入/缓存/输出)" key:@"token_step_log" def:YES],
         [self hdr:@"模型请求"],

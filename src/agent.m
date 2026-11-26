@@ -79,6 +79,16 @@ static BOOL writeClipboardInForeground(NSString *text, NSString *backHint, NSStr
         dispatch_sync(dispatch_get_main_queue(), ^{ ccNow = UIPasteboard.generalPasteboard.changeCount; });
         if (ccNow == gPbLastCC) return YES;
     }
+    // v0.9.73:有了剪贴板后台权限(com.apple.Pasteboard.background-access,lab18 实测),PhoneAgent 在后台也能直接写,
+    // 先直接写;读回一致就不用再切回 PhoneAgent。不一致才走老办法(切到前台写完再切回去)
+    {
+        __block NSString *chk = nil; __block NSInteger ccA = 0;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            UIPasteboard *pb = UIPasteboard.generalPasteboard;
+            @try { pb.string = text; ccA = pb.changeCount; chk = pb.string; } @catch (NSException *e) {}
+        });
+        if ([chk isEqualToString:text]) { gPbLastText = [text copy]; gPbLastCC = ccA; return YES; }
+    }
     NSString *selfID = NSBundle.mainBundle.bundleIdentifier;
     BOOL switched = NO;
     NSString *back = nil;
@@ -1209,7 +1219,8 @@ static void taskRunBegin(NSString *task) {
 // 任务结束:停止防锁屏 -> 回到 PhoneAgent -> 弹出结果窗口 -> 后台提炼记忆
 static void taskRunEnd(NSString *task, BOOL stopCast) {
     gAgentRunning = NO;
-    if (winActive()) winClose(); // v0.9.67 小窗模式:任务结束收起小窗
+    if (winEnabled()) winShutdown(); // v0.9.73 小窗模式:任务结束关掉悬浮小窗
+    else if (winActive()) winClose();
     taskAwakeStop();
     keepAliveTaskStop();
     cpClear(); // 11:正常结束(完成/停止/失败)都清掉断点
@@ -2074,10 +2085,9 @@ static void agentRunClaimed(NSString *task, NSString *base, NSString *key, NSStr
         [ud setBool:YES forKey:@"mig_0921"];
     }
     BOOL autoCast = [ud objectForKey:@"auto_cast"] ? [ud boolForKey:@"auto_cast"] : YES;
-    if (winEnabled()) { // v0.9.67:小窗模式不自动开/关录屏;PhoneAgent 要在前台,小窗才看得见
+    if (winEnabled()) { // v0.9.73:小窗模式不开录屏;App 在悬浮小窗里跑,盖在所有界面上,你可以继续用手机
         autoCast = NO;
-        if (appStateNow() != UIApplicationStateActive) { openApp(NSBundle.mainBundle.bundleIdentifier); waitAppActive(6); usleep(500 * 1000); }
-        agentSay(@"小窗模式:不开屏幕录制,App 在右上角小窗里运行");
+        agentSay(@"小窗模式:不开屏幕录制,App 在悬浮小窗里运行(按住橙条拖动,拖右边「⤡」放大缩小)");
     }
     BOOL proceed = YES;
     if (autoCast && !broadcastAlive()) {

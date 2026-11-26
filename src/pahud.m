@@ -18,10 +18,16 @@ extern int posix_spawnattr_set_persona_np(const posix_spawnattr_t *__restrict, u
 extern int posix_spawnattr_set_persona_uid_np(const posix_spawnattr_t *__restrict, uid_t);
 extern int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t *__restrict, uid_t);
 
-#define HUD_LOG @"/var/mobile/Library/Caches/pa_hud.log"
-#define HUD_PID @"/var/mobile/Library/Caches/pa_hud.pid"
+// 文件名带端口号,正式版(8200)和实验版(8201)同时装着也不会互相干扰
+#define HUD_DIR @"/var/mobile/Library/Caches/"
+#define HUD_LOG [NSString stringWithFormat:HUD_DIR @"pa_hud_%d.log", PORT]
+#define HUD_PID [NSString stringWithFormat:HUD_DIR @"pa_hud_%d.pid", PORT]
+#define HUD_GEO [NSString stringWithFormat:HUD_DIR @"pa_hud_%d.geo", PORT]
+#define HUD_PORT (PORT + 100)   // 悬浮层自己的本机接口:正式版 8300,实验版 8301
 
 static NSString *gHudBid, *gHudPAKey;
+static BOOL gHudServe = NO;     // v0.9.73:给 PhoneAgent 跑任务用(不是实验页的自测)
+static pid_t gHudPAPid = 0;
 static int hudClipChild(NSString *text);
 static UIWindow *gHudWin;
 
@@ -34,7 +40,7 @@ static void hlog(NSString *fmt, ...) {
     static NSDateFormatter *df; static dispatch_once_t once;
     dispatch_once(&once, ^{ df = [NSDateFormatter new]; df.dateFormat = @"HH:mm:ss"; });
     NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [df stringFromDate:NSDate.date], s];
-    @synchronized (HUD_LOG) {
+    @synchronized (NSFileManager.class) {
         FILE *f = fopen(HUD_LOG.UTF8String, "a");
         if (f) { fputs(line.UTF8String, f); fclose(f); }
         chmod(HUD_LOG.UTF8String, 0666);
@@ -218,6 +224,79 @@ static void hudHIDCallback(void *target, void *refcon, void *service, void *even
     });
 }
 
+
+// ---------- v0.9.73:悬浮层的本机接口(只给 PhoneAgent 用,带钥匙) ----------
+#import <sys/socket.h>
+#import <netinet/in.h>
+#import <arpa/inet.h>
+static void hSend(int c, int code, NSString *type, NSData *body) {
+    NSString *h = [NSString stringWithFormat:@"HTTP/1.1 %d OK\r\nContent-Type: %@\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n", code, type, (unsigned long)body.length];
+    NSMutableData *d = [[h dataUsingEncoding:NSUTF8StringEncoding] mutableCopy];
+    if (body) [d appendData:body];
+    const uint8_t *p = d.bytes; size_t left = d.length;
+    while (left > 0) { ssize_t n = write(c, p, left); if (n <= 0) break; p += n; left -= n; }
+    close(c);
+}
+static void hJSON(int c, int code, NSDictionary *j) {
+    hSend(c, code, @"application/json", [NSJSONSerialization dataWithJSONObject:j options:0 error:nil]);
+}
+static void hHandle(int c) {
+    char buf[4096]; ssize_t n = read(c, buf, sizeof buf - 1);
+    if (n <= 0) { close(c); return; }
+    buf[n] = 0;
+    NSString *head = [NSString stringWithUTF8String:buf] ?: @"";
+    NSArray *parts = [[[head componentsSeparatedByString:@"\r\n"] firstObject] componentsSeparatedByString:@" "];
+    if (parts.count < 2) { close(c); return; }
+    NSURLComponents *uc = [NSURLComponents componentsWithString:[@"http://h" stringByAppendingString:parts[1]]];
+    NSMutableDictionary *q = [NSMutableDictionary dictionary];
+    for (NSURLQueryItem *i in uc.queryItems) q[i.name] = i.value ?: @"";
+    if (!gHudPAKey.length || ![q[@"key"] isEqualToString:gHudPAKey]) { hJSON(c, 403, @{@"ok": @NO}); return; }
+    NSString *path = uc.path ?: @"/";
+    if ([path isEqualToString:@"/ping"]) { hJSON(c, 200, @{@"ok": @YES, @"active": @(winActive())}); return; }
+    if ([path isEqualToString:@"/open"]) {
+        NSString *note = nil;
+        BOOL ok = winOpen(q[@"bid"] ?: @"", &note);
+        hlog(@"打开 %@:%@", q[@"bid"], ok ? (note ?: @"成功") : (note ?: @"失败"));
+        hJSON(c, 200, @{@"ok": @(ok), @"note": note ?: @""});
+        return;
+    }
+    if ([path isEqualToString:@"/close"]) { winClose(); hJSON(c, 200, @{@"ok": @YES}); return; }
+    if ([path isEqualToString:@"/snap"]) {
+        NSString *e = nil;
+        UIImage *u = winSnapshot(&e);
+        NSData *d = u ? UIImageJPEGRepresentation(u, 0.85) : nil;
+        if (d.length) hSend(c, 200, @"image/jpeg", d);
+        else hJSON(c, 500, @{@"ok": @NO, @"error": e ?: @"快照失败"});
+        return;
+    }
+    hJSON(c, 404, @{@"ok": @NO});
+}
+static void hudServeStart(void) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1; setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET; a.sin_port = htons(HUD_PORT); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(sock, (struct sockaddr *)&a, sizeof a) != 0 || listen(sock, 8) != 0) { hlog(@"✗ 接口端口 %d 打不开", HUD_PORT); exit(1); }
+    hlog(@"接口已开 %d", HUD_PORT);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        for (;;) {
+            int c = accept(sock, NULL, NULL);
+            if (c < 0) continue;
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ @autoreleasepool { hHandle(c); } });
+        }
+    });
+    // PhoneAgent 没了(闪退/被杀),悬浮层也跟着退,不留一个关不掉的窗
+    if (gHudPAPid > 0) {
+        dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), 3 * NSEC_PER_SEC, NSEC_PER_SEC);
+        dispatch_source_set_event_handler(t, ^{
+            if (kill(gHudPAPid, 0) != 0 && errno == ESRCH) { hlog(@"PhoneAgent 已退出,悬浮层也退出"); winClose(); exit(0); }
+        });
+        dispatch_resume(t);
+        static dispatch_source_t keep; keep = t;
+    }
+}
+
 @interface PAHudDelegate : UIResponder <UIApplicationDelegate>
 @property (nonatomic, strong) UIWindow *window;
 @property (nonatomic, strong) id hosting;
@@ -253,6 +332,7 @@ static void hudHIDCallback(void *target, void *refcon, void *service, void *even
         gHudWin = win;
         winSetHostWindow(win, content);
         hudLayout(win.frame.origin, 0.3);
+        if (gHudServe) hlog(@"悬浮层待命,等 PhoneAgent 打开 App");
         dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_NOW);
         Class HC = NSClassFromString(@"SBSAccessibilityWindowHostingController");
         unsigned int cid = [win respondsToSelector:sel_registerName("_contextId")] ? ((unsigned int (*)(id, SEL))objc_msgSend)(win, sel_registerName("_contextId")) : 0;
@@ -261,11 +341,13 @@ static void hudHIDCallback(void *target, void *refcon, void *service, void *even
             ((void (*)(id, SEL, unsigned int, double))objc_msgSend)(self.hosting, sel_registerName("registerWindowWithContextID:atLevel:"), cid, win.windowLevel);
             hlog(@"悬浮窗已登记 context=%u", cid);
         } else hlog(@"✗ 登记悬浮窗失败 HC=%@ context=%u", HC, cid);
+        if (gHudServe) self.window.hidden = YES; // 打开 App 时才显示
     } @catch (NSException *e) { hlog(@"✗ 建悬浮窗异常 %@", e.reason ?: e.name); }
+    if (gHudServe) { hudServeStart(); return YES; }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @try { hudFlow(); } @catch (NSException *e) { hlog(@"✗ 流程异常 %@", e.reason ?: e.name); }
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    if (!gHudServe) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         hlog(@"5 分钟到,悬浮层退出");
         winClose();
         exit(0);
@@ -283,10 +365,12 @@ int paHudMain(int argc, char *argv[]) {
     @autoreleasepool {
         gHudBid = argc > 2 ? [NSString stringWithUTF8String:argv[2]] : @"com.apple.Preferences";
         gHudPAKey = argc > 3 ? [NSString stringWithUTF8String:argv[3]] : @"";
+        gHudServe = argc > 4 && strcmp(argv[4], "serve") == 0;
+        gHudPAPid = argc > 5 ? (pid_t)atoi(argv[5]) : 0;
         [[NSString stringWithFormat:@"%d", getpid()] writeToFile:HUD_PID atomically:YES encoding:NSUTF8StringEncoding error:nil];
         chmod(HUD_PID.UTF8String, 0666);
         NSSetUncaughtExceptionHandler(&hudUncaught);
-        hlog(@"== lab14 悬浮层启动,目标 %@", gHudBid);
+        hlog(gHudServe ? @"== 悬浮层启动(任务用)" : @"== lab14 悬浮层启动,目标 %@", gHudBid);
         void *gs = dlopen("/System/Library/PrivateFrameworks/GraphicsServices.framework/GraphicsServices", RTLD_NOW);
         void *bk = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
         void (*GSInit)(void) = gs ? dlsym(gs, "GSInitialize") : NULL;
@@ -333,7 +417,7 @@ int paHudExitMain(void) {
 }
 
 // ---------- PhoneAgent 这边:用 root 身份再启动自己一份 ----------
-static NSString *hudSpawn(const char *arg, const char *arg2, const char *arg3, BOOL wait) {
+static NSString *hudSpawn5(const char *arg, const char *arg2, const char *arg3, const char *arg4, const char *arg5, BOOL wait) {
     uint32_t sz = 0; _NSGetExecutablePath(NULL, &sz);
     char *exe = calloc(1, sz + 1); _NSGetExecutablePath(exe, &sz);
     posix_spawnattr_t attr; posix_spawnattr_init(&attr);
@@ -341,7 +425,7 @@ static NSString *hudSpawn(const char *arg, const char *arg2, const char *arg3, B
     posix_spawnattr_set_persona_uid_np(&attr, 0);
     posix_spawnattr_set_persona_gid_np(&attr, 0);
     if (!wait) { posix_spawnattr_setpgroup(&attr, 0); posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP); }
-    const char *args[] = { exe, arg, arg2, arg3, NULL };
+    const char *args[] = { exe, arg, arg2, arg3, arg4, arg5, NULL };
     pid_t pid = 0;
     int rc = posix_spawn(&pid, exe, NULL, &attr, (char **)args, environ);
     posix_spawnattr_destroy(&attr);
@@ -352,6 +436,8 @@ static NSString *hudSpawn(const char *arg, const char *arg2, const char *arg3, B
     return [NSString stringWithFormat:@"已启动 pid=%d", pid];
 }
 
+static NSString *hudSpawn(const char *arg, const char *arg2, const char *arg3, BOOL wait) { return hudSpawn5(arg, arg2, arg3, NULL, NULL, wait); }
+
 static NSString *gHudKey;
 NSString *hudKey(void) { return gHudKey; }
 NSString *hudStart(NSString *bid) {
@@ -361,6 +447,81 @@ NSString *hudStart(NSString *bid) {
     return hudSpawn("-pahud", bid.UTF8String ?: "com.apple.Preferences", gHudKey.UTF8String, NO);
 }
 NSString *hudStop(void) { return hudSpawn("-pahudexit", NULL, NULL, YES); }
+
+// ---------- v0.9.73 PhoneAgent 这边:跑任务时启动悬浮层并给它发指令 ----------
+void hudWriteGeo(double ox, double oy, double k) {
+    NSString *g = [NSString stringWithFormat:@"%.2f %.2f %.4f", ox, oy, k];
+    [g writeToFile:HUD_GEO atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    chmod(HUD_GEO.UTF8String, 0666);
+}
+// 读小窗位置和缩放(拖动后会变);0.3 秒内用缓存,滑动时每秒要读几十次
+BOOL hudGeo(double *ox, double *oy, double *k) {
+    static double cx, cy, ck; static CFAbsoluteTime ct; static BOOL have;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    @synchronized (NSFileManager.class) {
+        if (!have || now - ct > 0.3) {
+            NSString *g = [NSString stringWithContentsOfFile:HUD_GEO encoding:NSUTF8StringEncoding error:nil];
+            NSArray *a = [g componentsSeparatedByString:@" "];
+            if (a.count == 3 && [a[2] doubleValue] > 0.05) { cx = [a[0] doubleValue]; cy = [a[1] doubleValue]; ck = [a[2] doubleValue]; have = YES; ct = now; }
+        }
+        if (!have) return NO;
+        *ox = cx; *oy = cy; *k = ck;
+        return YES;
+    }
+}
+static NSData *hudReq(NSString *path, NSDictionary *q, double timeout, NSInteger *code) {
+    NSURLComponents *uc = [NSURLComponents componentsWithString:[NSString stringWithFormat:@"http://127.0.0.1:%d%@", HUD_PORT, path]];
+    NSMutableArray *items = [NSMutableArray arrayWithObject:[NSURLQueryItem queryItemWithName:@"key" value:gHudKey ?: @""]];
+    for (NSString *k in q) [items addObject:[NSURLQueryItem queryItemWithName:k value:q[k]]];
+    uc.queryItems = items;
+    NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:uc.URL];
+    rq.timeoutInterval = timeout;
+    __block NSData *out = nil; __block NSInteger st = 0;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[NSURLSession.sharedSession dataTaskWithRequest:rq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        out = d; st = [r isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse *)r).statusCode : 0;
+        dispatch_semaphore_signal(sem);
+    }] resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)((timeout + 1) * NSEC_PER_SEC)));
+    if (code) *code = st;
+    return out;
+}
+static BOOL hudAlive(void) {
+    if (!gHudKey.length) return NO;
+    NSInteger st = 0;
+    hudReq(@"/ping", @{}, 1.0, &st);
+    return st == 200;
+}
+// 确保悬浮层在待命;没有就启动一个(最多等 6 秒)
+static BOOL hudEnsure(NSString **note) {
+    if (hudAlive()) return YES;
+    hudSpawn("-pahudexit", NULL, NULL, YES);
+    unlink(HUD_LOG.UTF8String);
+    gHudKey = [[NSUUID UUID].UUIDString stringByReplacingOccurrencesOfString:@"-" withString:@""];
+    char pid[16]; snprintf(pid, sizeof pid, "%d", getpid());
+    NSString *r = hudSpawn5("-pahud", "-", gHudKey.UTF8String, "serve", pid, NO);
+    for (int i = 0; i < 30; i++) { usleep(200 * 1000); if (hudAlive()) return YES; }
+    if (note) *note = [NSString stringWithFormat:@"悬浮层没起来(%@)。最后日志:%@", r, [[hudReadLog() componentsSeparatedByString:@"\n"] lastObject] ?: @""];
+    return NO;
+}
+BOOL hudRemoteOpen(NSString *bid, NSString **note) {
+    if (!hudEnsure(note)) return NO;
+    NSInteger st = 0;
+    NSData *d = hudReq(@"/open", @{@"bid": bid ?: @""}, 15, &st);
+    NSDictionary *j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+    if (![j isKindOfClass:NSDictionary.class]) { if (note) *note = [NSString stringWithFormat:@"悬浮层没回应(HTTP %ld)", (long)st]; return NO; }
+    if (note) *note = j[@"note"];
+    return [j[@"ok"] boolValue];
+}
+void hudRemoteClose(void) { if (gHudKey.length) hudReq(@"/close", @{}, 3, NULL); }
+UIImage *hudRemoteSnapshot(NSString **err) {
+    NSInteger st = 0;
+    NSData *d = hudReq(@"/snap", @{}, 5, &st);
+    UIImage *u = (st == 200 && d.length) ? [UIImage imageWithData:d] : nil;
+    if (!u && err) *err = [NSString stringWithFormat:@"悬浮小窗快照失败(HTTP %ld)", (long)st];
+    return u;
+}
+
 NSString *hudReadLog(void) { return [NSString stringWithContentsOfFile:HUD_LOG encoding:NSUTF8StringEncoding error:nil] ?: @""; }
 
 // lab16:以 mobile(uid 501)身份起一个子进程写剪贴板,返回子进程退出码
