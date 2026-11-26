@@ -6,6 +6,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
+#import <CoreImage/CoreImage.h>
 #import "pa_internal.h"
 
 static id lab_cls(NSString *n) { return NSClassFromString(n); }
@@ -73,6 +74,7 @@ static void labUncaught(NSException *e) {
         [self btn:@"1b 直接启动" sel:@selector(onEmbedDirect)],
         [self btn:@"2 截图+OCR" sel:@selector(onShot)],
         [self btn:@"3 程序点" sel:@selector(onAutoTap)],
+        [self btn:@"4 快照" sel:@selector(onSnap)],
         [self btn:@"关闭" sel:@selector(onClose)]]];
     btns.axis = UILayoutConstraintAxisHorizontal; btns.distribution = UIStackViewDistributionFillEqually;
     self.host = [UIView new];
@@ -391,6 +393,116 @@ static void lab_range(CGImageRef cg, int *mn, int *mx) {
         doSwipeSmooth(sx, sy1, sx, sy2, 400, 150);
         [self log:@"j 已滑。看小窗内容有没有滚动。告诉我:点了有没有反应、滑了有没有滚"];
     });
+}
+
+// lab6:找"场景快照"接口 —— 按 App 原尺寸出图,和小窗大小无关
+// 先列出 FrontBoard 里名字带 Snapshot 的类和场景对象上的快照方法,再逐个试无参数、返回对象的快照方法。
+// 每试一个先记下名字;如果闪退,下次自动跳过它。
+static NSArray *lab_snapSels(id o) {
+    NSMutableArray *r = [NSMutableArray array];
+    for (Class c = object_getClass(o); c && c != NSObject.class; c = class_getSuperclass(c)) {
+        unsigned n = 0; Method *ms = class_copyMethodList(c, &n);
+        for (unsigned i = 0; i < n; i++) {
+            NSString *nm = NSStringFromSelector(method_getName(ms[i]));
+            if ([nm rangeOfString:@"napshot" options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+            const char *t = method_getTypeEncoding(ms[i]);
+            [r addObject:@[NSStringFromClass(c), nm, t ? @(t) : @""]];
+        }
+        free(ms);
+    }
+    return r;
+}
+
+- (UIImage *)imageFrom:(id)o depth:(int)d {
+    if (!o || d > 2) return nil;
+    if ([o isKindOfClass:UIImage.class]) return o;
+    if (CFGetTypeID((__bridge CFTypeRef)o) == CGImageGetTypeID()) return [UIImage imageWithCGImage:(__bridge CGImageRef)o];
+    NSArray *cands = @[@"CGImage", @"cgImage", @"image", @"IOSurface", @"ioSurface", @"fallbackIOSurface", @"surface", @"snapshot"];
+    for (NSString *n in cands) {
+        SEL sel = NSSelectorFromString(n);
+        if (![o respondsToSelector:sel]) continue;
+        Method m = class_getInstanceMethod(object_getClass(o), sel);
+        char rt[64] = {0}; if (m) method_getReturnType(m, rt, sizeof rt);
+        [self log:[NSString stringWithFormat:@"  · %@ 有 -%@ (返回 %s)", NSStringFromClass(object_getClass(o)), n, rt]];
+        @try {
+            if (rt[0] == '^') {
+                void *p = ((void *(*)(id, SEL))objc_msgSend)(o, sel);
+                if (!p) continue;
+                if ([n rangeOfString:@"urface" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                    CIImage *ci = [CIImage imageWithIOSurface:(IOSurfaceRef)p];
+                    CGImageRef cg = [[CIContext contextWithOptions:nil] createCGImage:ci fromRect:ci.extent];
+                    if (cg) { UIImage *u = [UIImage imageWithCGImage:cg]; CGImageRelease(cg); return u; }
+                } else {
+                    return [UIImage imageWithCGImage:(CGImageRef)p];
+                }
+            } else if (rt[0] == '@') {
+                id r = ((id (*)(id, SEL))objc_msgSend)(o, sel);
+                if (r && r != o) { UIImage *u = [self imageFrom:r depth:d + 1]; if (u) return u; }
+            }
+        } @catch (NSException *e) { [self log:[NSString stringWithFormat:@"  · 异常 %@", e.reason]]; }
+    }
+    return nil;
+}
+
+- (void)onSnap {
+    if (!self.presView) { [self log:@"还没嵌入"]; return; }
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    NSMutableArray *skip = [([ud arrayForKey:@"scenelab_skip"] ?: @[]) mutableCopy];
+    NSString *trying = [ud stringForKey:@"scenelab_trying"];
+    if (trying.length) { [skip addObject:trying]; [ud setObject:skip forKey:@"scenelab_skip"]; [ud removeObjectForKey:@"scenelab_trying"]; [self log:[NSString stringWithFormat:@"k 上次试 %@ 时闪退,这次跳过", trying]]; }
+
+    // 1) FrontBoard / FrontBoardServices 里名字带 Snapshot 的类
+    NSMutableSet *imgs = [NSMutableSet set];
+    for (NSString *cn in @[@"FBScene", @"FBSScene", @"FBSSceneSettings", @"_UIScenePresenter"]) {
+        Class c = NSClassFromString(cn); const char *im = c ? class_getImageName(c) : NULL;
+        if (im) [imgs addObject:@(im)];
+    }
+    for (NSString *im in imgs) {
+        unsigned n = 0; const char **names = objc_copyClassNamesForImage(im.UTF8String, &n);
+        NSMutableArray *hit = [NSMutableArray array];
+        for (unsigned i = 0; i < n; i++) { NSString *cn = @(names[i]); if ([cn rangeOfString:@"napshot" options:NSCaseInsensitiveSearch].location != NSNotFound) [hit addObject:cn]; }
+        free(names);
+        [self log:[NSString stringWithFormat:@"k %@ 快照类 %lu 个:%@", im.lastPathComponent, (unsigned long)hit.count, [[hit subarrayWithRange:NSMakeRange(0, MIN((NSUInteger)30, hit.count))] componentsJoinedByString:@" "]]];
+    }
+
+    // 2) 场景 / presenter / 视图上带 snapshot 的方法
+    NSDictionary *objs = @{ @"scene": self.scene ?: NSNull.null, @"presenter": self.presenter ?: NSNull.null, @"view": self.presView ?: NSNull.null };
+    NSMutableArray *tries = [NSMutableArray array];
+    for (NSString *k in @[@"scene", @"presenter", @"view"]) {
+        id o = objs[k]; if (o == NSNull.null) continue;
+        NSArray *sels = lab_snapSels(o);
+        [self log:[NSString stringWithFormat:@"k %@(%@) 快照方法 %lu 个", k, NSStringFromClass(object_getClass(o)), (unsigned long)sels.count]];
+        for (NSArray *x in sels) {
+            [self log:[NSString stringWithFormat:@"  %@ -%@ %@", x[0], x[1], x[2]]];
+            NSString *nm = x[1], *t = x[2];
+            BOOL zeroArg = [nm rangeOfString:@":"].location == NSNotFound;
+            BOOL retObj = [t hasPrefix:@"@"];
+            NSString *low = nm.lowercaseString;
+            BOOL bad = NO;
+            for (NSString *w in @[@"invalidate", @"remove", @"delete", @"discard", @"set", @"clear", @"purge", @"destroy", @"cancel", @"_"])
+                if ([low hasPrefix:w]) bad = YES;
+            NSString *key = [NSString stringWithFormat:@"%@.%@", k, nm];
+            if (zeroArg && retObj && !bad && ![skip containsObject:key]) [tries addObject:@[k, nm, key]];
+        }
+    }
+
+    // 3) 逐个试
+    UIImage *got = nil; NSString *how = nil;
+    for (NSArray *x in tries) {
+        id o = objs[x[0]];
+        [ud setObject:x[2] forKey:@"scenelab_trying"]; [ud synchronize];
+        [self log:[NSString stringWithFormat:@"k 试 %@", x[2]]];
+        @try {
+            id r = ((id (*)(id, SEL))objc_msgSend)(o, NSSelectorFromString(x[1]));
+            [self log:[NSString stringWithFormat:@"  → %@", r ? NSStringFromClass(object_getClass(r)) : @"nil"]];
+            UIImage *u = [self imageFrom:r depth:0];
+            if (u && !got) { got = u; how = x[2]; }
+        } @catch (NSException *e) { [self log:[NSString stringWithFormat:@"  → 异常 %@", e.reason]]; }
+        [ud removeObjectForKey:@"scenelab_trying"]; [ud synchronize];
+    }
+    if (!got) { [self log:@"k 没拿到快照图。把这段日志发我,我按上面列出的方法写下一步"]; return; }
+    [self log:[NSString stringWithFormat:@"k 用 %@ 拿到图", how]];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ [self report:@"S" image:got]; [self log:@"== 快照完"]; });
 }
 
 - (void)onClose {
