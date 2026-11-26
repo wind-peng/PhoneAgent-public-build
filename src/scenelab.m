@@ -5,6 +5,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <dlfcn.h>
 #import "pa_internal.h"
 
 static id lab_cls(NSString *n) { return NSClassFromString(n); }
@@ -248,32 +249,121 @@ static void labUncaught(NSException *e) {
     }
 }
 
+// lab4:三种截图方法逐个试,每种都裁出嵌入框那一块,看亮度并 OCR
+static void lab_range(CGImageRef cg, int *mn, int *mx) {
+    size_t w = 40, h = 80; unsigned char px[40 * 80 * 4] = {0};
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(px, w, h, 8, w * 4, cs, kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(cs);
+    if (!ctx) { *mn = *mx = -1; return; }
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg); CGContextRelease(ctx);
+    int a = 255, b = 0;
+    for (size_t i = 0; i < w * h; i++) { int v = (px[i*4] + px[i*4+1] + px[i*4+2]) / 3; a = MIN(a, v); b = MAX(b, v); }
+    *mn = a; *mx = b;
+}
+
+// 整屏截图 → 裁出嵌入框(按屏幕点坐标换算到像素)
+- (UIImage *)cropBox:(CGImageRef)full {
+    if (!full) return nil;
+    CGRect box = [self.host convertRect:self.host.bounds toView:nil];   // 窗口坐标 = 屏幕坐标(竖屏)
+    CGFloat sx = CGImageGetWidth(full) / UIScreen.mainScreen.bounds.size.width;
+    CGFloat sy = CGImageGetHeight(full) / UIScreen.mainScreen.bounds.size.height;
+    CGRect px = CGRectIntegral(CGRectMake(box.origin.x * sx, box.origin.y * sy, box.size.width * sx, box.size.height * sy));
+    CGImageRef c = CGImageCreateWithImageInRect(full, px);
+    if (!c) return nil;
+    UIImage *img = [UIImage imageWithCGImage:c]; CGImageRelease(c);
+    return img;
+}
+
+- (void)report:(NSString *)tag image:(UIImage *)img {
+    if (!img.CGImage) { [self log:[NSString stringWithFormat:@"%@ 没拿到图", tag]]; return; }
+    int mn = 0, mx = 0; lab_range(img.CGImage, &mn, &mx);
+    [self log:[NSString stringWithFormat:@"%@ 图 %zux%zu,亮度 %d~%d", tag, CGImageGetWidth(img.CGImage), CGImageGetHeight(img.CGImage), mn, mx]];
+    if (mx - mn < 10) return;
+    NSString *err = nil;
+    NSArray *items = ocrImage(img, &err);
+    NSMutableArray *ts = [NSMutableArray array];
+    for (NSDictionary *it in items) { if (ts.count >= 8) break; NSString *t = [it[@"text"] description]; if (t.length) [ts addObject:t]; }
+    [self log:[NSString stringWithFormat:@"%@ OCR %lu 条%@:%@", tag, (unsigned long)items.count, err.length ? [@" 错误 " stringByAppendingString:err] : @"", [ts componentsJoinedByString:@" | "]]];
+}
+
+// 方法 C:直接从显示服务读整块屏幕像素(CARenderServerRenderDisplay → IOSurface)
+- (UIImage *)shotRenderServer {
+    dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
+    typedef void *(*fCreate)(CFDictionaryRef);
+    typedef int (*fLock)(void *, uint32_t, uint32_t *);
+    typedef void *(*fBase)(void *);
+    typedef size_t (*fBPR)(void *);
+    typedef void (*fRender)(int, CFStringRef, void *, int, int);
+    fCreate sCreate = (fCreate)dlsym(RTLD_DEFAULT, "IOSurfaceCreate");
+    fLock sLock = (fLock)dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+    fLock sUnlock = (fLock)dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+    fBase sBase = (fBase)dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+    fBPR sBPR = (fBPR)dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+    fRender sRender = (fRender)dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
+    if (!sCreate || !sLock || !sUnlock || !sBase || !sBPR || !sRender) {
+        [self log:[NSString stringWithFormat:@"C 缺函数 create=%d lock=%d base=%d render=%d", !!sCreate, !!sLock, !!sBase, !!sRender]];
+        return nil;
+    }
+    int W = (int)UIScreen.mainScreen.nativeBounds.size.width, H = (int)UIScreen.mainScreen.nativeBounds.size.height;
+    int bpr = W * 4;
+    NSDictionary *props = @{ @"IOSurfaceWidth": @(W), @"IOSurfaceHeight": @(H), @"IOSurfaceBytesPerElement": @4,
+                             @"IOSurfaceBytesPerRow": @(bpr), @"IOSurfaceAllocSize": @(bpr * H),
+                             @"IOSurfacePixelFormat": @(0x42475241u) };
+    void *surf = sCreate((__bridge CFDictionaryRef)props);
+    if (!surf) { [self log:@"C IOSurface 建不了"]; return nil; }
+    [self log:[NSString stringWithFormat:@"C 调渲染服务 %dx%d", W, H]];
+    sRender(0, CFSTR("LCD"), surf, 0, 0);
+    sLock(surf, 1, NULL);   // 1 = 只读
+    void *base = sBase(surf); size_t realBPR = sBPR(surf);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(base, W, H, 8, realBPR, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+    CGImageRef cg = ctx ? CGBitmapContextCreateImage(ctx) : NULL;   // 这里会复制一份像素
+    if (ctx) CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
+    sUnlock(surf, 1, NULL);
+    CFRelease((CFTypeRef)surf);
+    if (!cg) { [self log:@"C 转图失败"]; return nil; }
+    UIImage *box = [self cropBox:cg]; CGImageRelease(cg);
+    return box;
+}
+
 - (void)onShot {
     if (!self.presView) { [self log:@"还没嵌入"]; return; }
+    [self log:@"== 截图对比(A 视图绘制 / B UIKit 整屏 / C 渲染服务)"];
     CGRect full = UIScreen.mainScreen.bounds;
+
+    // A:原来的方法(对远程画面通常是黑的)
     UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat];
     f.scale = 2;
-    UIImage *img = [[[UIGraphicsImageRenderer alloc] initWithSize:full.size format:f] imageWithActions:^(UIGraphicsImageRendererContext *c) {
+    UIImage *imgA = [[[UIGraphicsImageRenderer alloc] initWithSize:full.size format:f] imageWithActions:^(UIGraphicsImageRendererContext *c) {
         CGAffineTransform t = self.presView.transform;
         self.presView.transform = CGAffineTransformIdentity;
-        BOOL ok = [self.presView drawViewHierarchyInRect:CGRectMake(0, 0, full.size.width, full.size.height) afterScreenUpdates:YES];
+        [self.presView drawViewHierarchyInRect:CGRectMake(0, 0, full.size.width, full.size.height) afterScreenUpdates:YES];
         self.presView.transform = t;
-        [self log:[NSString stringWithFormat:@"h drawViewHierarchy 返回 %@", ok ? @"成功" : @"失败"]];
     }];
-    // 粗看是不是全空白
-    CGImageRef cg = img.CGImage;
-    size_t w = 40, h = 80; unsigned char px[40 * 80 * 4] = {0};
-    CGContextRef ctx = CGBitmapContextCreate(px, w, h, 8, w * 4, CGColorSpaceCreateDeviceRGB(), kCGImageAlphaPremultipliedLast);
-    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg); CGContextRelease(ctx);
-    int minV = 255, maxV = 0;
-    for (size_t i = 0; i < w * h; i++) { int v = (px[i*4] + px[i*4+1] + px[i*4+2]) / 3; minV = MIN(minV, v); maxV = MAX(maxV, v); }
-    [self log:[NSString stringWithFormat:@"h 截图 %.0fx%.0f,亮度范围 %d~%d(范围很小 = 可能是空白)", img.size.width * img.scale, img.size.height * img.scale, minV, maxV]];
+
+    // B:UIKit 私有整屏截图
+    UIImage *imgB = nil;
+    typedef CGImageRef (*fScreen)(void);
+    fScreen sB = (fScreen)dlsym(RTLD_DEFAULT, "UIGetScreenImage");
+    typedef id (*fScreenUI)(void);
+    fScreenUI sB2 = (fScreenUI)dlsym(RTLD_DEFAULT, "_UICreateScreenUIImage");
+    @try {
+        if (sB2) { UIImage *u = sB2(); if (u.CGImage) imgB = [self cropBox:u.CGImage]; [self log:[NSString stringWithFormat:@"B 用 _UICreateScreenUIImage:%@", u ? @"有图" : @"空"]]; }
+        else if (sB) { CGImageRef c = sB(); if (c) { imgB = [self cropBox:c]; CGImageRelease(c); } [self log:[NSString stringWithFormat:@"B 用 UIGetScreenImage:%@", c ? @"有图" : @"空"]]; }
+        else [self log:@"B 两个函数都没有"];
+    } @catch (NSException *e) { [self log:[NSString stringWithFormat:@"B 异常 %@", e.reason]]; }
+
+    // C:渲染服务
+    UIImage *imgC = nil;
+    @try { imgC = [self shotRenderServer]; } @catch (NSException *e) { [self log:[NSString stringWithFormat:@"C 异常 %@", e.reason]]; }
+
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSString *err = nil;
-        NSArray *items = ocrImage(img, &err);
-        NSMutableArray *ts = [NSMutableArray array];
-        for (NSDictionary *it in items) { if (ts.count >= 8) break; NSString *t = [it[@"text"] description]; if (t.length) [ts addObject:t]; }
-        [self log:[NSString stringWithFormat:@"i OCR 识别到 %lu 条%@:%@", (unsigned long)items.count, err.length ? [@" 错误 " stringByAppendingString:err] : @"", [ts componentsJoinedByString:@" | "]]];
+        [self report:@"A" image:imgA];
+        [self report:@"B" image:imgB];
+        [self report:@"C" image:imgC];
+        [self log:@"== 完(亮度范围大且 OCR 有字 = 这种方法能用)"];
     });
 }
 
