@@ -26,6 +26,7 @@ static BOOL lab_has(id o, const char *s) { return o && [o respondsToSelector:sel
 @property (nonatomic, strong) UIView *host;
 @property (nonatomic, strong) id scene, presenter;
 @property (nonatomic, strong) UIView *presView;
+@property (nonatomic, assign) int shrinkStep;
 @end
 
 @implementation SceneLabVC
@@ -75,6 +76,7 @@ static void labUncaught(NSException *e) {
         [self btn:@"2 截图+OCR" sel:@selector(onShot)],
         [self btn:@"3 程序点" sel:@selector(onAutoTap)],
         [self btn:@"5 快照2" sel:@selector(onSnap2)],
+        [self btn:@"6 变小/藏" sel:@selector(onShrink)],
         [self btn:@"关闭" sel:@selector(onClose)]]];
     btns.axis = UILayoutConstraintAxisHorizontal; btns.distribution = UIStackViewDistributionFillEqually;
     self.host = [UIView new];
@@ -577,6 +579,37 @@ static NSString *lab_allSels(Class c) {
 
     if (!got) { [self log:@"== 三种都没出有内容的图。整段发我"]; return; }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ [self report:@"S" image:got]; [self log:@"== 快照2 完"]; });
+}
+
+// lab9:快照按 App 原尺寸出图(lab8 已成功)。这版测:小窗缩到 30%、完全隐藏、移出屏幕时,快照还能不能拿到内容。
+// 每按一次换一种状态并自动拍一张快照:1=缩到30%  2=隐藏(hidden)  3=透明度0  4=移到屏幕外  5=恢复
+- (void)quickSnap:(NSString *)tag {
+    @try {
+        id snap = MSG0(self.scene, "createSnapshot");
+        BOOL ok = snap ? ((BOOL (*)(id, SEL))objc_msgSend)(snap, sel_registerName("capture")) : NO;
+        CGImageRef cg = (snap && ok) ? ((CGImageRef (*)(id, SEL))objc_msgSend)(snap, sel_registerName("CGImage")) : NULL;
+        if (!cg) { [self log:[NSString stringWithFormat:@"%@ 快照失败 capture=%@", tag, ok ? @"YES" : @"NO"]]; return; }
+        UIImage *u = [UIImage imageWithCGImage:cg];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ [self report:tag image:u]; });
+    } @catch (NSException *e) { [self log:[NSString stringWithFormat:@"%@ 异常 %@", tag, e.reason]]; }
+}
+
+- (void)onShrink {
+    if (!self.presView) { [self log:@"还没嵌入"]; return; }
+    UIView *pv = self.presView;
+    CGFloat k0 = self.host.bounds.size.width / UIScreen.mainScreen.bounds.size.width;
+    self.shrinkStep = self.shrinkStep % 5 + 1;
+    pv.hidden = NO; pv.alpha = 1; pv.layer.position = CGPointZero;
+    NSString *tag = @"";
+    switch (self.shrinkStep) {
+        case 1: pv.transform = CGAffineTransformMakeScale(0.3, 0.3); tag = @"L1 缩到30%"; break;
+        case 2: pv.transform = CGAffineTransformMakeScale(0.3, 0.3); pv.hidden = YES; tag = @"L2 隐藏"; break;
+        case 3: pv.transform = CGAffineTransformMakeScale(0.3, 0.3); pv.alpha = 0; tag = @"L3 透明"; break;
+        case 4: pv.transform = CGAffineTransformMakeScale(0.3, 0.3); pv.layer.position = CGPointMake(3000, 0); tag = @"L4 移出屏幕"; break;
+        default: pv.transform = CGAffineTransformMakeScale(k0, k0); tag = @"L5 恢复"; break;
+    }
+    [self log:[NSString stringWithFormat:@"%@ —— 1 秒后拍快照", tag]];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [self quickSnap:tag]; });
 }
 
 - (void)onClose {
