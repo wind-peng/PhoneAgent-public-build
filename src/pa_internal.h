@@ -141,6 +141,7 @@ double winScale(void);
 // lab14 悬浮层(pahud.m)
 int paHudMain(int argc, char *argv[]);
 int paHudExitMain(void);
+int paClipMain(int argc, char *argv[]);
 NSString *hudStart(NSString *bid);
 NSString *hudStop(void);
 NSString *hudReadLog(void);

@@ -22,6 +22,7 @@ extern int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t *__restric
 #define HUD_PID @"/var/mobile/Library/Caches/pa_hud.pid"
 
 static NSString *gHudBid;
+static int hudClipChild(NSString *text);
 static UIWindow *gHudWin;
 
 // ---------- 悬浮层进程里写日志(PhoneAgent 那边读) ----------
@@ -120,16 +121,26 @@ static void hudFlow(void) {
         hlog(@"m6 点搜索框 App(%@,%@)", sf[@"x"], sf[@"y"]);
         doTapRaw([sf[@"x"] doubleValue], [sf[@"y"] doubleValue]);
         usleep(1200 * 1000);
+        // lab16:悬浮层是 root,直接写剪贴板写不进(lab15 实测)。试两种:①临时切成 mobile 身份写;②起一个 mobile 身份的子进程写
         __block BOOL pbOK = NO;
         dispatch_sync(dispatch_get_main_queue(), ^{
+            uid_t old = geteuid();
+            int r = seteuid(501);
             @try { UIPasteboard.generalPasteboard.string = @"蓝牙"; pbOK = [UIPasteboard.generalPasteboard.string isEqualToString:@"蓝牙"]; } @catch (NSException *e) {}
+            if (r == 0) seteuid(old);
         });
-        hlog(@"m7 剪贴板写「蓝牙」%@,发 Cmd+V", pbOK ? @"成功" : @"可能失败");
+        hlog(@"m7a 切 mobile 身份写「蓝牙」:读回%@,发 Cmd+V", pbOK ? @"一致" : @"不一致");
         doCmdKey(0x19);
         usleep(1800 * 1000);
-        NSArray *s3 = hOCR();
-        NSString *t3 = hTexts(s3, 8);
-        hlog(@"m8 打字后:%@ —— %@", t3, [t3 containsString:@"蓝牙"] ? @"✓ 看到「蓝牙」" : @"✗ 没看到「蓝牙」");
+        NSString *t3 = hTexts(hOCR(), 8);
+        BOOL a = [t3 containsString:@"蓝牙"];
+        hlog(@"m8a 粘贴后:%@ —— %@", t3, a ? @"✓ ①能用" : @"✗ ①不行");
+        int st = hudClipChild(@"无线");
+        hlog(@"m7b 子进程(mobile)写「无线」:退出码 %d(0=读回一致),发 Cmd+V", st);
+        doCmdKey(0x19);
+        usleep(1800 * 1000);
+        NSString *t4 = hTexts(hOCR(), 8);
+        hlog(@"m8b 粘贴后:%@ —— %@", t4, [t4 containsString:@"无线"] ? @"✓ ②能用" : @"✗ ②不行");
     }
     hlog(@"== 全流程完。告诉我:测试时你在哪个界面、悬浮窗在不在、键盘弹在哪。悬浮窗 5 分钟后自动关,或在实验页点「14 关」");
 }
@@ -329,3 +340,29 @@ NSString *hudStart(NSString *bid) {
 }
 NSString *hudStop(void) { return hudSpawn("-pahudexit", NULL, YES); }
 NSString *hudReadLog(void) { return [NSString stringWithContentsOfFile:HUD_LOG encoding:NSUTF8StringEncoding error:nil] ?: @""; }
+
+// lab16:以 mobile(uid 501)身份起一个子进程写剪贴板,返回子进程退出码
+static int hudClipChild(NSString *text) {
+    uint32_t sz = 0; _NSGetExecutablePath(NULL, &sz);
+    char *exe = calloc(1, sz + 1); _NSGetExecutablePath(exe, &sz);
+    posix_spawnattr_t attr; posix_spawnattr_init(&attr);
+    posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
+    posix_spawnattr_set_persona_uid_np(&attr, 501);
+    posix_spawnattr_set_persona_gid_np(&attr, 501);
+    const char *args[] = { exe, "-paclip", text.UTF8String, NULL };
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, exe, NULL, &attr, (char **)args, environ);
+    posix_spawnattr_destroy(&attr); free(exe);
+    if (rc != 0) { hlog(@"子进程启动失败 %s", strerror(rc)); return -1; }
+    int stt = 0; waitpid(pid, &stt, 0);
+    return WIFEXITED(stt) ? WEXITSTATUS(stt) : 100 + (WIFSIGNALED(stt) ? WTERMSIG(stt) : 0);
+}
+// 子进程入口:写剪贴板,读回一致返回 0
+int paClipMain(int argc, char *argv[]) {
+    @autoreleasepool {
+        if (argc < 3) return 2;
+        NSString *t = [NSString stringWithUTF8String:argv[2]];
+        UIPasteboard.generalPasteboard.string = t;
+        return [UIPasteboard.generalPasteboard.string isEqualToString:t] ? 0 : 1;
+    }
+}
