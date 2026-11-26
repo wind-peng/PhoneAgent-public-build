@@ -74,7 +74,7 @@ static void labUncaught(NSException *e) {
         [self btn:@"1b 直接启动" sel:@selector(onEmbedDirect)],
         [self btn:@"2 截图+OCR" sel:@selector(onShot)],
         [self btn:@"3 程序点" sel:@selector(onAutoTap)],
-        [self btn:@"4 快照" sel:@selector(onSnap)],
+        [self btn:@"5 快照2" sel:@selector(onSnap2)],
         [self btn:@"关闭" sel:@selector(onClose)]]];
     btns.axis = UILayoutConstraintAxisHorizontal; btns.distribution = UIStackViewDistributionFillEqually;
     self.host = [UIView new];
@@ -503,6 +503,80 @@ static NSArray *lab_snapSels(id o) {
     if (!got) { [self log:@"k 没拿到快照图。把这段日志发我,我按上面列出的方法写下一步"]; return; }
     [self log:[NSString stringWithFormat:@"k 用 %@ 拿到图", how]];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ [self report:@"S" image:got]; [self log:@"== 快照完"]; });
+}
+
+// lab7:lab6 找到 FBScene -createSnapshot,能出 1170x2532 原尺寸图但是黑的 —— 多半是没先调 -capture 真正渲染。
+// 这版:列出快照对象的全部方法;调 capture 后再取 CGImage / IOSurface;也试带 context 的版本。
+static NSString *lab_allSels(Class c) {
+    NSMutableArray *r = [NSMutableArray array];
+    for (; c && c != NSObject.class; c = class_getSuperclass(c)) {
+        unsigned n = 0; Method *ms = class_copyMethodList(c, &n);
+        for (unsigned i = 0; i < n; i++) {
+            const char *t = method_getTypeEncoding(ms[i]);
+            [r addObject:[NSString stringWithFormat:@"%@ %s", NSStringFromSelector(method_getName(ms[i])), t ?: ""]];
+        }
+        free(ms);
+    }
+    return [r componentsJoinedByString:@"\n   "];
+}
+
+- (UIImage *)grab:(id)snap tag:(NSString *)tag {
+    if (!snap) { [self log:[NSString stringWithFormat:@"%@ 快照对象=nil", tag]]; return nil; }
+    if ([snap respondsToSelector:NSSelectorFromString(@"capture")]) {
+        Method m = class_getInstanceMethod(object_getClass(snap), NSSelectorFromString(@"capture"));
+        char rt[16] = {0}; if (m) method_getReturnType(m, rt, sizeof rt);
+        [self log:[NSString stringWithFormat:@"%@ 调 capture(返回类型 %s)", tag, rt]];
+        if (rt[0] == 'B' || rt[0] == 'c') {
+            BOOL ok = ((BOOL (*)(id, SEL))objc_msgSend)(snap, NSSelectorFromString(@"capture"));
+            [self log:[NSString stringWithFormat:@"%@ capture 返回 %@", tag, ok ? @"YES" : @"NO"]];
+        } else {
+            ((void (*)(id, SEL))objc_msgSend)(snap, NSSelectorFromString(@"capture"));
+            [self log:[NSString stringWithFormat:@"%@ capture 已调", tag]];
+        }
+    } else [self log:[NSString stringWithFormat:@"%@ 没有 capture 方法", tag]];
+    UIImage *best = nil; int bestSpan = -1;
+    for (NSString *n in @[@"CGImage", @"IOSurface", @"fallbackIOSurface"]) {
+        SEL sel = NSSelectorFromString(n);
+        if (![snap respondsToSelector:sel]) continue;
+        void *p = ((void *(*)(id, SEL))objc_msgSend)(snap, sel);
+        if (!p) { [self log:[NSString stringWithFormat:@"%@ %@=空", tag, n]]; continue; }
+        UIImage *u = nil;
+        if ([n isEqualToString:@"CGImage"]) u = [UIImage imageWithCGImage:(CGImageRef)p];
+        else {
+            CIImage *ci = [CIImage imageWithIOSurface:(IOSurfaceRef)p];
+            CGImageRef cg = [[CIContext contextWithOptions:nil] createCGImage:ci fromRect:ci.extent];
+            if (cg) { u = [UIImage imageWithCGImage:cg]; CGImageRelease(cg); }
+        }
+        if (!u.CGImage) { [self log:[NSString stringWithFormat:@"%@ %@ 转图失败", tag, n]]; continue; }
+        int mn = 0, mx = 0; lab_range(u.CGImage, &mn, &mx);
+        [self log:[NSString stringWithFormat:@"%@ %@ %zux%zu 亮度 %d~%d", tag, n, CGImageGetWidth(u.CGImage), CGImageGetHeight(u.CGImage), mn, mx]];
+        if (mx - mn > bestSpan) { bestSpan = mx - mn; best = u; }
+    }
+    return bestSpan >= 10 ? best : nil;
+}
+
+- (void)onSnap2 {
+    if (!self.scene) { [self log:@"还没嵌入"]; return; }
+    [self log:@"== 快照2"];
+    @try {
+        [self log:[NSString stringWithFormat:@"FBSceneSnapshot 方法:\n   %@", lab_allSels(NSClassFromString(@"FBSceneSnapshot"))]];
+        [self log:[NSString stringWithFormat:@"FBSceneSnapshotContext 方法:\n   %@", lab_allSels(NSClassFromString(@"FBSceneSnapshotContext"))]];
+    } @catch (NSException *e) { [self log:[NSString stringWithFormat:@"列方法异常 %@", e.reason]]; }
+
+    UIImage *got = nil;
+    @try { got = [self grab:MSG0(self.scene, "createSnapshot") tag:@"P1 scene.createSnapshot"]; }
+    @catch (NSException *e) { [self log:[NSString stringWithFormat:@"P1 异常 %@", e.reason]]; }
+    if (!got) { @try {
+        id ctx = MSG0(self.scene, "snapshotContext");
+        [self log:[NSString stringWithFormat:@"P2 context=%@", ctx ? @"有" : @"无"]];
+        if (ctx && lab_has(ctx, "setScale:")) { MSGD(ctx, "setScale:", UIScreen.mainScreen.scale); [self log:@"P2 已设 scale"]; }
+        if (ctx) got = [self grab:MSG1(self.scene, "createSnapshotWithContext:", ctx) tag:@"P2 带 context"];
+    } @catch (NSException *e) { [self log:[NSString stringWithFormat:@"P2 异常 %@", e.reason]]; } }
+    if (!got) { @try { got = [self grab:MSG0(self.presenter, "newSnapshot") tag:@"P3 presenter.newSnapshot"]; }
+    @catch (NSException *e) { [self log:[NSString stringWithFormat:@"P3 异常 %@", e.reason]]; } }
+
+    if (!got) { [self log:@"== 三种都没出有内容的图。整段发我"]; return; }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ [self report:@"S" image:got]; [self log:@"== 快照2 完"]; });
 }
 
 - (void)onClose {
