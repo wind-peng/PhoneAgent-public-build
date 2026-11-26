@@ -53,6 +53,7 @@ static void labUncaught(NSException *e) {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     [b setTitle:t forState:UIControlStateNormal];
     b.titleLabel.font = [UIFont systemFontOfSize:15];
+    b.titleLabel.adjustsFontSizeToFitWidth = YES; b.titleLabel.minimumScaleFactor = 0.6;
     [b addTarget:self action:s forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
@@ -71,6 +72,7 @@ static void labUncaught(NSException *e) {
         [self btn:@"1 嵌入" sel:@selector(onEmbed)],
         [self btn:@"1b 直接启动" sel:@selector(onEmbedDirect)],
         [self btn:@"2 截图+OCR" sel:@selector(onShot)],
+        [self btn:@"3 程序点" sel:@selector(onAutoTap)],
         [self btn:@"关闭" sel:@selector(onClose)]]];
     btns.axis = UILayoutConstraintAxisHorizontal; btns.distribution = UIStackViewDistributionFillEqually;
     self.host = [UIView new];
@@ -324,6 +326,7 @@ static void lab_range(CGImageRef cg, int *mn, int *mx) {
     sUnlock(surf, 1, NULL);
     CFRelease((CFTypeRef)surf);
     if (!cg) { [self log:@"C 转图失败"]; return nil; }
+    { int m1=0,m2=0; lab_range(cg,&m1,&m2); [self log:[NSString stringWithFormat:@"C 整屏亮度 %d~%d(整屏也是 0 = 没权限读屏)", m1, m2]]; }
     UIImage *box = [self cropBox:cg]; CGImageRelease(cg);
     return box;
 }
@@ -350,7 +353,7 @@ static void lab_range(CGImageRef cg, int *mn, int *mx) {
     typedef id (*fScreenUI)(void);
     fScreenUI sB2 = (fScreenUI)dlsym(RTLD_DEFAULT, "_UICreateScreenUIImage");
     @try {
-        if (sB2) { UIImage *u = sB2(); if (u.CGImage) imgB = [self cropBox:u.CGImage]; [self log:[NSString stringWithFormat:@"B 用 _UICreateScreenUIImage:%@", u ? @"有图" : @"空"]]; }
+        if (sB2) { UIImage *u = sB2(); if (u.CGImage) { int m1=0,m2=0; lab_range(u.CGImage,&m1,&m2); [self log:[NSString stringWithFormat:@"B 整屏亮度 %d~%d", m1, m2]]; imgB = [self cropBox:u.CGImage]; } [self log:[NSString stringWithFormat:@"B 用 _UICreateScreenUIImage:%@", u ? @"有图" : @"空"]]; }
         else if (sB) { CGImageRef c = sB(); if (c) { imgB = [self cropBox:c]; CGImageRelease(c); } [self log:[NSString stringWithFormat:@"B 用 UIGetScreenImage:%@", c ? @"有图" : @"空"]]; }
         else [self log:@"B 两个函数都没有"];
     } @catch (NSException *e) { [self log:[NSString stringWithFormat:@"B 异常 %@", e.reason]]; }
@@ -364,6 +367,29 @@ static void lab_range(CGImageRef cg, int *mn, int *mx) {
         [self report:@"B" image:imgB];
         [self report:@"C" image:imgC];
         [self log:@"== 完(亮度范围大且 OCR 有字 = 这种方法能用)"];
+    });
+}
+
+// lab5:程序发 HID 触摸到小窗里,看嵌入的 App 有没有反应
+// 先点小窗里"App 坐标"(195,250)附近(设置首页偏上的一行),2 秒后在小窗里往上滑一下
+- (void)onAutoTap {
+    if (!self.presView) { [self log:@"还没嵌入"]; return; }
+    NSString *e = loadHID();
+    if (e.length) { [self log:[NSString stringWithFormat:@"j HID 加载失败:%@", e]]; return; }
+    CGRect box = [self.host convertRect:self.host.bounds toView:nil];
+    CGFloat k = box.size.width / UIScreen.mainScreen.bounds.size.width;
+    double tx = box.origin.x + 195 * k, ty = box.origin.y + 250 * k;
+    double sx = box.origin.x + 195 * k, sy1 = box.origin.y + 650 * k, sy2 = box.origin.y + 300 * k;
+    [self log:[NSString stringWithFormat:@"j 小窗在屏幕 (%.0f,%.0f) %.0fx%.0f,缩放 %.2f", box.origin.x, box.origin.y, box.size.width, box.size.height, k]];
+    [self log:[NSString stringWithFormat:@"j 1 秒后程序点屏幕 (%.0f,%.0f) = App 里 (195,250)", tx, ty]];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        sleep(1);
+        doTapRaw(tx, ty);
+        [self log:@"j 已点。看小窗有没有进到某个设置页"];
+        sleep(3);
+        [self log:[NSString stringWithFormat:@"j 现在在小窗里往上滑 (%.0f,%.0f)→(%.0f,%.0f)", sx, sy1, sx, sy2]];
+        doSwipeSmooth(sx, sy1, sx, sy2, 400, 150);
+        [self log:@"j 已滑。看小窗内容有没有滚动。告诉我:点了有没有反应、滑了有没有滚"];
     });
 }
 
