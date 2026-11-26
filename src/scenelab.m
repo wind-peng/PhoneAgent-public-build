@@ -188,16 +188,25 @@ static void labUncaught(NSException *e) {
         NSError *err = nil;
         id handle = ((id (*)(id, SEL, id, NSError **))objc_msgSend)(lab_cls(@"RBSProcessHandle"), sel_registerName("handleForPredicate:error:"), predicate, &err);
         [self log:[NSString stringWithFormat:@"d 进程 handle=%@ %@", handle ? @"有" : @"无", err.localizedDescription ?: @""]];
-        if (handle && lab_has(manager, "registerProcessForAuditToken:")) MSG1(manager, "registerProcessForAuditToken:", MSG0(handle, "auditToken"));
+        // lab3:auditToken 返回的是 32 字节结构体,不能当对象取(lab2 就崩在这)
+        if (handle && lab_has(handle, "auditToken") && lab_has(manager, "registerProcessForAuditToken:")) {
+            typedef struct { unsigned int v[8]; } pa_tok_t;
+            pa_tok_t tok = ((pa_tok_t (*)(id, SEL))objc_msgSend)(handle, sel_registerName("auditToken"));
+            [self log:@"d1 拿到 auditToken,注册进程"];
+            ((id (*)(id, SEL, pa_tok_t))objc_msgSend)(manager, sel_registerName("registerProcessForAuditToken:"), tok);
+            [self log:@"d2 注册完成"];
+        } else [self log:@"d1 跳过注册"];
 
         NSString *sceneID = [NSString stringWithFormat:@"sceneID:%@-palab", bid];
         id def = MSG0(lab_cls(@"FBSMutableSceneDefinition"), "definition");
         MSG1(def, "setIdentity:", MSG1(lab_cls(@"FBSSceneIdentity"), "identityForIdentifier:", sceneID));
         MSG1(def, "setClientIdentity:", MSG1(lab_cls(@"FBSSceneClientIdentity"), "identityForProcessIdentity:", identity));
+        [self log:@"d3 场景定义已建"];
         id spec = MSG0(lab_cls(@"UIApplicationSceneSpecification"), "specification");
         MSG1(def, "setSpecification:", spec);
         id params = MSG1(lab_cls(@"FBSMutableSceneParameters"), "parametersForSpecification:", spec);
 
+        [self log:@"d4 参数对象已建"];
         CGRect full = UIScreen.mainScreen.bounds; // 让 App 按整屏尺寸布局,显示时再缩小
         id settings = [lab_cls(@"UIMutableApplicationSceneSettings") new];
         if (lab_has(settings, "setCanShowAlerts:")) MSGB(settings, "setCanShowAlerts:", YES);
@@ -219,10 +228,12 @@ static void labUncaught(NSException *e) {
         id scene = MSG2(sm, "createSceneWithDefinition:initialParameters:", def, params);
         [self log:[NSString stringWithFormat:@"f 场景=%@", scene ? @"已创建" : @"失败"]];
         if (!scene) return;
+        [self log:@"f1 取 presenter"];
         id pm = lab_has(scene, "uiPresentationManager") ? MSG0(scene, "uiPresentationManager") : nil;
         id presenter = pm ? MSG1(pm, "createPresenterWithIdentifier:", sceneID) : nil;
         if (!presenter) { [self log:@"g 拿不到 presenter"]; return; }
         MSG0(presenter, "activate");
+        [self log:@"f2 presenter 已激活"];
         UIView *pv = MSG0(presenter, "presentationView");
         if (![pv isKindOfClass:UIView.class]) { [self log:@"g presentationView 不是 UIView"]; return; }
         self.scene = scene; self.presenter = presenter; self.presView = pv;
