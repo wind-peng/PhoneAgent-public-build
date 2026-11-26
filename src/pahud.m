@@ -354,7 +354,9 @@ static int hudClipChild(NSString *text) {
     int rc = posix_spawn(&pid, exe, NULL, &attr, (char **)args, environ);
     posix_spawnattr_destroy(&attr); free(exe);
     if (rc != 0) { hlog(@"子进程启动失败 %s", strerror(rc)); return -1; }
-    int stt = 0; waitpid(pid, &stt, 0);
+    int stt = 0, i = 0;
+    for (; i < 50 && waitpid(pid, &stt, WNOHANG) == 0; i++) usleep(100 * 1000); // 最多等 5 秒
+    if (i >= 50) { kill(pid, SIGKILL); waitpid(pid, &stt, 0); hlog(@"子进程 5 秒没结束,已结束它"); return -2; }
     return WIFEXITED(stt) ? WEXITSTATUS(stt) : 100 + (WIFSIGNALED(stt) ? WTERMSIG(stt) : 0);
 }
 // 子进程入口:写剪贴板,读回一致返回 0
