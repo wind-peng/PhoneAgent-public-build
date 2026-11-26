@@ -14,7 +14,7 @@
 #define WD(o, s, v)     ((void (*)(id, SEL, double))objc_msgSend)((o), sel_registerName(s), (v))
 #define WR(o, s, v)     ((void (*)(id, SEL, CGRect))objc_msgSend)((o), sel_registerName(s), (v))
 
-static const double kWinK = 0.3;          // 小窗缩放
+static double kWinK = 0.3;                // 小窗缩放(lab15 起悬浮层里可拖着改大小)
 static id gWScene, gWPresenter;           // 只在主线程读写
 static UIView *gWView;
 static UIWindow *gWWin;
@@ -25,7 +25,21 @@ static volatile BOOL gPAFront = YES;       // PhoneAgent 在前台(进后台后�
 static BOOL gWHud = NO;                    // lab14:在悬浮层进程里(小窗盖在所有界面上,不用管 PhoneAgent 在不在前台)
 
 // lab14:悬浮层进程把自己的系统级窗口交给小窗用
-void winSetHostWindow(UIWindow *w) { gWWin = w; gWHud = YES; gPAFront = YES; }
+static UIView *gWHost;                     // lab15:小窗画面放进这个视图(悬浮层里顶上留出拖动条)
+void winSetHostWindow(UIWindow *w, UIView *host) { gWWin = w; gWHost = host; gWHud = YES; gPAFront = YES; }
+// lab15:改小窗缩放(主线程)
+void winSetScale(double k) {
+    kWinK = k;
+    if (gWView) gWView.transform = CGAffineTransformMakeScale(k, k);
+}
+double winScale(void) { return kWinK; }
+// 小窗画面左上角的屏幕坐标(拖动后要重算,点击按它换算)。主线程调用
+void winRefreshOrigin(void) {
+    if (!gWWin) return;
+    UIView *h = gWHost ?: gWWin.rootViewController.view;
+    CGPoint p = [h convertPoint:CGPointZero toView:nil];
+    gWOX = gWWin.frame.origin.x + p.x; gWOY = gWWin.frame.origin.y + p.y;
+}
 
 static Class wC(NSString *n) { return NSClassFromString(n); }
 static BOOL wHas(id o, const char *s) { return o && [o respondsToSelector:sel_registerName(s)]; }
@@ -153,9 +167,9 @@ static NSString *wBuildScene(NSString *bid, id identity, id predicate, id manage
         pv.frame = full;
         pv.layer.anchorPoint = CGPointZero; pv.layer.position = CGPointZero;
         pv.transform = CGAffineTransformMakeScale(kWinK, kWinK);
-        [win.rootViewController.view addSubview:pv];
+        [(gWHost ?: win.rootViewController.view) addSubview:pv];
         win.hidden = NO;
-        gWOX = win.frame.origin.x; gWOY = win.frame.origin.y;
+        winRefreshOrigin();
         gWScene = scene; gWPresenter = presenter; gWView = pv; gWBid = [bid copy];
         gWActive = YES;
         return nil;

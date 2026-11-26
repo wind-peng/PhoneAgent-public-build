@@ -741,14 +741,14 @@ static NSUInteger gHudShown;
     [NSUserDefaults.standardUserDefaults setObject:bid forKey:@"scenelab_bid"];
     if (self.presView) [self onClose];
     [self log:[NSString stringWithFormat:@"== 14 悬浮测试 %@:%@", bid, hudStart(bid)]];
-    [self log:@"悬浮窗出来后,按提示回主屏或开别的 App,10 秒后它会自己点。日志回到这页再看"];
+    [self log:@"悬浮窗出来后回主屏或开别的 App,试试拖橙条移动、拖右边「⤡」放大缩小;20 秒后它会自己点。日志回到这页再看"];
     gHudShown = 0;
     [gHudTimer invalidate];
     __weak SceneLabVC *ws = self;
     __block int ticks = 0;
     gHudTimer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) {
         SceneLabVC *me = ws;
-        if (!me || ++ticks > 240) { [t invalidate]; return; }
+        if (!me || ++ticks > 330) { [t invalidate]; return; }
         NSString *all = hudReadLog();
         if (all.length > gHudShown) {
             NSString *add = [all substringFromIndex:gHudShown];

@@ -134,7 +134,10 @@ BOOL winOpen(NSString *bid, NSString **note);
 void winClose(void);
 void winKill(NSString *bid);
 UIImage *winSnapshot(NSString **err);
-void winSetHostWindow(UIWindow *w);
+void winSetHostWindow(UIWindow *w, UIView *host);
+void winRefreshOrigin(void);
+void winSetScale(double k);
+double winScale(void);
 // lab14 悬浮层(pahud.m)
 int paHudMain(int argc, char *argv[]);
 int paHudExitMain(void);

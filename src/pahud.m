@@ -22,6 +22,7 @@ extern int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t *__restric
 #define HUD_PID @"/var/mobile/Library/Caches/pa_hud.pid"
 
 static NSString *gHudBid;
+static UIWindow *gHudWin;
 
 // ---------- 悬浮层进程里写日志(PhoneAgent 那边读) ----------
 static void hlog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
@@ -83,10 +84,11 @@ static void hudFlow(void) {
     hlog(@"h1 ✓ %@", note ?: @"");
     NSString *he = loadHID();
     if (he.length) { hlog(@"HID 加载失败:%@", he); return; }
-    for (int i = 10; i > 0; i -= 2) {
-        hlog(@"h2 现在请回到主屏或打开别的 App,看悬浮窗还在不在(%d 秒后开始自动点)", i);
-        sleep(2);
+    for (int i = 20; i > 0; i -= 4) {
+        hlog(@"h2 回主屏或开别的 App;按住橙条左边拖=移动,按住右边「⤡」拖=放大缩小(%d 秒后开始自动点)", i);
+        sleep(4);
     }
+    hlog(@"h3 开始自动点:小窗左上角 (%.0f,%.0f) 缩放 %.0f%%", gHudWin.frame.origin.x, gHudWin.frame.origin.y, winScale() * 100);
     NSArray *s0 = hOCR();
     hlog(@"m1 快照 OCR %lu 条:%@", (unsigned long)s0.count, hTexts(s0, 6));
     if (![gHudBid isEqualToString:@"com.apple.Preferences"]) {
@@ -129,7 +131,62 @@ static void hudFlow(void) {
         NSString *t3 = hTexts(s3, 8);
         hlog(@"m8 打字后:%@ —— %@", t3, [t3 containsString:@"蓝牙"] ? @"✓ 看到「蓝牙」" : @"✗ 没看到「蓝牙」");
     }
-    hlog(@"== 全流程完。告诉我:测试时你在哪个界面、悬浮窗在不在、键盘弹在哪。悬浮窗 3 分钟后自动关,或在实验页点「14 关」");
+    hlog(@"== 全流程完。告诉我:测试时你在哪个界面、悬浮窗在不在、键盘弹在哪。悬浮窗 5 分钟后自动关,或在实验页点「14 关」");
+}
+
+// ---------- lab15:拖动 / 放大缩小 ----------
+#define HUD_BAR 26.0
+static UIView *gHudBar, *gHudContent;
+static int gDragMode = 0;           // 0 没拖;1 移动;2 改大小
+static CGPoint gDragP0, gDragO0;
+static double gDragK0;
+
+// 主线程:按左上角和缩放重新摆小窗
+static void hudLayout(CGPoint o, double k) {
+    CGSize sc = UIScreen.mainScreen.bounds.size;
+    k = MAX(0.2, MIN(0.85, k));
+    CGFloat w = round(sc.width * k), h = round(sc.height * k);
+    o.x = MAX(0, MIN(sc.width - w, o.x));
+    o.y = MAX(0, MIN(sc.height - h - HUD_BAR, o.y));
+    gHudWin.frame = CGRectMake(o.x, o.y, w, h + HUD_BAR);
+    gHudWin.rootViewController.view.frame = gHudWin.bounds;
+    gHudBar.frame = CGRectMake(0, 0, w, HUD_BAR);
+    [gHudBar viewWithTag:1].frame = CGRectMake(0, 0, w * 0.6, HUD_BAR);
+    [gHudBar viewWithTag:2].frame = CGRectMake(w * 0.6, 0, w * 0.4, HUD_BAR);
+    gHudContent.frame = CGRectMake(0, HUD_BAR, w, h);
+    winSetScale(k);
+    winRefreshOrigin();
+}
+
+static Class gAXRep;
+// 悬浮层收到的触摸(只有落在我们自己窗口上的才会送来,小窗里 App 画面上的触摸直接给那个 App)
+static void hudHIDCallback(void *target, void *refcon, void *service, void *event) {
+    if (!event || !gAXRep) return;
+    id rep = ((id (*)(id, SEL, void *, id))objc_msgSend)(gAXRep, sel_registerName("representationWithHIDEvent:hidStreamIdentifier:"), event, @"UIApplicationEvents");
+    if (!rep) return;
+    CGPoint p = ((CGPoint (*)(id, SEL))objc_msgSend)(rep, sel_registerName("location"));
+    BOOL down = ((BOOL (*)(id, SEL))objc_msgSend)(rep, sel_registerName("isTouchDown"));
+    BOOL move = ((BOOL (*)(id, SEL))objc_msgSend)(rep, sel_registerName("isMove"));
+    BOOL lift = ((BOOL (*)(id, SEL))objc_msgSend)(rep, sel_registerName("isLift")) || ((BOOL (*)(id, SEL))objc_msgSend)(rep, sel_registerName("isCancel"));
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!gHudWin) return;
+        CGRect f = gHudWin.frame;
+        if (down) {
+            CGRect bar = CGRectMake(f.origin.x, f.origin.y, f.size.width, HUD_BAR + 6);
+            if (CGRectContainsPoint(bar, p)) {
+                gDragMode = (p.x > f.origin.x + f.size.width * 0.55) ? 2 : 1;
+                gDragP0 = p; gDragO0 = f.origin; gDragK0 = winScale();
+            } else gDragMode = 0;
+        } else if (move && gDragMode) {
+            CGSize sc = UIScreen.mainScreen.bounds.size;
+            double dx = p.x - gDragP0.x, dy = p.y - gDragP0.y;
+            if (gDragMode == 1) hudLayout(CGPointMake(gDragO0.x + dx, gDragO0.y + dy), gDragK0);
+            else hudLayout(gDragO0, gDragK0 + (dx / sc.width + dy / sc.height) / 2);
+        } else if (lift && gDragMode) {
+            hlog(@"小窗%@:左上角 (%.0f,%.0f) 缩放 %.0f%%", gDragMode == 1 ? @"移动" : @"改大小", gHudWin.frame.origin.x, gHudWin.frame.origin.y, winScale() * 100);
+            gDragMode = 0;
+        }
+    });
 }
 
 @interface PAHudDelegate : UIResponder <UIApplicationDelegate>
@@ -141,17 +198,32 @@ static void hudFlow(void) {
     hlog(@"悬浮层进程启动 pid=%d uid=%d", getpid(), getuid());
     @try {
         CGSize sc = UIScreen.mainScreen.bounds.size;
-        CGFloat w = round(sc.width * 0.3), h = round(sc.height * 0.3);
-        PAHudWindow *win = [[PAHudWindow alloc] initWithFrame:CGRectMake(sc.width - w - 8, 54, w, h)];
+        PAHudWindow *win = [[PAHudWindow alloc] initWithFrame:CGRectMake(sc.width - round(sc.width * 0.3) - 8, 54, 10, 10)];
         win.rootViewController = [UIViewController new];
         win.rootViewController.view.backgroundColor = UIColor.blackColor;
-        win.rootViewController.view.clipsToBounds = YES;
         win.layer.borderWidth = 1.5; win.layer.borderColor = UIColor.systemOrangeColor.CGColor;
+        win.layer.cornerRadius = 6;
         win.clipsToBounds = YES;
+        // 顶上的拖动条:左边按住拖=移动,右边「⤡」按住拖=放大缩小
+        UIView *bar = [UIView new];
+        bar.backgroundColor = UIColor.systemOrangeColor;
+        UILabel *l1 = [UILabel new]; l1.text = @" ≡ 拖动"; l1.font = [UIFont boldSystemFontOfSize:12]; l1.textColor = UIColor.whiteColor;
+        UILabel *l2 = [UILabel new]; l2.text = @"⤡ "; l2.font = [UIFont boldSystemFontOfSize:16]; l2.textColor = UIColor.whiteColor; l2.textAlignment = NSTextAlignmentRight;
+        l1.tag = 1; l2.tag = 2;
+        [bar addSubview:l1]; [bar addSubview:l2];
+        UIView *content = [UIView new];
+        content.backgroundColor = UIColor.blackColor;
+        content.clipsToBounds = YES;
+        [win.rootViewController.view addSubview:content];
+        [win.rootViewController.view addSubview:bar];
+        gHudBar = bar; gHudContent = content;
         win.windowLevel = 10000010.0;
         win.hidden = NO;
         [win makeKeyAndVisible];
         self.window = win;
+        gHudWin = win;
+        winSetHostWindow(win, content);
+        hudLayout(win.frame.origin, 0.3);
         dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_NOW);
         Class HC = NSClassFromString(@"SBSAccessibilityWindowHostingController");
         unsigned int cid = [win respondsToSelector:sel_registerName("_contextId")] ? ((unsigned int (*)(id, SEL))objc_msgSend)(win, sel_registerName("_contextId")) : 0;
@@ -160,13 +232,12 @@ static void hudFlow(void) {
             ((void (*)(id, SEL, unsigned int, double))objc_msgSend)(self.hosting, sel_registerName("registerWindowWithContextID:atLevel:"), cid, win.windowLevel);
             hlog(@"悬浮窗已登记 context=%u", cid);
         } else hlog(@"✗ 登记悬浮窗失败 HC=%@ context=%u", HC, cid);
-        winSetHostWindow(win);
     } @catch (NSException *e) { hlog(@"✗ 建悬浮窗异常 %@", e.reason ?: e.name); }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @try { hudFlow(); } @catch (NSException *e) { hlog(@"✗ 流程异常 %@", e.reason ?: e.name); }
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(180 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        hlog(@"3 分钟到,悬浮层退出");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        hlog(@"5 分钟到,悬浮层退出");
         winClose();
         exit(0);
     });
@@ -211,6 +282,11 @@ int paHudMain(int argc, char *argv[]) {
         [NSRunLoop currentRunLoop];
         if (GSEvInit) GSEvInit(0);
         if (GSPush) GSPush(kCFRunLoopDefaultMode);
+        [[NSBundle bundleWithPath:@"/System/Library/PrivateFrameworks/AccessibilityUtilities.framework"] load];
+        gAXRep = NSClassFromString(@"AXEventRepresentation");
+        void *(*BKSReg)(void *) = bk ? dlsym(bk, "BKSHIDEventRegisterEventCallback") : NULL;
+        if (BKSReg && gAXRep) { BKSReg((void *)hudHIDCallback); hlog(@"触摸回调已接上(可拖动/改大小)"); }
+        else hlog(@"✗ 触摸回调没接上 BKSReg=%p AX=%@", BKSReg, gAXRep);
         hlog(@"UIKit 初始化完成,进入运行");
         ((void (*)(id, SEL))objc_msgSend)(UIApplication.sharedApplication, sel_registerName("__completeAndRunAsPlugin"));
         CFRunLoopRun();
