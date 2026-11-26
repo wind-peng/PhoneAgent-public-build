@@ -22,6 +22,10 @@ static NSString *gWBid;
 static volatile BOOL gWActive = NO;
 static volatile double gWOX = 0, gWOY = 0; // 小窗左上角(屏幕 pt)
 static volatile BOOL gPAFront = YES;       // PhoneAgent 在前台(进后台后不再发触摸,免得点到别的 App)
+static BOOL gWHud = NO;                    // lab14:在悬浮层进程里(小窗盖在所有界面上,不用管 PhoneAgent 在不在前台)
+
+// lab14:悬浮层进程把自己的系统级窗口交给小窗用
+void winSetHostWindow(UIWindow *w) { gWWin = w; gWHud = YES; gPAFront = YES; }
 
 static Class wC(NSString *n) { return NSClassFromString(n); }
 static BOOL wHas(id o, const char *s) { return o && [o respondsToSelector:sel_registerName(s)]; }
@@ -41,6 +45,7 @@ void winMapNorm(double *nx, double *ny) {
 }
 
 static void wWatchFront(void) {
+    if (gWHud) return;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         wMain(^{ gPAFront = UIApplication.sharedApplication.applicationState != UIApplicationStateBackground; });

@@ -82,6 +82,11 @@ static void labUncaught(NSException *e) {
         [self btn:@"7 全流程" sel:@selector(onFlow)],
         [self btn:@"关闭" sel:@selector(onClose)]]];
     btns.axis = UILayoutConstraintAxisHorizontal; btns.distribution = UIStackViewDistributionFillEqually;
+    // lab14:悬浮层(盖在主屏和其他 App 上)
+    UIStackView *btns2 = [[UIStackView alloc] initWithArrangedSubviews:@[
+        [self btn:@"14 悬浮测试" sel:@selector(onHud)],
+        [self btn:@"14 关悬浮" sel:@selector(onHudStop)]]];
+    btns2.axis = UILayoutConstraintAxisHorizontal; btns2.distribution = UIStackViewDistributionFillEqually;
     self.host = [UIView new];
     self.host.backgroundColor = UIColor.secondarySystemBackgroundColor;
     self.host.layer.borderWidth = 1; self.host.layer.borderColor = UIColor.separatorColor.CGColor;
@@ -93,7 +98,7 @@ static void labUncaught(NSException *e) {
     self.logTV.text = last.length ? [NSString stringWithFormat:@"(上次日志,若中途闪退看最后一行)\n%@\n----\n", last] : @"";
     gLabLog = [NSMutableString string];
     NSSetUncaughtExceptionHandler(&labUncaught);
-    for (UIView *v in @[self.bidField, btns, self.host, self.logTV]) { v.translatesAutoresizingMaskIntoConstraints = NO; [self.view addSubview:v]; }
+    for (UIView *v in @[self.bidField, btns, btns2, self.host, self.logTV]) { v.translatesAutoresizingMaskIntoConstraints = NO; [self.view addSubview:v]; }
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
         [self.bidField.topAnchor constraintEqualToAnchor:g.topAnchor constant:8],
@@ -102,7 +107,10 @@ static void labUncaught(NSException *e) {
         [btns.topAnchor constraintEqualToAnchor:self.bidField.bottomAnchor constant:6],
         [btns.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:12],
         [btns.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-12],
-        [self.host.topAnchor constraintEqualToAnchor:btns.bottomAnchor constant:6],
+        [btns2.topAnchor constraintEqualToAnchor:btns.bottomAnchor constant:4],
+        [btns2.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:12],
+        [btns2.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-12],
+        [self.host.topAnchor constraintEqualToAnchor:btns2.bottomAnchor constant:6],
         [self.host.centerXAnchor constraintEqualToAnchor:g.centerXAnchor],
         [self.host.widthAnchor constraintEqualToAnchor:g.widthAnchor multiplier:0.62],
         [self.host.heightAnchor constraintEqualToAnchor:self.host.widthAnchor multiplier:UIScreen.mainScreen.bounds.size.height / UIScreen.mainScreen.bounds.size.width],
@@ -721,6 +729,41 @@ static NSDictionary *lab_find(NSArray *items, NSString *want, double maxY) {
             [NSThread sleepForTimeInterval:0.8];
         } else [self log:@"k0 没有在跑的同名进程"];
     } @catch (NSException *e) { [self log:[NSString stringWithFormat:@"k0 异常 %@", e.reason]]; }
+}
+
+// lab14:用 root 身份再启动一份自己当悬浮层,小窗盖在主屏和其他 App 上;悬浮层自己跑测试,日志写文件,这里每秒读一次
+static NSTimer *gHudTimer;
+static NSUInteger gHudShown;
+- (void)onHud {
+    [self.view endEditing:YES];
+    NSString *bid = [self.bidField.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    if (!bid.length) bid = @"com.apple.Preferences";
+    [NSUserDefaults.standardUserDefaults setObject:bid forKey:@"scenelab_bid"];
+    if (self.presView) [self onClose];
+    [self log:[NSString stringWithFormat:@"== 14 悬浮测试 %@:%@", bid, hudStart(bid)]];
+    [self log:@"悬浮窗出来后,按提示回主屏或开别的 App,10 秒后它会自己点。日志回到这页再看"];
+    gHudShown = 0;
+    [gHudTimer invalidate];
+    __weak SceneLabVC *ws = self;
+    __block int ticks = 0;
+    gHudTimer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) {
+        SceneLabVC *me = ws;
+        if (!me || ++ticks > 240) { [t invalidate]; return; }
+        NSString *all = hudReadLog();
+        if (all.length > gHudShown) {
+            NSString *add = [all substringFromIndex:gHudShown];
+            gHudShown = all.length;
+            [me log:[add stringByTrimmingCharactersInSet:NSCharacterSet.newlineCharacterSet]];
+        }
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:gHudTimer forMode:NSRunLoopCommonModes];
+    // 5 秒还没日志,多半是悬浮层进程一启动就挂了
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (hudReadLog().length == 0) [ws log:@"✗ 5 秒没有悬浮层日志,进程可能没起来或一启动就闪退"];
+    });
+}
+- (void)onHudStop {
+    [self log:[NSString stringWithFormat:@"14 关悬浮:%@", hudStop()]];
 }
 
 - (void)onEmbedDefault { self.useDefaultSID = YES; [self onEmbed]; }

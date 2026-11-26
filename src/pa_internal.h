@@ -134,6 +134,13 @@ BOOL winOpen(NSString *bid, NSString **note);
 void winClose(void);
 void winKill(NSString *bid);
 UIImage *winSnapshot(NSString **err);
+void winSetHostWindow(UIWindow *w);
+// lab14 悬浮层(pahud.m)
+int paHudMain(int argc, char *argv[]);
+int paHudExitMain(void);
+NSString *hudStart(NSString *bid);
+NSString *hudStop(void);
+NSString *hudReadLog(void);
 void touchAdjust(double *x, double *y);
 void doTapRaw(double x, double y);
 void doSwipeSmooth(double x1, double y1, double x2, double y2, int ms, int holdMs);
