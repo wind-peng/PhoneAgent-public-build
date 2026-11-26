@@ -143,13 +143,22 @@ static void hudFlow(void) {
         hlog(@"m6 点搜索框 App(%@,%@)", sf[@"x"], sf[@"y"]);
         doTapRaw([sf[@"x"] doubleValue], [sf[@"y"] doubleValue]);
         usleep(1200 * 1000);
-        // lab17:root 写不进剪贴板(lab15/16 实测,切身份、mobile 子进程都不行),改请 PhoneAgent 本体代写
-        NSString *r = hudClipViaPA(@"蓝牙");
-        hlog(@"m7 请 PhoneAgent 写「蓝牙」:%@,发 Cmd+V", r);
+        // lab18:加了系统用的剪贴板后台权限(com.apple.Pasteboard.background-access)。①悬浮层自己写;②请 PhoneAgent 代写
+        __block BOOL pbOK = NO;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            @try { UIPasteboard.generalPasteboard.string = @"蓝牙"; pbOK = [UIPasteboard.generalPasteboard.string isEqualToString:@"蓝牙"]; } @catch (NSException *e) {}
+        });
+        hlog(@"m7a 悬浮层自己写「蓝牙」:读回%@,发 Cmd+V", pbOK ? @"一致" : @"不一致");
         doCmdKey(0x19);
         usleep(1800 * 1000);
         NSString *t3 = hTexts(hOCR(), 8);
-        hlog(@"m8 粘贴后:%@ —— %@", t3, [t3 containsString:@"蓝牙"] ? @"✓ 能打字了" : @"✗ 没看到「蓝牙」");
+        hlog(@"m8a 粘贴后:%@ —— %@", t3, [t3 containsString:@"蓝牙"] ? @"✓ ①能用" : @"✗ ①不行");
+        NSString *r = hudClipViaPA(@"无线");
+        hlog(@"m7b 请 PhoneAgent 写「无线」:%@,发 Cmd+V", r);
+        doCmdKey(0x19);
+        usleep(1800 * 1000);
+        NSString *t4 = hTexts(hOCR(), 8);
+        hlog(@"m8b 粘贴后:%@ —— %@", t4, [t4 containsString:@"无线"] ? @"✓ ②能用" : @"✗ ②不行");
     }
     hlog(@"== 全流程完。告诉我:测试时你在哪个界面、悬浮窗在不在、键盘弹在哪。悬浮窗 5 分钟后自动关,或在实验页点「14 关」");
 }

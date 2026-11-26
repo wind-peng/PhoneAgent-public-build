@@ -35,5 +35,8 @@
   <key>com.apple.springboard.accessibility-window-hosting</key><true/>
   <key>com.apple.private.kernel.jetsam</key><true/>
   <key>com.apple.private.memorystatus</key><true/>
+  <key>com.apple.Pasteboard.background-access</key><true/>
+  <key>com.apple.Pasteboard.paste-unchecked</key><true/>
+  <key>com.apple.Pasteboard.trusted-bundle-layout</key><true/>
 </dict>
 </plist>
