@@ -4,7 +4,7 @@
 <dict>
   <key>CFBundleDevelopmentRegion</key><string>en</string>
   <key>CFBundleExecutable</key><string>PhoneAgentBroadcast</string>
-  <key>CFBundleIdentifier</key><string>com.example.phoneagent.lab.broadcast</string>
+  <key>CFBundleIdentifier</key><string>com.example.phoneagent.broadcast</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>PhoneAgent</string>
   <key>CFBundleDisplayName</key><string>PhoneAgent</string>

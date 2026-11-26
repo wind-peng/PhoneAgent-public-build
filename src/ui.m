@@ -805,7 +805,7 @@ static NSData *attachJPEG(UIImage *img) {
     // 屏幕广播(截屏必需)
     UILabel *bl = [UILabel new];
     bl.numberOfLines = 0; bl.font = [UIFont systemFontOfSize:14];
-    bl.text = @"屏幕广播(截屏必需):点右边按钮 → 选 PA实验 → 开始直播";
+    bl.text = @"屏幕广播(截屏必需):点右边按钮 → 选 PhoneAgent → 开始直播";
     RPSystemBroadcastPickerView *pv = [[RPSystemBroadcastPickerView alloc] initWithFrame:CGRectMake(0, 0, 56, 56)];
     pv.preferredExtension = [NSBundle.mainBundle.bundleIdentifier stringByAppendingString:@".broadcast"];
     pv.showsMicrophoneButton = NO;

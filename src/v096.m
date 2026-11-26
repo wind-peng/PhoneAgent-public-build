@@ -230,7 +230,7 @@ NSDictionary *gResumeCP;
 
 static NSString *cpPath(void) {
     NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: NSTemporaryDirectory();
-    return [doc stringByAppendingPathComponent:@"pa_checkpoint_lab.json"];
+    return [doc stringByAppendingPathComponent:@"pa_checkpoint.json"];
 }
 void cpSave(NSDictionary *d) {
     if (!paOn(@"checkpoint_on", YES) || !d) return;
