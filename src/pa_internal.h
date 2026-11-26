@@ -145,6 +145,7 @@ int paClipMain(int argc, char *argv[]);
 NSString *hudStart(NSString *bid);
 NSString *hudStop(void);
 NSString *hudReadLog(void);
+NSString *hudKey(void);
 void touchAdjust(double *x, double *y);
 void doTapRaw(double x, double y);
 void doSwipeSmooth(double x1, double y1, double x2, double y2, int ms, int holdMs);

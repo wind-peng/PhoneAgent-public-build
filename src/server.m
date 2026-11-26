@@ -105,6 +105,19 @@ static void handleClient(int c) {
         sendJSON(c, 200, @{@"ok": @YES, @"cmd": gBroadcastStopRequested ? @"stop" : @""});
         return;
     }
+    // lab17:悬浮层(root)写不进剪贴板,改由 PhoneAgent 本体代写。钥匙是启动悬浮层时随机生成、经参数交给它的
+    if ([path isEqualToString:@"/clip"]) {
+        NSString *k = hudKey();
+        if (!k.length || ![q[@"key"] isEqualToString:k]) { sendJSON(c, 403, @{@"ok": @NO}); return; }
+        NSString *t = body.length ? [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding] : q[@"t"];
+        __block NSString *back = nil; __block long st = -1;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            st = (long)UIApplication.sharedApplication.applicationState;
+            @try { UIPasteboard.generalPasteboard.string = t ?: @""; back = UIPasteboard.generalPasteboard.string; } @catch (NSException *e) {}
+        });
+        sendJSON(c, 200, @{@"ok": @([back isEqualToString:t]), @"state": @(st)});
+        return;
+    }
     if (![q[@"token"] isEqualToString:gToken]) {
         sendJSON(c, 403, @{@"ok": @NO, @"error": @"token 不对"});
         return;

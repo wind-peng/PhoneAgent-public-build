@@ -21,7 +21,7 @@ extern int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t *__restric
 #define HUD_LOG @"/var/mobile/Library/Caches/pa_hud.log"
 #define HUD_PID @"/var/mobile/Library/Caches/pa_hud.pid"
 
-static NSString *gHudBid;
+static NSString *gHudBid, *gHudPAKey;
 static int hudClipChild(NSString *text);
 static UIWindow *gHudWin;
 
@@ -77,6 +77,28 @@ static NSArray *hOCR(void) {
     return r ?: @[];
 }
 
+// 请 PhoneAgent 本体(mobile 身份的正常 App)写剪贴板,返回说明
+static NSString *hudClipViaPA(NSString *text) {
+    NSString *u = [NSString stringWithFormat:@"http://127.0.0.1:%d/clip?key=%@", PORT, gHudPAKey ?: @""];
+    NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:u]];
+    rq.HTTPMethod = @"POST"; rq.HTTPBody = [text dataUsingEncoding:NSUTF8StringEncoding]; rq.timeoutInterval = 4;
+    __block NSString *res = @"没回应(PhoneAgent 可能被系统挂起)";
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[NSURLSession.sharedSession dataTaskWithRequest:rq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        if (d) {
+            NSDictionary *j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+            if ([j isKindOfClass:NSDictionary.class]) {
+                long st = [j[@"state"] longValue];
+                res = [NSString stringWithFormat:@"%@(PhoneAgent 状态:%@)", [j[@"ok"] boolValue] ? @"写入成功" : @"写入失败",
+                       st == 0 ? @"前台" : st == 1 ? @"非活跃" : st == 2 ? @"后台" : @"未知"];
+            } else res = [NSString stringWithFormat:@"回应看不懂 HTTP %ld", (long)((NSHTTPURLResponse *)r).statusCode];
+        } else if (e) res = [NSString stringWithFormat:@"连不上:%@", e.localizedDescription];
+        dispatch_semaphore_signal(sem);
+    }] resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)));
+    return res;
+}
+
 // 测试流程(后台线程)。点击/滑动传 App 里的坐标,sendFinger 会按小窗位置换算
 static void hudFlow(void) {
     NSString *note = nil;
@@ -121,26 +143,13 @@ static void hudFlow(void) {
         hlog(@"m6 点搜索框 App(%@,%@)", sf[@"x"], sf[@"y"]);
         doTapRaw([sf[@"x"] doubleValue], [sf[@"y"] doubleValue]);
         usleep(1200 * 1000);
-        // lab16:悬浮层是 root,直接写剪贴板写不进(lab15 实测)。试两种:①临时切成 mobile 身份写;②起一个 mobile 身份的子进程写
-        __block BOOL pbOK = NO;
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            uid_t old = geteuid();
-            int r = seteuid(501);
-            @try { UIPasteboard.generalPasteboard.string = @"蓝牙"; pbOK = [UIPasteboard.generalPasteboard.string isEqualToString:@"蓝牙"]; } @catch (NSException *e) {}
-            if (r == 0) seteuid(old);
-        });
-        hlog(@"m7a 切 mobile 身份写「蓝牙」:读回%@,发 Cmd+V", pbOK ? @"一致" : @"不一致");
+        // lab17:root 写不进剪贴板(lab15/16 实测,切身份、mobile 子进程都不行),改请 PhoneAgent 本体代写
+        NSString *r = hudClipViaPA(@"蓝牙");
+        hlog(@"m7 请 PhoneAgent 写「蓝牙」:%@,发 Cmd+V", r);
         doCmdKey(0x19);
         usleep(1800 * 1000);
         NSString *t3 = hTexts(hOCR(), 8);
-        BOOL a = [t3 containsString:@"蓝牙"];
-        hlog(@"m8a 粘贴后:%@ —— %@", t3, a ? @"✓ ①能用" : @"✗ ①不行");
-        int st = hudClipChild(@"无线");
-        hlog(@"m7b 子进程(mobile)写「无线」:退出码 %d(0=读回一致),发 Cmd+V", st);
-        doCmdKey(0x19);
-        usleep(1800 * 1000);
-        NSString *t4 = hTexts(hOCR(), 8);
-        hlog(@"m8b 粘贴后:%@ —— %@", t4, [t4 containsString:@"无线"] ? @"✓ ②能用" : @"✗ ②不行");
+        hlog(@"m8 粘贴后:%@ —— %@", t3, [t3 containsString:@"蓝牙"] ? @"✓ 能打字了" : @"✗ 没看到「蓝牙」");
     }
     hlog(@"== 全流程完。告诉我:测试时你在哪个界面、悬浮窗在不在、键盘弹在哪。悬浮窗 5 分钟后自动关,或在实验页点「14 关」");
 }
@@ -264,6 +273,7 @@ static void hudUncaught(NSException *e) {
 int paHudMain(int argc, char *argv[]) {
     @autoreleasepool {
         gHudBid = argc > 2 ? [NSString stringWithUTF8String:argv[2]] : @"com.apple.Preferences";
+        gHudPAKey = argc > 3 ? [NSString stringWithUTF8String:argv[3]] : @"";
         [[NSString stringWithFormat:@"%d", getpid()] writeToFile:HUD_PID atomically:YES encoding:NSUTF8StringEncoding error:nil];
         chmod(HUD_PID.UTF8String, 0666);
         NSSetUncaughtExceptionHandler(&hudUncaught);
@@ -314,7 +324,7 @@ int paHudExitMain(void) {
 }
 
 // ---------- PhoneAgent 这边:用 root 身份再启动自己一份 ----------
-static NSString *hudSpawn(const char *arg, const char *arg2, BOOL wait) {
+static NSString *hudSpawn(const char *arg, const char *arg2, const char *arg3, BOOL wait) {
     uint32_t sz = 0; _NSGetExecutablePath(NULL, &sz);
     char *exe = calloc(1, sz + 1); _NSGetExecutablePath(exe, &sz);
     posix_spawnattr_t attr; posix_spawnattr_init(&attr);
@@ -322,7 +332,7 @@ static NSString *hudSpawn(const char *arg, const char *arg2, BOOL wait) {
     posix_spawnattr_set_persona_uid_np(&attr, 0);
     posix_spawnattr_set_persona_gid_np(&attr, 0);
     if (!wait) { posix_spawnattr_setpgroup(&attr, 0); posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP); }
-    const char *args[] = { exe, arg, arg2, NULL };
+    const char *args[] = { exe, arg, arg2, arg3, NULL };
     pid_t pid = 0;
     int rc = posix_spawn(&pid, exe, NULL, &attr, (char **)args, environ);
     posix_spawnattr_destroy(&attr);
@@ -333,12 +343,15 @@ static NSString *hudSpawn(const char *arg, const char *arg2, BOOL wait) {
     return [NSString stringWithFormat:@"已启动 pid=%d", pid];
 }
 
+static NSString *gHudKey;
+NSString *hudKey(void) { return gHudKey; }
 NSString *hudStart(NSString *bid) {
     unlink(HUD_LOG.UTF8String);
-    hudSpawn("-pahudexit", NULL, YES);
-    return hudSpawn("-pahud", bid.UTF8String ?: "com.apple.Preferences", NO);
+    hudSpawn("-pahudexit", NULL, NULL, YES);
+    gHudKey = [[NSUUID UUID].UUIDString stringByReplacingOccurrencesOfString:@"-" withString:@""];
+    return hudSpawn("-pahud", bid.UTF8String ?: "com.apple.Preferences", gHudKey.UTF8String, NO);
 }
-NSString *hudStop(void) { return hudSpawn("-pahudexit", NULL, YES); }
+NSString *hudStop(void) { return hudSpawn("-pahudexit", NULL, NULL, YES); }
 NSString *hudReadLog(void) { return [NSString stringWithContentsOfFile:HUD_LOG encoding:NSUTF8StringEncoding error:nil] ?: @""; }
 
 // lab16:以 mobile(uid 501)身份起一个子进程写剪贴板,返回子进程退出码
