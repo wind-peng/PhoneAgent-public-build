@@ -634,13 +634,15 @@ static NSString *lab_texts(NSArray *items, int n) {
     for (NSDictionary *it in items) { if ((int)t.count >= n) break; NSString *s = [it[@"text"] description]; if (s.length) [t addObject:s]; }
     return [t componentsJoinedByString:@" | "];
 }
+// lab11:OCR 常把图标认成杂字粘在前面(如「©通用」「Q搜索」「<设置」),所以按"包含"匹配,并优先选最短的那条
 static NSDictionary *lab_find(NSArray *items, NSString *want, double maxY) {
-    NSDictionary *best = nil;
+    NSDictionary *best = nil; NSUInteger bestLen = NSUIntegerMax;
     for (NSDictionary *it in items) {
         NSString *s = [[it[@"text"] description] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
         if (maxY > 0 && [it[@"y"] doubleValue] > maxY) continue;
-        if ([s isEqualToString:want]) return it;
-        if (!best && [s hasPrefix:want] && s.length <= want.length + 3) best = it;
+        if ([s rangeOfString:want].location == NSNotFound) continue;
+        if (s.length > want.length + 4) continue;   // 太长的(比如一整句)不算
+        if (s.length < bestLen) { best = it; bestLen = s.length; }
     }
     return best;
 }
@@ -660,7 +662,7 @@ static NSDictionary *lab_find(NSArray *items, NSString *want, double maxY) {
         NSArray *s0 = [self snapOCR];
         [self log:[NSString stringWithFormat:@"m1 快照 OCR %lu 条:%@", (unsigned long)s0.count, lab_texts(s0, 6)]];
         NSDictionary *g = lab_find(s0, @"通用", 0);
-        if (!g) { [self log:@"m1 没找到「通用」(可能不在首页,先手动回到设置首页再试)"]; return; }
+        if (!g) { [self log:[NSString stringWithFormat:@"m1 没找到「通用」。全部 OCR:%@", lab_texts(s0, 40)]]; return; }
         [self log:[NSString stringWithFormat:@"m2 「通用」在 App 里 (%@,%@) → 屏幕 (%.0f,%.0f),程序点", g[@"x"], g[@"y"], o.x + [g[@"x"] doubleValue] * K, o.y + [g[@"y"] doubleValue] * K]];
         tapApp([g[@"x"] doubleValue], [g[@"y"] doubleValue]);
         usleep(1500 * 1000);
