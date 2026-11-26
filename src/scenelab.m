@@ -27,11 +27,25 @@ static BOOL lab_has(id o, const char *s) { return o && [o respondsToSelector:sel
 @end
 
 @implementation SceneLabVC
+static NSMutableString *gLabLog;
+static void labUncaught(NSException *e) {
+    NSString *t = [NSString stringWithFormat:@"!! 未捕获异常:%@ %@\n%@", e.name, e.reason,
+                   [[e.callStackSymbols subarrayWithRange:NSMakeRange(0, MIN((NSUInteger)12, e.callStackSymbols.count))] componentsJoinedByString:@"\n"]];
+    [gLabLog appendFormat:@"%@\n", t];
+    [NSUserDefaults.standardUserDefaults setObject:gLabLog forKey:@"scenelab_last"];
+    [NSUserDefaults.standardUserDefaults synchronize];
+}
 - (void)log:(NSString *)s {
+    // lab2:先同步写盘再刷界面,闪退前最后一行也能留下
+    @synchronized (SceneLabVC.class) {
+        if (!gLabLog) gLabLog = [NSMutableString string];
+        [gLabLog appendFormat:@"%@\n", s];
+        [NSUserDefaults.standardUserDefaults setObject:gLabLog forKey:@"scenelab_last"];
+        [NSUserDefaults.standardUserDefaults synchronize];
+    }
     dispatch_async(dispatch_get_main_queue(), ^{
         self.logTV.text = [self.logTV.text stringByAppendingFormat:@"%@\n", s];
         [self.logTV scrollRangeToVisible:NSMakeRange(self.logTV.text.length, 0)];
-        [NSUserDefaults.standardUserDefaults setObject:self.logTV.text forKey:@"scenelab_last"];
     });
 }
 - (UIButton *)btn:(NSString *)t sel:(SEL)s {
@@ -54,6 +68,7 @@ static BOOL lab_has(id o, const char *s) { return o && [o respondsToSelector:sel
     self.bidField.placeholder = @"App 包名,如 com.apple.Preferences";
     UIStackView *btns = [[UIStackView alloc] initWithArrangedSubviews:@[
         [self btn:@"1 嵌入" sel:@selector(onEmbed)],
+        [self btn:@"1b 直接启动" sel:@selector(onEmbedDirect)],
         [self btn:@"2 截图+OCR" sel:@selector(onShot)],
         [self btn:@"关闭" sel:@selector(onClose)]]];
     btns.axis = UILayoutConstraintAxisHorizontal; btns.distribution = UIStackViewDistributionFillEqually;
@@ -66,6 +81,8 @@ static BOOL lab_has(id o, const char *s) { return o && [o respondsToSelector:sel
     self.logTV.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
     NSString *last = [NSUserDefaults.standardUserDefaults stringForKey:@"scenelab_last"];
     self.logTV.text = last.length ? [NSString stringWithFormat:@"(上次日志,若中途闪退看最后一行)\n%@\n----\n", last] : @"";
+    gLabLog = [NSMutableString string];
+    NSSetUncaughtExceptionHandler(&labUncaught);
     for (UIView *v in @[self.bidField, btns, self.host, self.logTV]) { v.translatesAutoresizingMaskIntoConstraints = NO; [self.view addSubview:v]; }
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -110,22 +127,57 @@ static BOOL lab_has(id o, const char *s) { return o && [o respondsToSelector:sel
 
         id (^provider)(void) = ^id(void) {
             @try {
+                [self log:@"c1 provider 被调用"];
                 id ctx = [lab_cls(@"FBMutableProcessExecutionContext") new];
                 MSG1(ctx, "setIdentity:", identity);
                 MSG1(ctx, "setEnvironment:", @{});
                 MSGL(ctx, "setLaunchIntent:", 4);
-                return MSG1(manager, "launchProcessWithContext:", ctx);
+                [self log:@"c2 调 launchProcessWithContext"];
+                id proc = MSG1(manager, "launchProcessWithContext:", ctx);
+                [self log:[NSString stringWithFormat:@"c3 进程=%@", proc ? @"有" : @"无"]];
+                return proc;
             } @catch (NSException *e) { [self log:[@"启动进程异常:" stringByAppendingString:e.reason ?: e.name]]; return nil; }
         };
         id tx = MSG2([lab_cls(@"FBApplicationProcessLaunchTransaction") alloc], "initWithProcessIdentity:executionContextProvider:", identity, provider);
         if (!tx) { [self log:@"c 启动事务创建失败"]; return; }
         __weak SceneLabVC *ws = self;
+        [self log:@"c0 事务已建,设完成回调"];
         MSG1(tx, "setCompletionBlock:", (id)^{
+            [ws log:@"c4 事务完成回调"];
             dispatch_async(dispatch_get_main_queue(), ^{ [ws afterLaunch:bid identity:identity predicate:predicate manager:manager]; });
         });
-        [self log:@"c 开始启动进程…"];
+        [self log:@"c 开始启动进程(begin)…"];
         MSG0(tx, "begin");
+        [self log:@"c5 begin 已返回"];
         objc_setAssociatedObject(self, "tx", tx, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } @catch (NSException *e) {
+        [self log:[NSString stringWithFormat:@"异常:%@ %@", e.name, e.reason]];
+    }
+}
+
+// lab2:不走启动事务,直接让 FBProcessManager 启动,再建场景
+- (void)onEmbedDirect {
+    [self.view endEditing:YES];
+    if (self.presView) { [self log:@"已经嵌入了,先点关闭"]; return; }
+    NSString *bid = [self.bidField.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    if (!bid.length) return;
+    [self log:[NSString stringWithFormat:@"== 直接启动 %@", bid]];
+    @try {
+        id identity = MSG1(lab_cls(@"RBSProcessIdentity"), "identityForEmbeddedApplicationIdentifier:", bid);
+        id predicate = MSG1(lab_cls(@"RBSProcessPredicate"), "predicateMatchingIdentity:", identity);
+        id manager = MSG0(lab_cls(@"FBProcessManager"), "sharedInstance");
+        [self log:@"d0 建执行上下文"];
+        id ctx = [lab_cls(@"FBMutableProcessExecutionContext") new];
+        MSG1(ctx, "setIdentity:", identity);
+        MSG1(ctx, "setEnvironment:", @{});
+        MSGL(ctx, "setLaunchIntent:", 4);
+        [self log:@"d1 调 launchProcessWithContext"];
+        id proc = MSG1(manager, "launchProcessWithContext:", ctx);
+        [self log:[NSString stringWithFormat:@"d2 进程=%@", proc ? @"有" : @"无"]];
+        __weak SceneLabVC *ws = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [ws afterLaunch:bid identity:identity predicate:predicate manager:manager];
+        });
     } @catch (NSException *e) {
         [self log:[NSString stringWithFormat:@"异常:%@ %@", e.name, e.reason]];
     }
