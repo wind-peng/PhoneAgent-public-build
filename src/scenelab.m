@@ -77,6 +77,7 @@ static void labUncaught(NSException *e) {
         [self btn:@"3 程序点" sel:@selector(onAutoTap)],
         [self btn:@"5 快照2" sel:@selector(onSnap2)],
         [self btn:@"6 变小/藏" sel:@selector(onShrink)],
+        [self btn:@"7 全流程" sel:@selector(onFlow)],
         [self btn:@"关闭" sel:@selector(onClose)]]];
     btns.axis = UILayoutConstraintAxisHorizontal; btns.distribution = UIStackViewDistributionFillEqually;
     self.host = [UIView new];
@@ -610,6 +611,87 @@ static NSString *lab_allSels(Class c) {
     }
     [self log:[NSString stringWithFormat:@"%@ —— 1 秒后拍快照", tag]];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [self quickSnap:tag]; });
+}
+
+// lab10:30% 小窗下走一遍完整流程:快照找字 → 换算坐标程序点 → 快照看页面变没变 → 返回 → 下拉出搜索框 → 剪贴板+Cmd+V 打字 → 快照看字进没进去
+// OCR 给的 x/y 就是 App 里的坐标(快照是整屏原尺寸),屏幕坐标 = 小窗左上角 + App 坐标 × 缩放
+- (NSArray *)snapOCR {
+    __block UIImage *u = nil;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        @try {
+            id snap = MSG0(self.scene, "createSnapshot");
+            BOOL ok = snap ? ((BOOL (*)(id, SEL))objc_msgSend)(snap, sel_registerName("capture")) : NO;
+            CGImageRef cg = ok ? ((CGImageRef (*)(id, SEL))objc_msgSend)(snap, sel_registerName("CGImage")) : NULL;
+            if (cg) u = [UIImage imageWithCGImage:cg];
+        } @catch (NSException *e) {}
+    });
+    if (!u) return nil;
+    NSString *err = nil;
+    return ocrImage(u, &err) ?: @[];
+}
+static NSString *lab_texts(NSArray *items, int n) {
+    NSMutableArray *t = [NSMutableArray array];
+    for (NSDictionary *it in items) { if ((int)t.count >= n) break; NSString *s = [it[@"text"] description]; if (s.length) [t addObject:s]; }
+    return [t componentsJoinedByString:@" | "];
+}
+static NSDictionary *lab_find(NSArray *items, NSString *want, double maxY) {
+    NSDictionary *best = nil;
+    for (NSDictionary *it in items) {
+        NSString *s = [[it[@"text"] description] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if (maxY > 0 && [it[@"y"] doubleValue] > maxY) continue;
+        if ([s isEqualToString:want]) return it;
+        if (!best && [s hasPrefix:want] && s.length <= want.length + 3) best = it;
+    }
+    return best;
+}
+
+- (void)onFlow {
+    if (!self.presView) { [self log:@"还没嵌入"]; return; }
+    NSString *he = loadHID(); if (he.length) { [self log:[@"HID 加载失败:" stringByAppendingString:he]]; return; }
+    const CGFloat K = 0.3;
+    self.presView.hidden = NO; self.presView.alpha = 1; self.presView.layer.position = CGPointZero;
+    self.presView.transform = CGAffineTransformMakeScale(K, K);
+    CGRect box = [self.host convertRect:self.host.bounds toView:nil];
+    CGPoint o = box.origin;
+    [self log:[NSString stringWithFormat:@"== 全流程(小窗 30%%,左上角 %.0f,%.0f)", o.x, o.y]];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        void (^tapApp)(double, double) = ^(double x, double y) { doTapRaw(o.x + x * K, o.y + y * K); };
+        usleep(800 * 1000);
+        NSArray *s0 = [self snapOCR];
+        [self log:[NSString stringWithFormat:@"m1 快照 OCR %lu 条:%@", (unsigned long)s0.count, lab_texts(s0, 6)]];
+        NSDictionary *g = lab_find(s0, @"通用", 0);
+        if (!g) { [self log:@"m1 没找到「通用」(可能不在首页,先手动回到设置首页再试)"]; return; }
+        [self log:[NSString stringWithFormat:@"m2 「通用」在 App 里 (%@,%@) → 屏幕 (%.0f,%.0f),程序点", g[@"x"], g[@"y"], o.x + [g[@"x"] doubleValue] * K, o.y + [g[@"y"] doubleValue] * K]];
+        tapApp([g[@"x"] doubleValue], [g[@"y"] doubleValue]);
+        usleep(1500 * 1000);
+        NSArray *s1 = [self snapOCR];
+        BOOL inGeneral = lab_find(s1, @"关于本机", 0) || lab_find(s1, @"软件更新", 0) || lab_find(s1, @"关于", 0);
+        [self log:[NSString stringWithFormat:@"m3 点后快照:%@ —— %@", lab_texts(s1, 6), inGeneral ? @"✓ 进了「通用」,快照跟着变" : @"✗ 页面好像没变"]];
+        // 返回:点左上角「设置」返回按钮
+        NSDictionary *back = lab_find(s1, @"设置", 200);
+        if (back) { [self log:@"m4 点左上角「设置」返回"]; tapApp([back[@"x"] doubleValue], [back[@"y"] doubleValue]); }
+        else { [self log:@"m4 没找到返回按钮,从左边缘右滑返回"]; doSwipeSmooth(o.x + 2, o.y + 400 * K, o.x + 300 * K, o.y + 400 * K, 300, 100); }
+        usleep(1500 * 1000);
+        // 下拉出搜索框
+        [self log:@"m5 在小窗里往下拉,露出搜索框"];
+        doSwipeSmooth(o.x + 195 * K, o.y + 250 * K, o.x + 195 * K, o.y + 600 * K, 400, 150);
+        usleep(1200 * 1000);
+        NSArray *s2 = [self snapOCR];
+        NSDictionary *sf = lab_find(s2, @"搜索", 0);
+        if (!sf) { [self log:[NSString stringWithFormat:@"m6 没找到搜索框。快照:%@", lab_texts(s2, 6)]]; return; }
+        [self log:[NSString stringWithFormat:@"m6 点搜索框 App(%@,%@)", sf[@"x"], sf[@"y"]]];
+        tapApp([sf[@"x"] doubleValue], [sf[@"y"] doubleValue]);
+        usleep(1200 * 1000);
+        dispatch_sync(dispatch_get_main_queue(), ^{ UIPasteboard.generalPasteboard.string = @"蓝牙"; });
+        [self log:@"m7 剪贴板写「蓝牙」,发 Cmd+V(注意看键盘弹在哪、有没有弹「允许粘贴」)"];
+        doCmdKey(0x19);
+        usleep(1800 * 1000);
+        NSArray *s3 = [self snapOCR];
+        NSString *t3 = lab_texts(s3, 8);
+        BOOL typed = [t3 containsString:@"蓝牙"];
+        [self log:[NSString stringWithFormat:@"m8 打字后快照:%@ —— %@", t3, typed ? @"✓ 看到「蓝牙」" : @"✗ 没看到「蓝牙」"]];
+        [self log:@"== 全流程完。告诉我:键盘弹在哪、有没有「允许粘贴」框"];
+    });
 }
 
 - (void)onClose {
