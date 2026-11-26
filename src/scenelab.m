@@ -8,6 +8,7 @@
 #import <dlfcn.h>
 #import <CoreImage/CoreImage.h>
 #import "pa_internal.h"
+#import <signal.h>
 
 static id lab_cls(NSString *n) { return NSClassFromString(n); }
 #define MSG0(o, s)          ((id (*)(id, SEL))objc_msgSend)((o), sel_registerName(s))
@@ -27,6 +28,7 @@ static BOOL lab_has(id o, const char *s) { return o && [o respondsToSelector:sel
 @property (nonatomic, strong) id scene, presenter;
 @property (nonatomic, strong) UIView *presView;
 @property (nonatomic, assign) int shrinkStep;
+@property (nonatomic, assign) BOOL useDefaultSID;
 @end
 
 @implementation SceneLabVC
@@ -72,7 +74,7 @@ static void labUncaught(NSException *e) {
     self.bidField.placeholder = @"App 包名,如 com.apple.Preferences";
     UIStackView *btns = [[UIStackView alloc] initWithArrangedSubviews:@[
         [self btn:@"1 嵌入" sel:@selector(onEmbed)],
-        [self btn:@"1b 直接启动" sel:@selector(onEmbedDirect)],
+        [self btn:@"1c 默认名" sel:@selector(onEmbedDefault)],
         [self btn:@"2 截图+OCR" sel:@selector(onShot)],
         [self btn:@"3 程序点" sel:@selector(onAutoTap)],
         [self btn:@"5 快照2" sel:@selector(onSnap2)],
@@ -116,6 +118,7 @@ static void labUncaught(NSException *e) {
     if (self.presView) { [self log:@"已经嵌入了,先点关闭"]; return; }
     NSString *bid = [self.bidField.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
     if (!bid.length) return;
+    [self killApp:bid];
     [NSUserDefaults.standardUserDefaults setObject:bid forKey:@"scenelab_bid"];
     [self log:[NSString stringWithFormat:@"== 嵌入 %@ (iOS %@)", bid, UIDevice.currentDevice.systemVersion]];
     @try {
@@ -169,6 +172,7 @@ static void labUncaught(NSException *e) {
     if (self.presView) { [self log:@"已经嵌入了,先点关闭"]; return; }
     NSString *bid = [self.bidField.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
     if (!bid.length) return;
+    [self killApp:bid];
     [self log:[NSString stringWithFormat:@"== 直接启动 %@", bid]];
     @try {
         id identity = MSG1(lab_cls(@"RBSProcessIdentity"), "identityForEmbeddedApplicationIdentifier:", bid);
@@ -205,7 +209,8 @@ static void labUncaught(NSException *e) {
             [self log:@"d2 注册完成"];
         } else [self log:@"d1 跳过注册"];
 
-        NSString *sceneID = [NSString stringWithFormat:@"sceneID:%@-palab", bid];
+        NSString *sceneID = [NSString stringWithFormat:(self.useDefaultSID ? @"sceneID:%@-default" : @"sceneID:%@-palab"), bid];
+        [self log:[@"d3a 场景名 " stringByAppendingString:sceneID]];
         id def = MSG0(lab_cls(@"FBSMutableSceneDefinition"), "definition");
         MSG1(def, "setIdentity:", MSG1(lab_cls(@"FBSSceneIdentity"), "identityForIdentifier:", sceneID));
         MSG1(def, "setClientIdentity:", MSG1(lab_cls(@"FBSSceneClientIdentity"), "identityForProcessIdentity:", identity));
@@ -251,6 +256,7 @@ static void labUncaught(NSException *e) {
         pv.transform = CGAffineTransformMakeScale(k, k);
         [self.host addSubview:pv];
         [self log:[NSString stringWithFormat:@"g 已嵌入,缩放 %.2f。看框里有没有画面;用手点框里试试有没有反应。然后点「2 截图+OCR」", k]];
+        [self watchScene:0];
     } @catch (NSException *e) {
         [self log:[NSString stringWithFormat:@"异常:%@ %@", e.name, e.reason]];
     }
@@ -698,7 +704,51 @@ static NSDictionary *lab_find(NSArray *items, NSString *want, double maxY) {
     });
 }
 
+// lab13:微信嵌入后黑屏。三个改动:①嵌入前先结束已在跑的同名 App;②「1c」用系统默认场景名 sceneID:包名-default;
+// ③嵌入后每 2 秒报一次场景状态和快照亮度,共 6 次,看 App 是没画出来还是画得慢
+- (void)killApp:(NSString *)bid {
+    @try {
+        id identity = MSG1(lab_cls(@"RBSProcessIdentity"), "identityForEmbeddedApplicationIdentifier:", bid);
+        Class PC = lab_cls(@"RBSProcessPredicate");
+        id pred = [PC respondsToSelector:sel_registerName("predicateMatchingBundleIdentifier:")] ? MSG1(PC, "predicateMatchingBundleIdentifier:", bid) : nil;
+        if (!pred) pred = MSG1(PC, "predicateMatchingIdentity:", identity);
+        NSError *err = nil;
+        id h = pred ? ((id (*)(id, SEL, id, NSError **))objc_msgSend)(lab_cls(@"RBSProcessHandle"), sel_registerName("handleForPredicate:error:"), pred, &err) : nil;
+        int pid = (h && lab_has(h, "pid")) ? ((int (*)(id, SEL))objc_msgSend)(h, sel_registerName("pid")) : 0;
+        if (pid > 0) {
+            int r = kill(pid, SIGKILL);
+            [self log:[NSString stringWithFormat:@"k0 先结束已在跑的 %@ (pid %d) → %@", bid, pid, r == 0 ? @"成功" : [NSString stringWithFormat:@"失败 errno=%d", errno]]];
+            [NSThread sleepForTimeInterval:0.8];
+        } else [self log:@"k0 没有在跑的同名进程"];
+    } @catch (NSException *e) { [self log:[NSString stringWithFormat:@"k0 异常 %@", e.reason]]; }
+}
+
+- (void)onEmbedDefault { self.useDefaultSID = YES; [self onEmbed]; }
+
+- (void)watchScene:(int)n {
+    if (n >= 6 || !self.scene) return;
+    __weak SceneLabVC *ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        SceneLabVC *me = ws; if (!me || !me.scene) return;
+        NSMutableString *st = [NSMutableString string];
+        @try {
+            if (lab_has(me.scene, "contentState")) [st appendFormat:@"内容状态=%ld ", ((long (*)(id, SEL))objc_msgSend)(me.scene, sel_registerName("contentState"))];
+            if (lab_has(me.scene, "isValid")) [st appendFormat:@"有效=%d ", ((BOOL (*)(id, SEL))objc_msgSend)(me.scene, sel_registerName("isValid"))];
+            id cp = lab_has(me.scene, "clientProcess") ? MSG0(me.scene, "clientProcess") : nil;
+            if (cp && lab_has(cp, "isRunning")) [st appendFormat:@"进程在跑=%d ", ((BOOL (*)(id, SEL))objc_msgSend)(cp, sel_registerName("isRunning"))];
+            id snap = MSG0(me.scene, "createSnapshot");
+            BOOL ok = snap ? ((BOOL (*)(id, SEL))objc_msgSend)(snap, sel_registerName("capture")) : NO;
+            CGImageRef cg = ok ? ((CGImageRef (*)(id, SEL))objc_msgSend)(snap, sel_registerName("CGImage")) : NULL;
+            if (cg) { int mn = 0, mx = 0; lab_range(cg, &mn, &mx); [st appendFormat:@"快照 %zux%zu 亮度 %d~%d", CGImageGetWidth(cg), CGImageGetHeight(cg), mn, mx]; }
+            else [st appendFormat:@"快照失败 capture=%d", ok];
+        } @catch (NSException *e) { [st appendFormat:@"异常 %@", e.reason]; }
+        [me log:[NSString stringWithFormat:@"w%d (%d 秒) %@", n + 1, (n + 1) * 2, st]];
+        [me watchScene:n + 1];
+    });
+}
+
 - (void)onClose {
+    self.useDefaultSID = NO;
     @try {
         if (self.presenter && lab_has(self.presenter, "invalidate")) MSG0(self.presenter, "invalidate");
         [self.presView removeFromSuperview];
