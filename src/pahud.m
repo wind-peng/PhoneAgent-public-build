@@ -211,6 +211,7 @@ static void hudHIDCallback(void *target, void *refcon, void *service, void *even
             if (CGRectContainsPoint(bar, p)) {
                 gDragMode = (p.x > f.origin.x + f.size.width * 0.55) ? 2 : 1;
                 gDragP0 = p; gDragO0 = f.origin; gDragK0 = winScale();
+                winRefreshOrigin(); // 写一下“正在拖”,PhoneAgent 这时先不点
             } else gDragMode = 0;
         } else if (move && gDragMode) {
             CGSize sc = UIScreen.mainScreen.bounds.size;
@@ -220,6 +221,7 @@ static void hudHIDCallback(void *target, void *refcon, void *service, void *even
         } else if (lift && gDragMode) {
             hlog(@"小窗%@:左上角 (%.0f,%.0f) 缩放 %.0f%%", gDragMode == 1 ? @"移动" : @"改大小", gHudWin.frame.origin.x, gHudWin.frame.origin.y, winScale() * 100);
             gDragMode = 0;
+            winRefreshOrigin(); // 松手:写新位置,PhoneAgent 接着点
         }
     });
 }
@@ -450,19 +452,28 @@ NSString *hudStop(void) { return hudSpawn("-pahudexit", NULL, NULL, YES); }
 
 // ---------- v0.9.73 PhoneAgent 这边:跑任务时启动悬浮层并给它发指令 ----------
 void hudWriteGeo(double ox, double oy, double k) {
-    NSString *g = [NSString stringWithFormat:@"%.2f %.2f %.4f", ox, oy, k];
+    NSString *g = [NSString stringWithFormat:@"%.2f %.2f %.4f %d", ox, oy, k, gDragMode ? 1 : 0];
     [g writeToFile:HUD_GEO atomically:YES encoding:NSUTF8StringEncoding error:nil];
     chmod(HUD_GEO.UTF8String, 0666);
 }
-// 读小窗位置和缩放(拖动后会变);0.3 秒内用缓存,滑动时每秒要读几十次
+// 读小窗位置和缩放(拖动后会变);0.3 秒内用缓存,滑动时每秒要读几十次。
+// 你正在拖小窗时(第 4 个数为 1)先等,松手再点,最多等 8 秒
 BOOL hudGeo(double *ox, double *oy, double *k) {
-    static double cx, cy, ck; static CFAbsoluteTime ct; static BOOL have;
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    static double cx, cy, ck; static CFAbsoluteTime ct; static BOOL have, drag;
     @synchronized (NSFileManager.class) {
-        if (!have || now - ct > 0.3) {
-            NSString *g = [NSString stringWithContentsOfFile:HUD_GEO encoding:NSUTF8StringEncoding error:nil];
-            NSArray *a = [g componentsSeparatedByString:@" "];
-            if (a.count == 3 && [a[2] doubleValue] > 0.05) { cx = [a[0] doubleValue]; cy = [a[1] doubleValue]; ck = [a[2] doubleValue]; have = YES; ct = now; }
+        for (int i = 0; i < 80; i++) {
+            CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+            if (!have || drag || now - ct > 0.3) {
+                NSString *g = [NSString stringWithContentsOfFile:HUD_GEO encoding:NSUTF8StringEncoding error:nil];
+                NSArray *a = [g componentsSeparatedByString:@" "];
+                if (a.count >= 3 && [a[2] doubleValue] > 0.05) {
+                    cx = [a[0] doubleValue]; cy = [a[1] doubleValue]; ck = [a[2] doubleValue];
+                    drag = a.count >= 4 && [a[3] intValue] == 1;
+                    have = YES; ct = now;
+                }
+            }
+            if (!have || !drag) break;
+            usleep(100 * 1000);
         }
         if (!have) return NO;
         *ox = cx; *oy = cy; *k = ck;
