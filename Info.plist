@@ -2,10 +2,29 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>BSServiceDomains</key>
+	<dict>
+		<key>com.apple.frontboard</key>
+		<dict>
+			<key>DerivedServiceRestrictions</key>
+			<array>
+				<string>com.apple.uis.applicationStateService</string>
+				<string>com.apple.uis.applicationSupportService</string>
+				<string>com.apple.frontboard.layout-monitor</string>
+			</array>
+			<key>Services</key>
+			<dict>
+				<key>com.apple.frontboard.system-service</key>
+				<dict/>
+				<key>com.apple.frontboard.workspace-service</key>
+				<dict/>
+			</dict>
+		</dict>
+	</dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>PhoneAgent</string>
+	<string>PA实验</string>
 	<key>CFBundleExecutable</key>
 	<string>PhoneAgent</string>
 	<key>CFBundleIcons</key>
@@ -21,7 +40,7 @@
 		</dict>
 	</dict>
 	<key>CFBundleIdentifier</key>
-	<string>com.example.phoneagent</string>
+	<string>com.example.phoneagent.lab</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -29,7 +48,7 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.9.66</string>
+	<string>0.9.66-lab1</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -37,12 +56,12 @@
 			<string>com.example.phoneagent</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>phoneagent</string>
+				<string>phoneagentlab</string>
 			</array>
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>0.9.66</string>
+	<string>0.9.66-lab1</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>MinimumOSVersion</key>

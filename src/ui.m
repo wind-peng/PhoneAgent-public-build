@@ -597,10 +597,14 @@ static NSData *attachJPEG(UIImage *img) {
     [axT setTitle:@"无障碍探测(点后 6 秒内切到微信/淘宝/美团等,停 10 秒再回来看执行记录)" forState:UIControlStateNormal];
     axT.titleLabel.numberOfLines = 0;
     [axT addTarget:self action:@selector(onAXProbe) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *labB = [UIButton buttonWithType:UIButtonTypeSystem];
+    [labB setTitle:@"嵌入实验(把别的 App 画面嵌进来,测截图/OCR)" forState:UIControlStateNormal];
+    labB.titleLabel.numberOfLines = 0;
+    [labB addTarget:self action:@selector(onSceneLab) forControlEvents:UIControlEventTouchUpInside];
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
         [self hdr:@"Token 统计(每次任务结束也会在执行记录里显示本次用量)"],
         self.tokL, tokClr, cacheT,
-        [self hdr:@"实验"], axT,
+        [self hdr:@"实验"], labB, axT,
         [self sw:@"每次调用模型都在执行记录里写一行 Token 明细(第几步、几张图、输入/缓存/输出)" key:@"token_step_log" def:YES],
         [self hdr:@"模型请求"],
         [self sw:@"DeepSeek 分档:常规步骤 deepseek-flash,卡住/规划/完成自检用 deepseek-v4-pro" key:@"ds_tiering" def:YES],
@@ -694,6 +698,14 @@ static NSData *attachJPEG(UIImage *img) {
     }]];
     [self presentViewController:a animated:YES completion:nil];
 }
+- (void)onSceneLab {
+    UINavigationController *n = [[UINavigationController alloc] initWithRootViewController:sceneLabVC()];
+    n.modalPresentationStyle = UIModalPresentationFullScreen;
+    UIViewController *root = n.viewControllers.firstObject;
+    root.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose target:self action:@selector(dismissLab)];
+    [self presentViewController:n animated:YES completion:nil];
+}
+- (void)dismissLab { [self.presentedViewController dismissViewControllerAnimated:YES completion:nil]; }
 - (void)onCalib {
     CalibVC *c = [CalibVC new];
     c.modalPresentationStyle = UIModalPresentationFullScreen;
@@ -791,9 +803,9 @@ static NSData *attachJPEG(UIImage *img) {
     // 屏幕广播(截屏必需)
     UILabel *bl = [UILabel new];
     bl.numberOfLines = 0; bl.font = [UIFont systemFontOfSize:14];
-    bl.text = @"屏幕广播(截屏必需):点右边按钮 → 选 PhoneAgent → 开始直播";
+    bl.text = @"屏幕广播(截屏必需):点右边按钮 → 选 PA实验 → 开始直播";
     RPSystemBroadcastPickerView *pv = [[RPSystemBroadcastPickerView alloc] initWithFrame:CGRectMake(0, 0, 56, 56)];
-    pv.preferredExtension = @"com.example.phoneagent.broadcast";
+    pv.preferredExtension = [NSBundle.mainBundle.bundleIdentifier stringByAppendingString:@".broadcast"];
     pv.showsMicrophoneButton = NO;
     [pv.widthAnchor constraintEqualToConstant:56].active = YES;
     [pv.heightAnchor constraintEqualToConstant:56].active = YES;

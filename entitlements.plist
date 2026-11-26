@@ -19,5 +19,15 @@
   <key>com.apple.springboard.show-alert</key><true/>
   <key>com.apple.private.accessibility.inspection.allow</key><true/>
   <key>com.apple.accessibility.api</key><true/>
+  <key>com.apple.frontboard.launchapplications</key><true/>
+  <key>com.apple.runningboard.launchprocess</key><true/>
+  <key>com.apple.runningboard.targetidentities</key><true/>
+  <key>com.apple.runningboard.assertions.frontboard</key><true/>
+  <key>com.apple.runningboard.process-state</key><true/>
+  <key>com.apple.runningboard.terminateprocess</key><true/>
+  <key>com.apple.runningboard.primitiveattribute</key><true/>
+  <key>com.apple.runningboard.hereditarygrantoriginator</key><true/>
+  <key>com.apple.private.persona-mgmt</key><true/>
+  <key>com.apple.QuartzCore.displayable-context</key><true/>
 </dict>
 </plist>

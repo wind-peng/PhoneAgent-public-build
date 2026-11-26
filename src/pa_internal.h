@@ -168,3 +168,4 @@ BOOL ocrAccurateOn(void);
 // v0.9.18 OCR 自检
 NSString *ocrSelfTest(void (^progress)(NSString *soFar));
 NSString *ocrClearCache(void);
+UIViewController *sceneLabVC(void); // lab1 嵌入实验
