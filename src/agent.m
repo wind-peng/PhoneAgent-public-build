@@ -1238,7 +1238,9 @@ static void taskRunEnd(NSString *task, BOOL stopCast) {
                       shown, status, result, [lines componentsJoinedByString:@"\n"]];
     gLastResultText = text;
     gLastSpeechText = [NSString stringWithFormat:@"任务%@。%@", status, result];
-    if (appStateNow() != UIApplicationStateActive) {
+    // v0.9.74:小窗模式下默认不跳回 PhoneAgent,直接语音播报结果(设置里可改成跳回)
+    BOOL quietEnd = winEnabled() && !paOn(@"win_end_open", NO);
+    if (!quietEnd && appStateNow() != UIApplicationStateActive) {
         openApp(NSBundle.mainBundle.bundleIdentifier);
         waitAppActive(6);
         usleep(500 * 1000);
@@ -1258,7 +1260,7 @@ static void taskRunEnd(NSString *task, BOOL stopCast) {
         usleep(1000 * 1000);
         [NSNotificationCenter.defaultCenter postNotificationName:@"pa.closing" object:@NO];
     }
-    [NSNotificationCenter.defaultCenter postNotificationName:@"pa.showResult" object:text];
+    [NSNotificationCenter.defaultCenter postNotificationName:@"pa.showResult" object:text userInfo:@{@"speak": @(quietEnd)}];
     NSString *shownCopy = [shown copy], *resultCopy = [result copy];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ memoryLearn(shownCopy, resultCopy); });
 }

@@ -606,6 +606,7 @@ static NSData *attachJPEG(UIImage *img) {
         self.tokL, tokClr, cacheT,
         [self hdr:@"实验"],
         [self sw:@"小窗模式(测试):任务里的 App 在悬浮小窗里运行,盖在主屏和其他 App 上,可拖动、可缩放;不用屏幕录制" key:@"win_mode" def:NO],
+        [self sw:@"小窗模式:任务结束后跳回 PhoneAgent 看结果(关=不跳,直接语音播报结果)" key:@"win_end_open" def:NO],
         labB, axT,
         [self sw:@"每次调用模型都在执行记录里写一行 Token 明细(第几步、几张图、输入/缓存/输出)" key:@"token_step_log" def:YES],
         [self hdr:@"模型请求"],
@@ -886,7 +887,8 @@ static NSData *attachJPEG(UIImage *img) {
                                                 usingBlock:^(NSNotification *n) {
         [wself showResult:[n.object description]];
         NSUserDefaults *ud1 = NSUserDefaults.standardUserDefaults;
-        if (!([ud1 objectForKey:@"tts_on"] && ![ud1 boolForKey:@"tts_on"])) [[PATTS shared] speak:gLastSpeechText];
+        BOOL force = [n.userInfo[@"speak"] boolValue]; // 小窗模式不跳回时一定播报
+        if (force || !([ud1 objectForKey:@"tts_on"] && ![ud1 boolForKey:@"tts_on"])) [[PATTS shared] speak:gLastSpeechText];
     }];
 
     // 语音输入
@@ -1310,6 +1312,11 @@ static NSData *attachJPEG(UIImage *img) {
     if (say) { [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:say]; return YES; }
     agentSay([NSString stringWithFormat:@"收到语音任务:%@", task]);
     [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:[NSString stringWithFormat:@"收到语音任务:%@", task]];
+    // v0.9.74:小窗模式下,快捷指令把 PhoneAgent 叫到前台后马上退回主屏,任务在悬浮小窗里跑
+    if (winEnabled()) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        SEL sp = NSSelectorFromString(@"suspend");
+        if ([UIApplication.sharedApplication respondsToSelector:sp]) ((void (*)(id, SEL))objc_msgSend)(UIApplication.sharedApplication, sp);
+    });
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSUserDefaults *u2 = NSUserDefaults.standardUserDefaults;
         BOOL autoCast = [u2 objectForKey:@"auto_cast"] ? [u2 boolForKey:@"auto_cast"] : YES;
