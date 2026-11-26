@@ -661,14 +661,16 @@ static NSDictionary *lab_find(NSArray *items, NSString *want, double maxY) {
         usleep(800 * 1000);
         NSArray *s0 = [self snapOCR];
         [self log:[NSString stringWithFormat:@"m1 快照 OCR %lu 条:%@", (unsigned long)s0.count, lab_texts(s0, 6)]];
-        NSDictionary *g = lab_find(s0, @"通用", 0);
+        // lab12:OCR 会把「通用」认成「诵用」,所以多给几个候选
+        NSDictionary *g = nil;
+        for (NSString *w in @[@"通用", @"诵用", @"显示与亮度", @"控制中心"]) { g = lab_find(s0, w, 0); if (g) break; }
         if (!g) { [self log:[NSString stringWithFormat:@"m1 没找到「通用」。全部 OCR:%@", lab_texts(s0, 40)]]; return; }
-        [self log:[NSString stringWithFormat:@"m2 「通用」在 App 里 (%@,%@) → 屏幕 (%.0f,%.0f),程序点", g[@"x"], g[@"y"], o.x + [g[@"x"] doubleValue] * K, o.y + [g[@"y"] doubleValue] * K]];
+        [self log:[NSString stringWithFormat:@"m2 「%@」在 App 里 (%@,%@) → 屏幕 (%.0f,%.0f),程序点", g[@"text"], g[@"x"], g[@"y"], o.x + [g[@"x"] doubleValue] * K, o.y + [g[@"y"] doubleValue] * K]];
         tapApp([g[@"x"] doubleValue], [g[@"y"] doubleValue]);
         usleep(1500 * 1000);
         NSArray *s1 = [self snapOCR];
-        BOOL inGeneral = lab_find(s1, @"关于本机", 0) || lab_find(s1, @"软件更新", 0) || lab_find(s1, @"关于", 0);
-        [self log:[NSString stringWithFormat:@"m3 点后快照:%@ —— %@", lab_texts(s1, 6), inGeneral ? @"✓ 进了「通用」,快照跟着变" : @"✗ 页面好像没变"]];
+        BOOL inGeneral = !lab_find(s1, @"飞行模式", 0);   // 首页才有「飞行模式」,没了就说明进了下一页
+        [self log:[NSString stringWithFormat:@"m3 点后快照:%@ —— %@", lab_texts(s1, 6), inGeneral ? @"✓ 进了下一页,快照跟着变" : @"✗ 页面好像没变"]];
         // 返回:点左上角「设置」返回按钮
         NSDictionary *back = lab_find(s1, @"设置", 200);
         if (back) { [self log:@"m4 点左上角「设置」返回"]; tapApp([back[@"x"] doubleValue], [back[@"y"] doubleValue]); }
