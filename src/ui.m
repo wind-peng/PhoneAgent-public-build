@@ -604,7 +604,9 @@ static NSData *attachJPEG(UIImage *img) {
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
         [self hdr:@"Token 统计(每次任务结束也会在执行记录里显示本次用量)"],
         self.tokL, tokClr, cacheT,
-        [self hdr:@"实验"], labB, axT,
+        [self hdr:@"实验"],
+        [self sw:@"小窗模式(测试):任务里的 App 在右上角小窗里运行,不用屏幕录制、不来回切 App" key:@"win_mode" def:NO],
+        labB, axT,
         [self sw:@"每次调用模型都在执行记录里写一行 Token 明细(第几步、几张图、输入/缓存/输出)" key:@"token_step_log" def:YES],
         [self hdr:@"模型请求"],
         [self sw:@"DeepSeek 分档:常规步骤 deepseek-flash,卡住/规划/完成自检用 deepseek-v4-pro" key:@"ds_tiering" def:YES],
@@ -1110,7 +1112,7 @@ static NSData *attachJPEG(UIImage *img) {
     gTaskDisplay = task;
     gRunImages = [gAttachImages copy];
     if (!gPlayer) setKeepAlive(YES);
-    if (!broadcastAlive()) [self say:@"提醒:屏幕广播还没开,没有广播会截屏失败"];
+    if (!broadcastAlive() && !winEnabled()) [self say:@"提醒:屏幕广播还没开,没有广播会截屏失败"];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ agentRun(full, base, key, model); });
 }
 - (void)onTTS:(UISwitch *)sw { [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"tts_on"]; if (!sw.on) [[PATTS shared] stop]; }
@@ -1311,7 +1313,7 @@ static NSData *attachJPEG(UIImage *img) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSUserDefaults *u2 = NSUserDefaults.standardUserDefaults;
         BOOL autoCast = [u2 objectForKey:@"auto_cast"] ? [u2 boolForKey:@"auto_cast"] : YES;
-        if (!autoCast) { // 没打开“自动开启录屏”才需要现成的广播;冷启动后扩展要重新连上,最多等 6 秒
+        if (!autoCast && !winEnabled()) { // 没打开“自动开启录屏”(小窗模式不需要录屏)才需要现成的广播;冷启动后扩展要重新连上,最多等 6 秒
             for (int i = 0; i < 30 && !broadcastAlive(); i++) usleep(200 * 1000);
             if (!broadcastAlive()) {
                 [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:@"屏幕广播没开,任务未执行:请先开启屏幕广播,或打开界面里“任务时自动开启/关闭屏幕录制”的开关"];

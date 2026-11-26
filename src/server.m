@@ -142,7 +142,7 @@ static void handleClient(int c) {
         {
             NSUserDefaults *u2 = NSUserDefaults.standardUserDefaults;
             BOOL autoCast = [u2 objectForKey:@"auto_cast"] ? [u2 boolForKey:@"auto_cast"] : YES;
-            if (!autoCast && !broadcastAlive()) { sendJSON(c, 409, @{@"ok": @NO, @"error": @"屏幕广播没开,请先在 PhoneAgent 里开启,或打开“任务时自动开启/关闭屏幕录制”开关"}); return; }
+            if (!autoCast && !broadcastAlive() && !winEnabled()) { sendJSON(c, 409, @{@"ok": @NO, @"error": @"屏幕广播没开,请先在 PhoneAgent 里开启,或打开“任务时自动开启/关闭屏幕录制”开关"}); return; }
         }
         agentSay([NSString stringWithFormat:@"收到语音任务:%@", task]);
         [NSNotificationCenter.defaultCenter postNotificationName:@"pa.say" object:[NSString stringWithFormat:@"收到语音任务:%@", task]];

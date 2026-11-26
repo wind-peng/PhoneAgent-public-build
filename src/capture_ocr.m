@@ -160,6 +160,12 @@ static UIImage *shotR(NSString **note) {
 
 // 依次尝试 R→A→B→C→D;全部失败时 err 里列出每种方法的原因
 UIImage *takeScreenshot(NSString **err) {
+    // v0.9.67 小窗模式:小窗开着就只用小窗 App 的场景快照(原尺寸,不需要录屏)
+    if (winActive()) {
+        UIImage *w = winSnapshot(err);
+        if (w) gShotMethod = @"W";
+        return w;
+    }
     // 广播开启时禁止调用 A-D 的私有 IOSurface 截图接口。
     // 这些接口与 ReplayKit 同时工作时可能触发系统进程级崩溃，必须只使用广播帧。
     if (broadcastAlive()) return shotR(err);

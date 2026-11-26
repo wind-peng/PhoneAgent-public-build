@@ -43,6 +43,9 @@ void sendFinger(double nx, double ny, int phase) {
     // v0.9.44:所有注入坐标统一限制在屏幕内(经验回放、AutoGLM 的滑动之前没限制)
     if (!(nx >= 0)) nx = 0; if (nx > 0.9995) nx = 0.9995;
     if (!(ny >= 0)) ny = 0; if (ny > 0.9995) ny = 0.9995;
+    // v0.9.67 小窗模式:App 坐标换到右上角小窗里;PhoneAgent 进了后台就不发(小窗不在屏幕上,会点到别的 App)
+    if (winTouchBlocked()) return;
+    winMapNorm(&nx, &ny);
     uint64_t t = mach_absolute_time();
     BOOL touching = (phase != 2);
     uint32_t mask = (phase == 1) ? 0x4 : 0x3;

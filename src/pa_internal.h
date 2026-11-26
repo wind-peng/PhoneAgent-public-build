@@ -124,6 +124,16 @@ extern BOOL gUseTools;
 extern NSString *gFrozenSystem;
 extern NSDictionary *gResumeCP;
 BOOL paOn(NSString *key, BOOL def);
+// v0.9.67 小窗模式(pawin.m)
+BOOL winEnabled(void);
+BOOL winActive(void);
+NSString *winBid(void);
+BOOL winTouchBlocked(void);
+void winMapNorm(double *nx, double *ny);
+BOOL winOpen(NSString *bid, NSString **note);
+void winClose(void);
+void winKill(NSString *bid);
+UIImage *winSnapshot(NSString **err);
 void touchAdjust(double *x, double *y);
 void doTapRaw(double x, double y);
 void doSwipeSmooth(double x1, double y1, double x2, double y2, int ms, int holdMs);

@@ -31,6 +31,7 @@ static NSString *gLastApp; // 最近一次 open_app 成功打开的 bundle id
 // 当前最前台 App 的 bundle id(SpringBoardServices 私有接口,失败返回 nil)。
 // 先在 NSUserDefaults 里打个"可能崩溃"的标记,万一这个接口在本系统上签名不对导致崩溃,下次启动就自动停用。
 static NSString *frontmostBundleID(void) {
+    { NSString *wb = winBid(); if (wb.length) return wb; } // v0.9.67 小窗模式:当前 App 就是小窗里的 App
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     if ([d boolForKey:@"sbfront_crashed"]) return nil;
     static void *h; static mach_port_t (*getPort)(void); static void (*getFront)(mach_port_t, char *);
@@ -113,6 +114,8 @@ static BOOL writeClipboardInForeground(NSString *text, NSString *backHint, NSStr
 
 // 回主屏幕:先发 Home 键事件;如果还能查到最前台 App 并且不是主屏,再尝试从底部上滑
 static BOOL goHome(NSString **note) {
+    // v0.9.67 小窗模式:不按 Home 键(那会把 PhoneAgent 切到后台),关掉小窗就算回到主屏
+    if (winEnabled() && gAgentRunning) { winClose(); return YES; }
     BOOL sent = doHomeKey();
     sleep(1);
     NSString *f = frontmostBundleID();
@@ -131,6 +134,7 @@ static void waitForStableFrame(double maxWait); // 定义在下面
 
 // 等广播画面静止:最近 0.8 秒内没有新帧,说明动画/转场结束了(最多等 maxWait 秒)
 static void waitForStableFrame(double maxWait) {
+    if (winEnabled()) { usleep(800 * 1000); return; } // v0.9.67 小窗模式没有录屏帧,固定等一下
     CFAbsoluteTime end = CFAbsoluteTimeGetCurrent() + maxWait;
     while (CFAbsoluteTimeGetCurrent() < end) {
         CFAbsoluteTime ft;
@@ -325,6 +329,13 @@ static void agParse(NSString *content, NSString **think, NSString **action) {
 
 // 最近一帧广播画面(原始 JPEG)
 static NSData *agLatestJPEG(NSString **err) {
+    if (winEnabled()) { // v0.9.67 小窗模式没有录屏帧:用截图(小窗开着时就是小窗快照)
+        UIImage *img = takeScreenshot(err);
+        if (!img) return nil;
+        NSData *d = UIImageJPEGRepresentation(resizeToWidth(img, 780), 0.8);
+        if (!d.length && err) *err = @"截图转 JPEG 失败";
+        return d.length ? d : nil;
+    }
     if (!broadcastAlive()) { *err = @"屏幕广播没开(或已停止)"; return nil; }
     NSData *d;
     @synchronized (gLock) { d = gFrame; }
@@ -528,6 +539,13 @@ static NSArray *pidsForBundle(NSString *bid) {
 }
 
 static BOOL closeApp(NSString *bid, NSString **note) {
+    // v0.9.67 小窗模式:关小窗并结束这个 App 进程,不去多任务界面划
+    if (winEnabled() && gAgentRunning) {
+        if ([bid isEqualToString:winBid()]) winClose();
+        winKill(bid);
+        if (note) *note = @"已结束(小窗模式)";
+        return YES;
+    }
     if (!bid.length || [bid isEqualToString:NSBundle.mainBundle.bundleIdentifier] || [bid isEqualToString:@"com.apple.springboard"]) {
         *note = @"不能关闭 PhoneAgent 自己或主屏幕"; return NO;
     }
@@ -1191,6 +1209,7 @@ static void taskRunBegin(NSString *task) {
 // 任务结束:停止防锁屏 -> 回到 PhoneAgent -> 弹出结果窗口 -> 后台提炼记忆
 static void taskRunEnd(NSString *task, BOOL stopCast) {
     gAgentRunning = NO;
+    if (winActive()) winClose(); // v0.9.67 小窗模式:任务结束收起小窗
     taskAwakeStop();
     keepAliveTaskStop();
     cpClear(); // 11:正常结束(完成/停止/失败)都清掉断点
@@ -1537,7 +1556,7 @@ static void agentRunCore(NSString *task, NSString *base, NSString *key, NSString
         BOOL axRich = NO; int axMs = 0, axN = 0; NSString *axHow = nil;
         if (paOn(@"ax_tree", YES)) {
             NSString *fb = frontmostBundleID();
-            BOOL skipAX = !fb.length || [fb isEqualToString:selfID] || [fb isEqualToString:@"com.apple.springboard"];
+            BOOL skipAX = !fb.length || [fb isEqualToString:selfID] || [fb isEqualToString:@"com.apple.springboard"] || winActive(); // v0.9.67 小窗里的 App 读不到正确的无障碍坐标
             NSArray *axItems = skipAX ? nil : axReadScreen(fb, &axMs, &axHow);
             axN = (int)axItems.count;
             if (axN >= 8) {
@@ -2055,6 +2074,11 @@ static void agentRunClaimed(NSString *task, NSString *base, NSString *key, NSStr
         [ud setBool:YES forKey:@"mig_0921"];
     }
     BOOL autoCast = [ud objectForKey:@"auto_cast"] ? [ud boolForKey:@"auto_cast"] : YES;
+    if (winEnabled()) { // v0.9.67:小窗模式不自动开/关录屏;PhoneAgent 要在前台,小窗才看得见
+        autoCast = NO;
+        if (appStateNow() != UIApplicationStateActive) { openApp(NSBundle.mainBundle.bundleIdentifier); waitAppActive(6); usleep(500 * 1000); }
+        agentSay(@"小窗模式:不开屏幕录制,App 在右上角小窗里运行");
+    }
     BOOL proceed = YES;
     if (autoCast && !broadcastAlive()) {
         agentSay(@"屏幕录制没开,正在自动开启……");

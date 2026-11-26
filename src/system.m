@@ -4,6 +4,13 @@
 #pragma mark - 打开 App
 
 BOOL openApp(NSString *bid) {
+    // v0.9.67 小窗模式:任务中打开别的 App 时,改为在 PhoneAgent 的小窗里打开
+    if (winEnabled() && gAgentRunning && bid.length && ![bid isEqualToString:NSBundle.mainBundle.bundleIdentifier] && ![bid isEqualToString:@"com.apple.springboard"]) {
+        NSString *n = nil;
+        BOOL ok = winOpen(bid, &n);
+        agentSay(ok ? [NSString stringWithFormat:@"小窗:%@", n ?: @"已打开"] : [NSString stringWithFormat:@"小窗打开失败:%@", n ?: @""]);
+        return ok;
+    }
     Class c = NSClassFromString(@"LSApplicationWorkspace");
     if (!c) return NO;
     id ws = ((id (*)(id, SEL))objc_msgSend)(c, NSSelectorFromString(@"defaultWorkspace"));
