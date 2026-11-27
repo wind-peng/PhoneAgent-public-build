@@ -66,13 +66,15 @@ NSString *winBid(void) { return gWHud ? (gWActive ? gWBid : nil) : (gRActive ? g
 BOOL winTouchBlocked(void) { return gWHud ? (gWActive && !gPAFront) : NO; } // 悬浮窗盖在所有界面上,PhoneAgent 在后台也能点
 
 // 触摸坐标(0~1,按整屏算)换到小窗里:屏幕点 = 小窗左上角 + App 坐标 × 0.3
-void winMapNorm(double *nx, double *ny) {
+// v0.9.79:小窗开着但读不到位置时返回 NO,这次触摸不发(以前会按整屏坐标点到真实屏幕上)
+BOOL winMapNorm(double *nx, double *ny) {
     double ox = gWOX, oy = gWOY, k = kWinK;
-    if (gWHud) { if (!gWActive) return; }
-    else { if (!gRActive || !hudGeo(&ox, &oy, &k)) return; }
+    if (gWHud) { if (!gWActive) return YES; }
+    else { if (!gRActive) return YES; if (!hudGeo(&ox, &oy, &k)) return NO; }
     CGSize s = screenSize();
     *nx = (ox + *nx * s.width * k) / s.width;
     *ny = (oy + *ny * s.height * k) / s.height;
+    return YES;
 }
 
 static void wWatchFront(void) {
@@ -87,7 +89,8 @@ static void wWatchFront(void) {
     });
 }
 
-// 结束已在跑的同名 App(微信等已在后台时不结束就嵌不出画面,lab13 验证)
+// 结束已在跑的同名 App(lab13 时和其他改动一起加的,单独是否必要未验证;v0.9.79 可在设置里关掉做对比)
+BOOL gWNoKill = NO;
 void winKill(NSString *bid) {
     if (!bid.length) return;
     @try {
@@ -233,7 +236,7 @@ static BOOL lOpen(NSString *bid, NSString **note) {
                       @"UIMutableApplicationSceneSettings", @"UIMutableApplicationSceneClientSettings"];
     for (NSString *n in need) if (!wC(n)) { if (note) *note = [@"系统缺少 " stringByAppendingString:n]; return NO; }
     lClose();
-    winKill(bid);
+    if (!gWNoKill) winKill(bid); // v0.9.79:设置里可关掉“先结束”
     __block NSString *fail = @"启动超时";
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     __block id keepTx = nil;

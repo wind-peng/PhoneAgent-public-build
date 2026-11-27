@@ -129,7 +129,8 @@ BOOL winEnabled(void);
 BOOL winActive(void);
 NSString *winBid(void);
 BOOL winTouchBlocked(void);
-void winMapNorm(double *nx, double *ny);
+BOOL winMapNorm(double *nx, double *ny); // v0.9.79:NO=读不到小窗位置,这次触摸不发
+extern BOOL gWNoKill;
 BOOL winOpen(NSString *bid, NSString **note);
 void winClose(void);
 void winKill(NSString *bid);

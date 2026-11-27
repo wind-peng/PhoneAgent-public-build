@@ -45,7 +45,13 @@ void sendFinger(double nx, double ny, int phase) {
     if (!(ny >= 0)) ny = 0; if (ny > 0.9995) ny = 0.9995;
     // v0.9.67 小窗模式:App 坐标换到右上角小窗里;PhoneAgent 进了后台就不发(小窗不在屏幕上,会点到别的 App)
     if (winTouchBlocked()) return;
-    winMapNorm(&nx, &ny);
+    // v0.9.79:读不到小窗位置就不发;抬起时用上次的位置,免得手指一直按着
+    static double lastX = -1, lastY = -1;
+    if (!winMapNorm(&nx, &ny)) {
+        if (phase != 2 || lastX < 0) return;
+        nx = lastX; ny = lastY;
+    }
+    if (phase == 2) { lastX = -1; lastY = -1; } else { lastX = nx; lastY = ny; }
     uint64_t t = mach_absolute_time();
     BOOL touching = (phase != 2);
     uint32_t mask = (phase == 1) ? 0x4 : 0x3;

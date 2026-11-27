@@ -9,6 +9,7 @@
 #import <spawn.h>
 #import <signal.h>
 #import <sys/stat.h>
+#import <sys/param.h>
 #import <sys/wait.h>
 #import <mach-o/dyld.h>
 
@@ -144,6 +145,7 @@ static void hHandle(int c) {
     if ([path isEqualToString:@"/ping"]) { hJSON(c, 200, @{@"ok": @YES, @"active": @(winActive())}); return; }
     if ([path isEqualToString:@"/open"]) {
         NSString *note = nil;
+        gWNoKill = [q[@"nokill"] isEqualToString:@"1"];
         BOOL ok = winOpen(q[@"bid"] ?: @"", &note);
         hlog(@"打开 %@:%@", q[@"bid"], ok ? (note ?: @"成功") : (note ?: @"失败"));
         hJSON(c, 200, @{@"ok": @(ok), @"note": note ?: @""});
@@ -249,7 +251,7 @@ int paHudMain(int argc, char *argv[]) {
         gHudServe = argc > 4 && strcmp(argv[4], "serve") == 0;
         gHudPAPid = argc > 5 ? (pid_t)atoi(argv[5]) : 0;
         [[NSString stringWithFormat:@"%d", getpid()] writeToFile:HUD_PID atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        chmod(HUD_PID.UTF8String, 0666);
+        chmod(HUD_PID.UTF8String, 0600);
         NSSetUncaughtExceptionHandler(&hudUncaught);
         hlog(gHudServe ? @"== 悬浮层启动(任务用)" : @"== lab14 悬浮层启动,目标 %@", gHudBid);
         void *gs = dlopen("/System/Library/PrivateFrameworks/GraphicsServices.framework/GraphicsServices", RTLD_NOW);
@@ -290,9 +292,24 @@ int paHudMain(int argc, char *argv[]) {
 }
 
 // 结束悬浮层(root 身份启动,PhoneAgent 自己是 mobile,杀不了 root 进程)
+// v0.9.79:杀之前核对这个进程是不是 PhoneAgent 自己(防止别的程序改 PID 文件借 root 杀别的进程)
+extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 int paHudExitMain(void) {
     NSString *p = [NSString stringWithContentsOfFile:HUD_PID encoding:NSUTF8StringEncoding error:nil];
-    if (p.intValue > 0) kill(p.intValue, SIGKILL);
+    int pid = p.intValue;
+    if (pid > 1) {
+        char path[4096] = {0};
+        uint32_t sz = 0; _NSGetExecutablePath(NULL, &sz);
+        char *me = calloc(1, sz + 1); _NSGetExecutablePath(me, &sz);
+        char rme[PATH_MAX] = {0};
+        if (!realpath(me, rme)) strlcpy(rme, me, sizeof rme);
+        char rp[PATH_MAX] = {0};
+        if (proc_pidpath(pid, path, sizeof path) > 0) {
+            if (!realpath(path, rp)) strlcpy(rp, path, sizeof rp);
+            if (strcmp(rp, rme) == 0) kill(pid, SIGKILL);
+        }
+        free(me);
+    }
     unlink(HUD_PID.UTF8String);
     return 0;
 }
@@ -390,7 +407,7 @@ static BOOL hudEnsure(NSString **note) {
 BOOL hudRemoteOpen(NSString *bid, NSString **note) {
     if (!hudEnsure(note)) return NO;
     NSInteger st = 0;
-    NSData *d = hudReq(@"/open", @{@"bid": bid ?: @""}, 35, &st); // 打开+等首帧+查黑屏最多约 27 秒
+    NSData *d = hudReq(@"/open", @{@"bid": bid ?: @"", @"nokill": [NSUserDefaults.standardUserDefaults objectForKey:@"win_kill"] && ![NSUserDefaults.standardUserDefaults boolForKey:@"win_kill"] ? @"1" : @"0"}, 35, &st); // 打开+等首帧+查黑屏最多约 27 秒
     NSDictionary *j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
     if (![j isKindOfClass:NSDictionary.class]) { if (note) *note = [NSString stringWithFormat:@"悬浮层没回应(HTTP %ld)", (long)st]; return NO; }
     if (note) *note = j[@"note"];
