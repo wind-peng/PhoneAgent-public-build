@@ -7,7 +7,7 @@
   <key>CFBundleIdentifier</key><string>com.example.phoneagent.lab.broadcast</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>PhoneAgent</string>
-  <key>CFBundleDisplayName</key><string>PhoneAgent</string>
+  <key>CFBundleDisplayName</key><string>PA实验</string>
   <key>CFBundlePackageType</key><string>XPC!</string>
   <key>CFBundleShortVersionString</key><string>0.3.0</string>
   <key>CFBundleVersion</key><string>1</string>
