@@ -597,13 +597,17 @@ static NSData *attachJPEG(UIImage *img) {
     [axT setTitle:@"无障碍探测(点后 6 秒内切到微信/淘宝/美团等,停 10 秒再回来看执行记录)" forState:UIControlStateNormal];
     axT.titleLabel.numberOfLines = 0;
     [axT addTarget:self action:@selector(onAXProbe) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *skipB = [UIButton buttonWithType:UIButtonTypeSystem];
+    [skipB setTitle:@"小窗黑屏的 App(这些 App 自动改用录屏;点开查看/清空)" forState:UIControlStateNormal];
+    skipB.titleLabel.numberOfLines = 0;
+    [skipB addTarget:self action:@selector(onWinSkip) forControlEvents:UIControlEventTouchUpInside];
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
         [self hdr:@"Token 统计(每次任务结束也会在执行记录里显示本次用量)"],
         self.tokL, tokClr, cacheT,
         [self hdr:@"实验"],
         [self sw:@"小窗模式(测试):任务里的 App 在悬浮小窗里运行,盖在主屏和其他 App 上,可拖动、可缩放;不用屏幕录制" key:@"win_mode" def:NO],
         [self sw:@"小窗模式:任务结束后跳回 PhoneAgent 看结果(关=不跳,直接语音播报结果)" key:@"win_end_open" def:NO],
-        [self btn:@"小窗黑屏的 App(这些 App 自动改用录屏;点开查看/清空)" action:@selector(onWinSkip)],
+        skipB,
         axT,
         [self sw:@"每次调用模型都在执行记录里写一行 Token 明细(第几步、几张图、输入/缓存/输出)" key:@"token_step_log" def:YES],
         [self hdr:@"模型请求"],
