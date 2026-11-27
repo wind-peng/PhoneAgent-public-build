@@ -47,7 +47,17 @@ static Class wC(NSString *n) { return NSClassFromString(n); }
 static BOOL wHas(id o, const char *s) { return o && [o respondsToSelector:sel_registerName(s)]; }
 static void wMain(dispatch_block_t b) { if (NSThread.isMainThread) b(); else dispatch_sync(dispatch_get_main_queue(), b); }
 
-BOOL winEnabled(void) { return paOn(@"win_mode", NO); }
+// v0.9.77:某个 App 在小窗里是黑屏(美团)时,本次任务改回普通方式(屏幕录制);这类 App 记下来,下次直接用普通方式
+static volatile BOOL gWinFallback = NO;
+BOOL winEnabled(void) { return !gWinFallback && paOn(@"win_mode", NO); }
+void winSetFallback(BOOL on) { gWinFallback = on; }
+BOOL winFallbackOn(void) { return gWinFallback; }
+BOOL winSkipped(NSString *bid) { NSArray *a = [NSUserDefaults.standardUserDefaults arrayForKey:@"win_skip"]; return bid.length && [a containsObject:bid]; }
+void winSkipAdd(NSString *bid) {
+    if (!bid.length || winSkipped(bid)) return;
+    NSMutableArray *a = [[NSUserDefaults.standardUserDefaults arrayForKey:@"win_skip"] mutableCopy] ?: [NSMutableArray array];
+    [a addObject:bid]; [NSUserDefaults.standardUserDefaults setObject:a forKey:@"win_skip"];
+}
 // v0.9.73:悬浮层模式。PhoneAgent 里调这些函数时转给悬浮层进程(pahud.m 的 hudRemote*),悬浮层进程里才真的动场景
 static volatile BOOL gRActive = NO;       // PhoneAgent 这边:悬浮小窗里有 App
 static NSString *gRBid;
@@ -191,6 +201,25 @@ static long wContentState(void) {
     return st;
 }
 
+static UIImage *lSnapshot(NSString **err);
+// 图里最亮的点有多亮(0~255,缩成小图粗看);全黑的图很小
+static int wMaxLuma(CGImageRef cg) {
+    if (!cg) return 0;
+    const int W = 36, H = 78;
+    uint8_t *buf = calloc(W * H, 4);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, W, H, 8, W * 4, cs, kCGImageAlphaNoneSkipLast);
+    CGColorSpaceRelease(cs);
+    int mx = 0;
+    if (ctx) {
+        CGContextDrawImage(ctx, CGRectMake(0, 0, W, H), cg);
+        for (int i = 0; i < W * H; i++) { int l = (buf[i*4] * 3 + buf[i*4+1] * 6 + buf[i*4+2]) / 10; if (l > mx) mx = l; }
+        CGContextRelease(ctx);
+    }
+    free(buf);
+    return mx;
+}
+
 // 在小窗里打开 App(后台线程调用;会等到 App 画出第一帧,最多约 10 秒)
 static BOOL lOpen(NSString *bid, NSString **note) {
     if (!bid.length) { if (note) *note = @"包名为空"; return NO; }
@@ -248,6 +277,16 @@ static BOOL lOpen(NSString *bid, NSString **note) {
     if (fail) { lClose(); if (note) *note = fail; return NO; }
     for (int i = 0; i < 40 && wContentState() != 2; i++) usleep(200 * 1000); // 等 App 画出第一帧(微信约 2~4 秒)
     usleep(500 * 1000);
+    // v0.9.77:有的 App(美团)在小窗里一直全黑;等最多约 8 秒还是全黑,就关掉小窗,告诉 PhoneAgent 改用普通方式
+    {
+        BOOL black = YES;
+        for (int i = 0; i < 11 && black; i++) {
+            UIImage *u = lSnapshot(NULL);
+            if (u && wMaxLuma(u.CGImage) >= 16) black = NO;
+            else usleep(750 * 1000);
+        }
+        if (black) { lClose(); if (note) *note = @"画面全黑(这个 App 不支持小窗)"; return NO; }
+    }
     if (note) *note = wContentState() == 2 ? @"已在小窗打开" : @"已在小窗打开(画面可能还在加载)";
     return YES;
 }

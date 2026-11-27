@@ -6,10 +6,17 @@
 BOOL openApp(NSString *bid) {
     // v0.9.67 小窗模式:任务中打开别的 App 时,改为在 PhoneAgent 的小窗里打开
     if (winEnabled() && gAgentRunning && bid.length && ![bid isEqualToString:NSBundle.mainBundle.bundleIdentifier] && ![bid isEqualToString:@"com.apple.springboard"]) {
+        BOOL skip = winSkipped(bid);
         NSString *n = nil;
-        BOOL ok = winOpen(bid, &n);
-        agentSay(ok ? [NSString stringWithFormat:@"小窗:%@", n ?: @"已打开"] : [NSString stringWithFormat:@"小窗打开失败:%@", n ?: @""]);
-        return ok;
+        BOOL ok = skip ? NO : winOpen(bid, &n);
+        if (ok) { agentSay([NSString stringWithFormat:@"小窗:%@", n ?: @"已打开"]); return YES; }
+        // v0.9.77:小窗打不开或全黑 → 本次任务改用普通方式(自动开屏幕录制,App 全屏打开)
+        agentSay(skip ? @"小窗:这个 App 之前在小窗里是全黑的,改用普通方式(屏幕录制)打开"
+                      : [NSString stringWithFormat:@"小窗打开失败:%@;改用普通方式(屏幕录制)打开", n ?: @""]);
+        if (!skip && [n containsString:@"全黑"]) winSkipAdd(bid);
+        winShutdown();
+        winSetFallback(YES);
+        if (!winFallbackCast()) agentSay(@"自动开启屏幕录制没成功,后面可能拿不到画面");
     }
     Class c = NSClassFromString(@"LSApplicationWorkspace");
     if (!c) return NO;

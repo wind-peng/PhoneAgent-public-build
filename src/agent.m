@@ -1191,6 +1191,14 @@ static BOOL ensureBroadcast(NSString **note) {
 }
 
 // 任务结束后关闭录屏:让广播扩展自己结束(扩展调用 finishBroadcastWithError),最多等 10 秒
+// v0.9.77:小窗改普通方式时自动开录屏
+BOOL winFallbackCast(void) {
+    NSString *n = nil;
+    BOOL ok = ensureBroadcast(&n);
+    agentSay(ok ? @"屏幕录制已自动开启" : [NSString stringWithFormat:@"自动开启屏幕录制失败(%@)", n ?: @""]);
+    return ok;
+}
+
 static void requestBroadcastStop(void) {
     if (!broadcastAlive()) return;
     gBroadcastStopRequested = YES;
@@ -2086,6 +2094,7 @@ static void agentRunClaimed(NSString *task, NSString *base, NSString *key, NSStr
         [ud removeObjectForKey:@"macro_replay"]; [ud removeObjectForKey:@"exp_replay_on"]; [ud setBool:NO forKey:@"ocr_accurate"];
         [ud setBool:YES forKey:@"mig_0921"];
     }
+    winSetFallback(NO);
     BOOL autoCast = [ud objectForKey:@"auto_cast"] ? [ud boolForKey:@"auto_cast"] : YES;
     if (winEnabled()) { // v0.9.73:小窗模式不开录屏;App 在悬浮小窗里跑,盖在所有界面上,你可以继续用手机
         autoCast = NO;
@@ -2101,5 +2110,5 @@ static void agentRunClaimed(NSString *task, NSString *base, NSString *key, NSStr
     tokReset();
     if (proceed && gAgentRunning) agentRunCore(task, base, key, model);
     { NSString *ts = tokSummary(NO); if (ts.length) agentSay(ts); }
-    taskRunEnd(task, autoCast);
+    taskRunEnd(task, autoCast || winFallbackOn()); // 中途改成普通方式时,结束也关掉录屏
 }

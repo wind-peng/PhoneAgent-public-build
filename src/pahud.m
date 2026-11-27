@@ -518,7 +518,7 @@ static BOOL hudEnsure(NSString **note) {
 BOOL hudRemoteOpen(NSString *bid, NSString **note) {
     if (!hudEnsure(note)) return NO;
     NSInteger st = 0;
-    NSData *d = hudReq(@"/open", @{@"bid": bid ?: @""}, 15, &st);
+    NSData *d = hudReq(@"/open", @{@"bid": bid ?: @""}, 35, &st); // 打开+等首帧+查黑屏最多约 27 秒
     NSDictionary *j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
     if (![j isKindOfClass:NSDictionary.class]) { if (note) *note = [NSString stringWithFormat:@"悬浮层没回应(HTTP %ld)", (long)st]; return NO; }
     if (note) *note = j[@"note"];
