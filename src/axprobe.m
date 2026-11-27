@@ -257,6 +257,34 @@ static id axHitAt(CGPoint p) { // v0.9.34:按坐标取元素(设备上可用的 
     if ([w respondsToSelector:s]) { @try { el = ((id (*)(id, SEL, id))objc_msgSend)(w, s, u); } @catch (NSException *e) {} }
     return el;
 }
+// v0.9.78:开录屏时读系统“屏幕直播”面板上的按钮。返回 1=看到「开始直播」,2=看到「停止直播」,0=读不到;center 是按钮中心(屏幕点)
+int axBroadcastButton(CGPoint *center) {
+    @try {
+        axInitOnce();
+        CGSize sz = UIScreen.mainScreen.bounds.size;
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        for (CGFloat y = sz.height * 0.40; y < sz.height * 0.78; y += 14) {
+            for (CGFloat fx = 0.35; fx <= 0.66; fx += 0.15) {
+                if (CFAbsoluteTimeGetCurrent() - t0 > 2.5) return 0;
+                id el = axHitAt(CGPointMake(sz.width * fx, y));
+                NSString *l = el ? axKV(el, @"label") : nil;
+                if (![l isKindOfClass:NSString.class] || !l.length) continue;
+                int kind = ([l containsString:@"开始直播"] || [l.lowercaseString containsString:@"start broadcast"]) ? 1
+                         : ([l containsString:@"停止直播"] || [l.lowercaseString containsString:@"stop broadcast"]) ? 2 : 0;
+                if (!kind) continue;
+                CGPoint c = CGPointMake(sz.width * fx, y);
+                id fv = axKV(el, @"frame");
+                if ([fv isKindOfClass:NSValue.class] && strcmp([(NSValue *)fv objCType], @encode(CGRect)) == 0) {
+                    CGRect r = [(NSValue *)fv CGRectValue];
+                    if (r.size.width > 10 && r.size.height > 10) c = CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r));
+                }
+                if (center) *center = c;
+                return kind;
+            }
+        }
+    } @catch (NSException *e) {}
+    return 0;
+}
 static NSString *axTidy(NSString *t) {
     t = [t stringByReplacingOccurrencesOfString:@"人民币" withString:@"¥"];
     { // v0.9.34:「128.2元」这类写法也统一成 ¥128.2

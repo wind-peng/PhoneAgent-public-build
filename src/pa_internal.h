@@ -141,11 +141,8 @@ double winScale(void);
 // lab14 悬浮层(pahud.m)
 int paHudMain(int argc, char *argv[]);
 int paHudExitMain(void);
-int paClipMain(int argc, char *argv[]);
-NSString *hudStart(NSString *bid);
 NSString *hudStop(void);
 NSString *hudReadLog(void);
-NSString *hudKey(void);
 // v0.9.73 悬浮层模式:PhoneAgent ↔ 悬浮层进程
 BOOL hudGeo(double *ox, double *oy, double *k);
 void hudWriteGeo(double ox, double oy, double k);
@@ -158,6 +155,7 @@ BOOL winFallbackOn(void);
 BOOL winSkipped(NSString *bid);
 void winSkipAdd(NSString *bid);
 BOOL winFallbackCast(void);
+int axBroadcastButton(CGPoint *center);
 void touchAdjust(double *x, double *y);
 void doTapRaw(double x, double y);
 void doSwipeSmooth(double x1, double y1, double x2, double y2, int ms, int holdMs);
@@ -202,4 +200,3 @@ BOOL ocrAccurateOn(void);
 // v0.9.18 OCR 自检
 NSString *ocrSelfTest(void (^progress)(NSString *soFar));
 NSString *ocrClearCache(void);
-UIViewController *sceneLabVC(void); // lab1 嵌入实验

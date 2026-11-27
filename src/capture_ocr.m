@@ -158,11 +158,31 @@ static UIImage *shotR(NSString **note) {
     return img;
 }
 
+// 图里最亮的点有多亮(0~255,缩成小图粗看)
+static int capMaxLuma(CGImageRef cg) {
+    if (!cg) return 0;
+    const int W = 36, H = 78;
+    uint8_t *buf = calloc(W * H, 4);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, W, H, 8, W * 4, cs, kCGImageAlphaNoneSkipLast);
+    CGColorSpaceRelease(cs);
+    int mx = 0;
+    if (ctx) {
+        CGContextDrawImage(ctx, CGRectMake(0, 0, W, H), cg);
+        for (int i = 0; i < W * H; i++) { int l = (buf[i*4] * 3 + buf[i*4+1] * 6 + buf[i*4+2]) / 10; if (l > mx) mx = l; }
+        CGContextRelease(ctx);
+    }
+    free(buf);
+    return mx;
+}
+
 // 依次尝试 R→A→B→C→D;全部失败时 err 里列出每种方法的原因
 UIImage *takeScreenshot(NSString **err) {
     // v0.9.67 小窗模式:小窗开着就只用小窗 App 的场景快照(原尺寸,不需要录屏)
     if (winActive()) {
+        // v0.9.78:小窗里 App 一时没画出来(全黑)时,程序先等一等再拍,最多约 4 秒,不把黑屏交给模型乱点
         UIImage *w = winSnapshot(err);
+        for (int i = 0; i < 5 && w && capMaxLuma(w.CGImage) < 16; i++) { usleep(800 * 1000); UIImage *w2 = winSnapshot(err); if (w2) w = w2; }
         if (w) gShotMethod = @"W";
         return w;
     }

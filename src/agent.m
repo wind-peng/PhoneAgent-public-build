@@ -1150,18 +1150,30 @@ static void triggerPicker(void) {
     });
 }
 
+// 系统是否正在录屏/投屏(不管是谁开的)
+static BOOL screenCaptured(void) {
+    __block BOOL c = NO;
+    if (NSThread.isMainThread) c = UIScreen.mainScreen.isCaptured;
+    else dispatch_sync(dispatch_get_main_queue(), ^{ c = UIScreen.mainScreen.isCaptured; });
+    return c;
+}
+
+// v0.9.78:开录屏不再闭眼连点。
+// 1) 先用无障碍读面板上的按钮:看到「开始直播」就点它,看到「停止直播」绝不点;
+// 2) 读不到才按记住的位置盲点,但每次点之前先看系统是不是已经在录屏:已在录(哪怕不是我们的)就停手,不会再把它点关。
 static BOOL ensureBroadcast(NSString **note) {
     if (broadcastAlive()) return YES;
-    // 冷启动或刚回到前台时,扩展的心跳最多要 2 秒才到;先等一等,免得录屏明明开着却又去触发“开始直播”(那样会点到“停止直播”)
+    // 冷启动或刚回到前台时,扩展的心跳最多要 2 秒才到;先等一等
     for (int i = 0; i < 18 && !broadcastAlive(); i++) usleep(200 * 1000);
     if (broadcastAlive()) return YES;
+    if (screenCaptured()) { *note = @"系统已经在录屏,但 PhoneAgent 收不到画面(可能开的是别的 App 的录屏)。请先在控制中心停掉录屏再试"; return NO; }
     if (!gPicker) { *note = @"找不到录屏按钮"; return NO; }
     if (appStateNow() != UIApplicationStateActive) {
         openApp(NSBundle.mainBundle.bundleIdentifier);
         if (!waitAppActive(6)) { *note = @"PhoneAgent 没能回到前台"; return NO; }
         usleep(700 * 1000);
     }
-    castGuard(YES); // 盲点期间在 PhoneAgent 自己的界面上盖一层透明的"吞点击"层:系统面板在它上面,点面板不受影响;面板不在时,盲点只会落在这层上
+    castGuard(YES); // 盲点期间盖一层透明的"吞点击"层:系统面板在它上面,点面板不受影响
     CGSize sc = screenSize();
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     double saved = [d doubleForKey:@"bcast_btn_y"];
@@ -1169,28 +1181,42 @@ static BOOL ensureBroadcast(NSString **note) {
     if (saved > 0) [cands addObject:@(saved)];
     for (NSNumber *r in @[@0.589, @0.575, @0.603, @0.56, @0.62]) // 0.589 来自你发的截图:“开始直播”按钮中心在屏幕高度的 58.9% 处
         if (fabs(r.doubleValue - saved) > 0.005) [cands addObject:r];
-    for (NSNumber *r in cands) {
+    BOOL ok = NO; NSString *why = nil;
+    for (NSUInteger n = 0; n < cands.count; n++) {
+        if (screenCaptured()) { why = @"系统已经在录屏,但 PhoneAgent 收不到画面(可能开的是别的 App 的录屏)"; break; }
         triggerPicker();
         usleep(1600 * 1000); // 等系统的“屏幕直播”面板弹出
-        doTap(sc.width / 2, sc.height * r.doubleValue);
-        for (int i = 0; i < 40 && !broadcastAlive(); i++) usleep(200 * 1000); // 3 秒倒计时 + 扩展连接
-        if (broadcastAlive()) {
-            [d setDouble:r.doubleValue forKey:@"bcast_btn_y"];
+        CGPoint bp = CGPointZero;
+        int kind = axBroadcastButton(&bp);
+        if (kind == 2) { // 面板上是「停止直播」:说明已经在录,绝不能点
+            doTap(sc.width / 2, sc.height * 0.81);
             usleep(900 * 1000);
-            doTap(sc.width / 2, sc.height * 0.81); // 倒计时结束后系统面板还停在屏幕上:点面板下面空白区域的中心(按截图:面板下缘 61.8%,下面空白区中心约 81%)把它收起来
-            usleep(900 * 1000);
-            castGuard(NO);
-            return YES;
+            for (int i = 0; i < 30 && !broadcastAlive(); i++) usleep(200 * 1000);
+            ok = broadcastAlive();
+            if (!ok) why = @"面板显示已经在录屏,但 PhoneAgent 收不到画面(可能开的是别的 App 的录屏)";
+            break;
         }
-        doTap(sc.width / 2, sc.height * 0.81); // 没点中:点面板下面的空白处把它收起来,再试下一个位置
+        double ry = sc.height * [cands[n] doubleValue];
+        if (kind == 1) { agentSay(@"录屏:在面板上认出了「开始直播」"); ry = bp.y; }
+        doTap(kind == 1 ? bp.x : sc.width / 2, ry);
+        for (int i = 0; i < 50 && !broadcastAlive(); i++) usleep(200 * 1000); // 3 秒倒计时 + 扩展连接,最多 10 秒
+        if (broadcastAlive()) {
+            [d setDouble:ry / sc.height forKey:@"bcast_btn_y"];
+            usleep(900 * 1000);
+            doTap(sc.width / 2, sc.height * 0.81); // 倒计时结束后系统面板还停在屏幕上:点面板下面空白处把它收起来
+            usleep(900 * 1000);
+            ok = YES;
+            break;
+        }
+        doTap(sc.width / 2, sc.height * 0.81); // 没成功:点面板下面的空白处把它收起来
         usleep(900 * 1000);
+        if (kind == 1 || screenCaptured()) { why = @"点了「开始直播」,但 PhoneAgent 收不到画面"; break; } // 点中了却收不到画面,再点只会把它点关
     }
     castGuard(NO);
-    *note = @"盲点“开始直播”的几个位置都没有成功";
-    return NO;
+    if (!ok) *note = why ?: @"盲点“开始直播”的几个位置都没有成功";
+    return ok;
 }
 
-// 任务结束后关闭录屏:让广播扩展自己结束(扩展调用 finishBroadcastWithError),最多等 10 秒
 // v0.9.77:小窗改普通方式时自动开录屏
 BOOL winFallbackCast(void) {
     NSString *n = nil;

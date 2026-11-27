@@ -597,17 +597,14 @@ static NSData *attachJPEG(UIImage *img) {
     [axT setTitle:@"无障碍探测(点后 6 秒内切到微信/淘宝/美团等,停 10 秒再回来看执行记录)" forState:UIControlStateNormal];
     axT.titleLabel.numberOfLines = 0;
     [axT addTarget:self action:@selector(onAXProbe) forControlEvents:UIControlEventTouchUpInside];
-    UIButton *labB = [UIButton buttonWithType:UIButtonTypeSystem];
-    [labB setTitle:@"嵌入实验(把别的 App 画面嵌进来,测截图/OCR)" forState:UIControlStateNormal];
-    labB.titleLabel.numberOfLines = 0;
-    [labB addTarget:self action:@selector(onSceneLab) forControlEvents:UIControlEventTouchUpInside];
     UIStackView *st = [[UIStackView alloc] initWithArrangedSubviews:@[
         [self hdr:@"Token 统计(每次任务结束也会在执行记录里显示本次用量)"],
         self.tokL, tokClr, cacheT,
         [self hdr:@"实验"],
         [self sw:@"小窗模式(测试):任务里的 App 在悬浮小窗里运行,盖在主屏和其他 App 上,可拖动、可缩放;不用屏幕录制" key:@"win_mode" def:NO],
         [self sw:@"小窗模式:任务结束后跳回 PhoneAgent 看结果(关=不跳,直接语音播报结果)" key:@"win_end_open" def:NO],
-        labB, axT,
+        [self btn:@"小窗黑屏的 App(这些 App 自动改用录屏;点开查看/清空)" action:@selector(onWinSkip)],
+        axT,
         [self sw:@"每次调用模型都在执行记录里写一行 Token 明细(第几步、几张图、输入/缓存/输出)" key:@"token_step_log" def:YES],
         [self hdr:@"模型请求"],
         [self sw:@"DeepSeek 分档:常规步骤 deepseek-flash,卡住/规划/完成自检用 deepseek-v4-pro" key:@"ds_tiering" def:YES],
@@ -701,14 +698,24 @@ static NSData *attachJPEG(UIImage *img) {
     }]];
     [self presentViewController:a animated:YES completion:nil];
 }
-- (void)onSceneLab {
-    UINavigationController *n = [[UINavigationController alloc] initWithRootViewController:sceneLabVC()];
-    n.modalPresentationStyle = UIModalPresentationFullScreen;
-    UIViewController *root = n.viewControllers.firstObject;
-    root.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose target:self action:@selector(dismissLab)];
-    [self presentViewController:n animated:YES completion:nil];
+// v0.9.78:小窗里黑屏、自动改用录屏的 App 名单
+- (void)onWinSkip {
+    NSArray *ids = [NSUserDefaults.standardUserDefaults arrayForKey:@"win_skip"] ?: @[];
+    NSMutableArray *names = [NSMutableArray array];
+    Class P = NSClassFromString(@"LSApplicationProxy");
+    for (NSString *b in ids) {
+        NSString *n = nil;
+        @try { id px = P ? ((id (*)(id, SEL, id))objc_msgSend)(P, NSSelectorFromString(@"applicationProxyForIdentifier:"), b) : nil; n = [px valueForKey:@"localizedName"]; } @catch (NSException *e) {}
+        [names addObject:n.length ? n : b];
+    }
+    NSString *msg = names.count ? [NSString stringWithFormat:@"%@\n\n这些 App 在小窗里是黑屏,任务会自动改用屏幕录制。清空后下次会重新在小窗里试。", [names componentsJoinedByString:@"、"]] : @"名单是空的";
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"小窗黑屏的 App" message:msg preferredStyle:UIAlertControllerStyleAlert];
+    if (names.count) [a addAction:[UIAlertAction actionWithTitle:@"清空" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:@"win_skip"];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
 }
-- (void)dismissLab { [self.presentedViewController dismissViewControllerAnimated:YES completion:nil]; }
 - (void)onCalib {
     CalibVC *c = [CalibVC new];
     c.modalPresentationStyle = UIModalPresentationFullScreen;

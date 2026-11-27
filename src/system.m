@@ -16,7 +16,11 @@ BOOL openApp(NSString *bid) {
         if (!skip && [n containsString:@"全黑"]) winSkipAdd(bid);
         winShutdown();
         winSetFallback(YES);
-        if (!winFallbackCast()) agentSay(@"自动开启屏幕录制没成功,后面可能拿不到画面");
+        if (!winFallbackCast()) { // v0.9.78:录屏没开成就停,不让模型看不见画面乱点
+            agentSay(@"任务停止:改用普通方式需要屏幕录制,但没能自动开启");
+            gAgentRunning = NO;
+            return NO;
+        }
     }
     Class c = NSClassFromString(@"LSApplicationWorkspace");
     if (!c) return NO;
