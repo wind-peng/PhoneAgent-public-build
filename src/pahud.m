@@ -29,7 +29,6 @@ extern int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t *__restric
 static NSString *gHudBid, *gHudPAKey;
 static BOOL gHudServe = NO;     // v0.9.73:给 PhoneAgent 跑任务用(不是实验页的自测)
 static pid_t gHudPAPid = 0;
-static UIWindow *gHudWin;
 
 // ---------- 悬浮层进程里写日志(PhoneAgent 那边读) ----------
 static void hlog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
@@ -57,28 +56,99 @@ static void hlog(NSString *fmt, ...) {
 - (BOOL)_shouldCreateContextAsSecure { return YES; }
 @end
 
-// ---------- lab15:拖动 / 放大缩小 ----------
+// ---------- lab15:拖动 / 放大缩小;v0.9.81 起最多 3 个小窗,各自拖动/缩放 ----------
 #define HUD_BAR 26.0
-static UIView *gHudBar, *gHudContent;
+#define HUD_N 3
+static PAHudWindow *gHW[HUD_N];
+static UIView *gHBar[HUD_N], *gHContent[HUD_N];
+static double gHK[HUD_N];
+static id gHHosting[HUD_N];
 static int gDragMode = 0;           // 0 没拖;1 移动;2 改大小
+static int gDragSlot = -1;
 static CGPoint gDragP0, gDragO0;
 static double gDragK0;
 
-// 主线程:按左上角和缩放重新摆小窗
-static void hudLayout(CGPoint o, double k) {
+// 主线程:按左上角和缩放重新摆第 i 个小窗
+static void hudLayout(int i, CGPoint o, double k) {
+    PAHudWindow *win = gHW[i];
+    if (!win) return;
     CGSize sc = UIScreen.mainScreen.bounds.size;
     k = MAX(0.2, MIN(0.85, k));
     CGFloat w = round(sc.width * k), h = round(sc.height * k);
     o.x = MAX(0, MIN(sc.width - w, o.x));
     o.y = MAX(0, MIN(sc.height - h - HUD_BAR, o.y));
-    gHudWin.frame = CGRectMake(o.x, o.y, w, h + HUD_BAR);
-    gHudWin.rootViewController.view.frame = gHudWin.bounds;
-    gHudBar.frame = CGRectMake(0, 0, w, HUD_BAR);
-    [gHudBar viewWithTag:1].frame = CGRectMake(0, 0, w * 0.6, HUD_BAR);
-    [gHudBar viewWithTag:2].frame = CGRectMake(w * 0.6, 0, w * 0.4, HUD_BAR);
-    gHudContent.frame = CGRectMake(0, HUD_BAR, w, h);
-    winSetScale(k);
+    win.frame = CGRectMake(o.x, o.y, w, h + HUD_BAR);
+    win.rootViewController.view.frame = win.bounds;
+    gHBar[i].frame = CGRectMake(0, 0, w, HUD_BAR);
+    [gHBar[i] viewWithTag:1].frame = CGRectMake(0, 0, w * 0.6, HUD_BAR);
+    [gHBar[i] viewWithTag:2].frame = CGRectMake(w * 0.6, 0, w * 0.4, HUD_BAR);
+    gHContent[i].frame = CGRectMake(0, HUD_BAR, w, h);
+    gHK[i] = k;
+    winSlotScale(i, k);
     winRefreshOrigin();
+}
+
+// 主线程:建第 i 个小窗(系统级窗口,向 SpringBoard 登记,能盖在所有界面上)
+static PAHudWindow *hudMakeWin(int i) {
+    @try {
+        CGSize sc = UIScreen.mainScreen.bounds.size;
+        PAHudWindow *win = [[PAHudWindow alloc] initWithFrame:CGRectMake(0, 54, 10, 10)];
+        win.rootViewController = [UIViewController new];
+        win.rootViewController.view.backgroundColor = UIColor.blackColor;
+        win.layer.borderWidth = 1.5; win.layer.borderColor = UIColor.systemOrangeColor.CGColor;
+        win.layer.cornerRadius = 6;
+        win.clipsToBounds = YES;
+        // 顶上的拖动条:左边按住拖=移动,右边「⤡」按住拖=放大缩小
+        UIView *bar = [UIView new];
+        bar.backgroundColor = UIColor.systemOrangeColor;
+        UILabel *l1 = [UILabel new]; l1.text = @" ≡ 拖动"; l1.font = [UIFont boldSystemFontOfSize:12]; l1.textColor = UIColor.whiteColor;
+        UILabel *l2 = [UILabel new]; l2.text = @"⤡ "; l2.font = [UIFont boldSystemFontOfSize:16]; l2.textColor = UIColor.whiteColor; l2.textAlignment = NSTextAlignmentRight;
+        l1.tag = 1; l2.tag = 2;
+        [bar addSubview:l1]; [bar addSubview:l2];
+        UIView *content = [UIView new];
+        content.backgroundColor = UIColor.blackColor;
+        content.clipsToBounds = YES;
+        [win.rootViewController.view addSubview:content];
+        [win.rootViewController.view addSubview:bar];
+        gHBar[i] = bar; gHContent[i] = content; gHW[i] = win;
+        win.windowLevel = 10000010.0;
+        win.hidden = NO;
+        if (i == 0) [win makeKeyAndVisible];
+        // 默认并排在屏幕顶上,从右往左:第 1 个最右
+        double k = 0.3;
+        CGFloat w = round(sc.width * k);
+        hudLayout(i, CGPointMake(sc.width - (w + 8) * (i + 1), 54), k);
+        dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_NOW);
+        Class HC = NSClassFromString(@"SBSAccessibilityWindowHostingController");
+        unsigned int cid = [win respondsToSelector:sel_registerName("_contextId")] ? ((unsigned int (*)(id, SEL))objc_msgSend)(win, sel_registerName("_contextId")) : 0;
+        if (HC && cid) {
+            gHHosting[i] = [HC new];
+            ((void (*)(id, SEL, unsigned int, double))objc_msgSend)(gHHosting[i], sel_registerName("registerWindowWithContextID:atLevel:"), cid, win.windowLevel);
+            hlog(@"小窗 %d 已登记 context=%u", i + 1, cid);
+        } else hlog(@"✗ 登记小窗 %d 失败 HC=%@ context=%u", i + 1, HC, cid);
+        return win;
+    } @catch (NSException *e) { hlog(@"✗ 建小窗 %d 异常 %@", i + 1, e.reason ?: e.name); return nil; }
+}
+// 下面几个给 pawin.m 用(都在主线程)
+UIView *hudSlotContent(int i) {
+    if (i < 0 || i >= HUD_N) return nil;
+    if (!gHW[i] && !hudMakeWin(i)) return nil;
+    gHW[i].hidden = NO;
+    return gHContent[i];
+}
+void hudSlotHide(int i) { if (i >= 0 && i < HUD_N && gHW[i]) gHW[i].hidden = YES; }
+// 正在操作的小窗橙色,其他灰色
+void hudSlotMark(int i, BOOL cur) {
+    if (i < 0 || i >= HUD_N || !gHW[i]) return;
+    UIColor *c = cur ? UIColor.systemOrangeColor : UIColor.systemGrayColor;
+    gHW[i].layer.borderColor = c.CGColor;
+    gHBar[i].backgroundColor = c;
+}
+double hudSlotScale(int i) { return (i >= 0 && i < HUD_N && gHK[i] > 0) ? gHK[i] : 0.3; }
+CGPoint hudSlotOrigin(int i) {
+    if (i < 0 || i >= HUD_N || !gHW[i]) return CGPointZero;
+    CGRect f = gHW[i].frame;
+    return CGPointMake(f.origin.x, f.origin.y + HUD_BAR);
 }
 
 static Class gAXRep;
@@ -92,23 +162,27 @@ static void hudHIDCallback(void *target, void *refcon, void *service, void *even
     BOOL move = ((BOOL (*)(id, SEL))objc_msgSend)(rep, sel_registerName("isMove"));
     BOOL lift = ((BOOL (*)(id, SEL))objc_msgSend)(rep, sel_registerName("isLift")) || ((BOOL (*)(id, SEL))objc_msgSend)(rep, sel_registerName("isCancel"));
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!gHudWin) return;
-        CGRect f = gHudWin.frame;
         if (down) {
-            CGRect bar = CGRectMake(f.origin.x, f.origin.y, f.size.width, HUD_BAR + 6);
-            if (CGRectContainsPoint(bar, p)) {
+            gDragMode = 0; gDragSlot = -1;
+            for (int i = HUD_N - 1; i >= 0; i--) {
+                if (!gHW[i] || gHW[i].hidden) continue;
+                CGRect f = gHW[i].frame;
+                CGRect bar = CGRectMake(f.origin.x, f.origin.y, f.size.width, HUD_BAR + 6);
+                if (!CGRectContainsPoint(bar, p)) continue;
                 gDragMode = (p.x > f.origin.x + f.size.width * 0.55) ? 2 : 1;
-                gDragP0 = p; gDragO0 = f.origin; gDragK0 = winScale();
+                gDragSlot = i; gDragP0 = p; gDragO0 = f.origin; gDragK0 = hudSlotScale(i);
                 winRefreshOrigin(); // 写一下“正在拖”,PhoneAgent 这时先不点
-            } else gDragMode = 0;
-        } else if (move && gDragMode) {
+                break;
+            }
+        } else if (move && gDragMode && gDragSlot >= 0) {
             CGSize sc = UIScreen.mainScreen.bounds.size;
             double dx = p.x - gDragP0.x, dy = p.y - gDragP0.y;
-            if (gDragMode == 1) hudLayout(CGPointMake(gDragO0.x + dx, gDragO0.y + dy), gDragK0);
-            else hudLayout(gDragO0, gDragK0 + (dx / sc.width + dy / sc.height) / 2);
-        } else if (lift && gDragMode) {
-            hlog(@"小窗%@:左上角 (%.0f,%.0f) 缩放 %.0f%%", gDragMode == 1 ? @"移动" : @"改大小", gHudWin.frame.origin.x, gHudWin.frame.origin.y, winScale() * 100);
-            gDragMode = 0;
+            if (gDragMode == 1) hudLayout(gDragSlot, CGPointMake(gDragO0.x + dx, gDragO0.y + dy), gDragK0);
+            else hudLayout(gDragSlot, gDragO0, gDragK0 + (dx / sc.width + dy / sc.height) / 2);
+        } else if (lift && gDragMode && gDragSlot >= 0) {
+            CGRect f = gHW[gDragSlot].frame;
+            hlog(@"小窗 %d %@:左上角 (%.0f,%.0f) 缩放 %.0f%%", gDragSlot + 1, gDragMode == 1 ? @"移动" : @"改大小", f.origin.x, f.origin.y, hudSlotScale(gDragSlot) * 100);
+            gDragMode = 0; gDragSlot = -1;
             winRefreshOrigin(); // 松手:写新位置,PhoneAgent 接着点
         }
     });
@@ -145,13 +219,16 @@ static void hHandle(int c) {
     if ([path isEqualToString:@"/ping"]) { hJSON(c, 200, @{@"ok": @YES, @"active": @(winActive())}); return; }
     if ([path isEqualToString:@"/open"]) {
         NSString *note = nil;
-        gWNoKill = [q[@"nokill"] isEqualToString:@"1"];
         BOOL ok = winOpen(q[@"bid"] ?: @"", &note);
         hlog(@"打开 %@:%@", q[@"bid"], ok ? (note ?: @"成功") : (note ?: @"失败"));
         hJSON(c, 200, @{@"ok": @(ok), @"note": note ?: @""});
         return;
     }
-    if ([path isEqualToString:@"/close"]) { winClose(); hJSON(c, 200, @{@"ok": @YES}); return; }
+    if ([path isEqualToString:@"/close"]) {
+        if ([q[@"bid"] length]) winCloseBid(q[@"bid"]); else winClose();
+        hJSON(c, 200, @{@"ok": @YES, @"active": @(winActive())});
+        return;
+    }
     if ([path isEqualToString:@"/snap"]) {
         NSString *e = nil;
         UIImage *u = winSnapshot(&e);
@@ -195,45 +272,11 @@ static void hudServeStart(void) {
 @implementation PAHudDelegate
 - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opts {
     hlog(@"悬浮层进程启动 pid=%d uid=%d", getpid(), getuid());
-    @try {
-        CGSize sc = UIScreen.mainScreen.bounds.size;
-        PAHudWindow *win = [[PAHudWindow alloc] initWithFrame:CGRectMake(sc.width - round(sc.width * 0.3) - 8, 54, 10, 10)];
-        win.rootViewController = [UIViewController new];
-        win.rootViewController.view.backgroundColor = UIColor.blackColor;
-        win.layer.borderWidth = 1.5; win.layer.borderColor = UIColor.systemOrangeColor.CGColor;
-        win.layer.cornerRadius = 6;
-        win.clipsToBounds = YES;
-        // 顶上的拖动条:左边按住拖=移动,右边「⤡」按住拖=放大缩小
-        UIView *bar = [UIView new];
-        bar.backgroundColor = UIColor.systemOrangeColor;
-        UILabel *l1 = [UILabel new]; l1.text = @" ≡ 拖动"; l1.font = [UIFont boldSystemFontOfSize:12]; l1.textColor = UIColor.whiteColor;
-        UILabel *l2 = [UILabel new]; l2.text = @"⤡ "; l2.font = [UIFont boldSystemFontOfSize:16]; l2.textColor = UIColor.whiteColor; l2.textAlignment = NSTextAlignmentRight;
-        l1.tag = 1; l2.tag = 2;
-        [bar addSubview:l1]; [bar addSubview:l2];
-        UIView *content = [UIView new];
-        content.backgroundColor = UIColor.blackColor;
-        content.clipsToBounds = YES;
-        [win.rootViewController.view addSubview:content];
-        [win.rootViewController.view addSubview:bar];
-        gHudBar = bar; gHudContent = content;
-        win.windowLevel = 10000010.0;
-        win.hidden = NO;
-        [win makeKeyAndVisible];
-        self.window = win;
-        gHudWin = win;
-        winSetHostWindow(win, content);
-        hudLayout(win.frame.origin, 0.3);
-        if (gHudServe) hlog(@"悬浮层待命,等 PhoneAgent 打开 App");
-        dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_NOW);
-        Class HC = NSClassFromString(@"SBSAccessibilityWindowHostingController");
-        unsigned int cid = [win respondsToSelector:sel_registerName("_contextId")] ? ((unsigned int (*)(id, SEL))objc_msgSend)(win, sel_registerName("_contextId")) : 0;
-        if (HC && cid) {
-            self.hosting = [HC new];
-            ((void (*)(id, SEL, unsigned int, double))objc_msgSend)(self.hosting, sel_registerName("registerWindowWithContextID:atLevel:"), cid, win.windowLevel);
-            hlog(@"悬浮窗已登记 context=%u", cid);
-        } else hlog(@"✗ 登记悬浮窗失败 HC=%@ context=%u", HC, cid);
-        if (gHudServe) self.window.hidden = YES; // 打开 App 时才显示
-    } @catch (NSException *e) { hlog(@"✗ 建悬浮窗异常 %@", e.reason ?: e.name); }
+    winSetHud();
+    // 先建第 1 个小窗并登记(和以前一样启动时就登记),打开 App 时才显示
+    PAHudWindow *win = hudMakeWin(0);
+    self.window = win;
+    if (gHudServe) { hlog(@"悬浮层待命,等 PhoneAgent 打开 App"); win.hidden = YES; }
     hudServeStart(); // v0.9.78:实验页自测流程已删,悬浮层只给任务用
     return YES;
 }
@@ -407,13 +450,13 @@ static BOOL hudEnsure(NSString **note) {
 BOOL hudRemoteOpen(NSString *bid, NSString **note) {
     if (!hudEnsure(note)) return NO;
     NSInteger st = 0;
-    NSData *d = hudReq(@"/open", @{@"bid": bid ?: @"", @"nokill": [NSUserDefaults.standardUserDefaults boolForKey:@"win_kill"] ? @"0" : @"1"}, 35, &st); // 打开+等首帧+查黑屏最多约 27 秒
+    NSData *d = hudReq(@"/open", @{@"bid": bid ?: @""}, 35, &st); // 打开+等首帧+查黑屏最多约 27 秒
     NSDictionary *j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
     if (![j isKindOfClass:NSDictionary.class]) { if (note) *note = [NSString stringWithFormat:@"悬浮层没回应(HTTP %ld)", (long)st]; return NO; }
     if (note) *note = j[@"note"];
     return [j[@"ok"] boolValue];
 }
-void hudRemoteClose(void) { if (gHudKey.length) hudReq(@"/close", @{}, 3, NULL); }
+void hudRemoteClose(NSString *bid) { if (gHudKey.length) hudReq(@"/close", bid.length ? @{@"bid": bid} : @{}, 3, NULL); }
 // v0.9.75:有的 App(美团等)刚打开时还没画出来,快照会失败;最多重试 8 次(约 6 秒),失败时带上悬浮层给的原因
 UIImage *hudRemoteSnapshot(NSString **err) {
     NSInteger st = 0; NSString *why = nil;

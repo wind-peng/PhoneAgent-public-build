@@ -16,31 +16,37 @@
 #define WR(o, s, v)     ((void (*)(id, SEL, CGRect))objc_msgSend)((o), sel_registerName(s), (v))
 
 static double kWinK = 0.3;                // 小窗缩放(lab15 起悬浮层里可拖着改大小)
-static id gWScene, gWPresenter;           // 只在主线程读写
-static UIView *gWView;
-static UIWindow *gWWin;
+// v0.9.81:最多 3 个小窗同时显示,每个小窗一个 App;gCur 是正在操作的那个
+@interface PAWSlot : NSObject
+@property (nonatomic, strong) id scene, presenter;
+@property (nonatomic, strong) UIView *view;
+@property (nonatomic, copy) NSString *bid;
+@property (nonatomic) int idx;
+@property (nonatomic) CFAbsoluteTime used;
+@end
+@implementation PAWSlot @end
+#define WIN_MAX 3
+static NSMutableArray<PAWSlot *> *gSlots;  // 只在主线程读写
+static PAWSlot *gCur;                      // 只在主线程读写
 static NSString *gWBid;
 static volatile BOOL gWActive = NO;
 static volatile double gWOX = 0, gWOY = 0; // 小窗左上角(屏幕 pt)
 static volatile BOOL gPAFront = YES;       // PhoneAgent 在前台(进后台后不再发触摸,免得点到别的 App)
 static BOOL gWHud = NO;                    // lab14:在悬浮层进程里(小窗盖在所有界面上,不用管 PhoneAgent 在不在前台)
 
-// lab14:悬浮层进程把自己的系统级窗口交给小窗用
-static UIView *gWHost;                     // lab15:小窗画面放进这个视图(悬浮层里顶上留出拖动条)
-void winSetHostWindow(UIWindow *w, UIView *host) { gWWin = w; gWHost = host; gWHud = YES; gPAFront = YES; }
-// lab15:改小窗缩放(主线程)
-void winSetScale(double k) {
-    kWinK = k;
-    if (gWView) gWView.transform = CGAffineTransformMakeScale(k, k);
+// 悬浮层进程:小窗窗口由 pahud.m 按编号建(hudSlotContent 等)
+void winSetHud(void) { gWHud = YES; gPAFront = YES; }
+// 某个小窗改了缩放(主线程)
+void winSlotScale(int i, double k) {
+    for (PAWSlot *s in gSlots) if (s.idx == i) s.view.transform = CGAffineTransformMakeScale(k, k);
 }
-double winScale(void) { return kWinK; }
-// 小窗画面左上角的屏幕坐标(拖动后要重算,点击按它换算)。主线程调用
+// 当前小窗画面左上角的屏幕坐标和缩放写给 PhoneAgent(拖动后要重算,点击按它换算)。主线程调用
 void winRefreshOrigin(void) {
-    if (!gWWin) return;
-    UIView *h = gWHost ?: gWWin.rootViewController.view;
-    CGPoint p = [h convertPoint:CGPointZero toView:nil];
-    gWOX = gWWin.frame.origin.x + p.x; gWOY = gWWin.frame.origin.y + p.y;
-    if (gWHud) hudWriteGeo(gWOX, gWOY, kWinK);
+    if (!gWHud || !gCur) return;
+    CGPoint o = hudSlotOrigin(gCur.idx);
+    kWinK = hudSlotScale(gCur.idx);
+    gWOX = o.x; gWOY = o.y;
+    hudWriteGeo(gWOX, gWOY, kWinK);
 }
 
 static Class wC(NSString *n) { return NSClassFromString(n); }
@@ -89,8 +95,8 @@ static void wWatchFront(void) {
     });
 }
 
-// 结束已在跑的同名 App(0.9.79 真机验证:不结束也能嵌进小窗;只在设置里打开时才用)
-BOOL gWNoKill = YES; // v0.9.80:默认不先结束(0.9.79 真机:不结束也能打开)
+// 结束已在跑的同名 App(0.9.80 真机验证:不在小窗里的 App 不结束就嵌不出画面)
+BOOL gWNoKill = NO; // v0.9.81:改回先结束(0.9.80 真机:不结束没画面)
 static int wPid(NSString *bid) {
     if (!bid.length) return 0;
     @try {
@@ -107,44 +113,38 @@ void winKill(NSString *bid) {
     if (pid > 0) { kill(pid, SIGKILL); usleep(800 * 1000); }
 }
 
-static void lClose(void) {
-    wMain(^{
-        gWActive = NO;
-        @try {
-            if (gWPresenter && wHas(gWPresenter, "invalidate")) W0(gWPresenter, "invalidate");
-            [gWView removeFromSuperview];
-            if (gWScene) {
-                id sm = W0(wC(@"FBSceneManager"), "sharedInstance");
-                if (wHas(sm, "destroyScene:withTransitionContext:")) W2(sm, "destroyScene:withTransitionContext:", W0(gWScene, "identifier"), nil);
-            }
-        } @catch (NSException *e) {}
-        gWView = nil; gWPresenter = nil; gWScene = nil; gWBid = nil;
-        gWWin.hidden = YES;
-    });
+// 主线程:关掉一个小窗(场景销毁,窗口藏起来;App 进程不杀)
+static void lCloseSlot(PAWSlot *sl) {
+    if (!sl) return;
+    @try {
+        if (sl.presenter && wHas(sl.presenter, "invalidate")) W0(sl.presenter, "invalidate");
+        [sl.view removeFromSuperview];
+        if (sl.scene) {
+            id sm = W0(wC(@"FBSceneManager"), "sharedInstance");
+            if (wHas(sm, "destroyScene:withTransitionContext:")) W2(sm, "destroyScene:withTransitionContext:", W0(sl.scene, "identifier"), nil);
+        }
+    } @catch (NSException *e) {}
+    if (gWHud) hudSlotHide(sl.idx);
+    [gSlots removeObject:sl];
+    if (gCur == sl) { gCur = nil; gWActive = NO; gWBid = nil; }
 }
-
-static UIWindow *wWindow(void) { // 主线程
-    if (gWWin) return gWWin;
-    UIWindowScene *ws = nil;
-    for (UIScene *s in UIApplication.sharedApplication.connectedScenes)
-        if ([s isKindOfClass:UIWindowScene.class]) { ws = (UIWindowScene *)s; if (s.activationState == UISceneActivationStateForegroundActive) break; }
-    if (!ws) return nil;
-    CGSize sc = UIScreen.mainScreen.bounds.size;
-    CGFloat w = round(sc.width * kWinK), h = round(sc.height * kWinK);
-    UIWindow *win = [[UIWindow alloc] initWithWindowScene:ws];
-    win.frame = CGRectMake(sc.width - w - 8, 54, w, h);
-    win.windowLevel = UIWindowLevelAlert + 5;
-    win.rootViewController = [UIViewController new];
-    win.rootViewController.view.backgroundColor = UIColor.blackColor;
-    win.rootViewController.view.clipsToBounds = YES;
-    win.layer.borderWidth = 1; win.layer.borderColor = UIColor.systemBlueColor.CGColor;
-    win.clipsToBounds = YES;
-    gWWin = win;
-    return win;
+// 主线程:把某个小窗设为当前(点击、快照都对它)
+static void wSetCur(PAWSlot *sl) {
+    gCur = sl; sl.used = CFAbsoluteTimeGetCurrent();
+    gWBid = [sl.bid copy]; gWActive = YES;
+    if (gWHud) for (PAWSlot *x in gSlots) hudSlotMark(x.idx, x == sl);
+    winRefreshOrigin();
+}
+static void lClose(void) {
+    wMain(^{ for (PAWSlot *x in [gSlots copy]) lCloseSlot(x); gCur = nil; gWActive = NO; gWBid = nil; });
+}
+// 只关某个 App 的小窗
+static void lCloseBid(NSString *bid) {
+    wMain(^{ for (PAWSlot *x in [gSlots copy]) if ([x.bid isEqualToString:bid]) lCloseSlot(x); });
 }
 
 // 主线程:进程已启动,建场景并放进小窗
-static NSString *wBuildScene(NSString *bid, id identity, id predicate, id manager) {
+static NSString *wBuildScene(NSString *bid, id identity, id predicate, id manager, int idx) {
     @try {
         NSError *err = nil;
         id handle = ((id (*)(id, SEL, id, NSError **))objc_msgSend)(wC(@"RBSProcessHandle"), sel_registerName("handleForPredicate:error:"), predicate, &err);
@@ -185,16 +185,18 @@ static NSString *wBuildScene(NSString *bid, id identity, id predicate, id manage
         W0(presenter, "activate");
         UIView *pv = W0(presenter, "presentationView");
         if (![pv isKindOfClass:UIView.class]) return @"presentationView 不是视图";
-        UIWindow *win = wWindow();
-        if (!win) return @"找不到 PhoneAgent 的窗口场景";
+        if (!gWHud) return @"小窗只在悬浮层里用";
+        UIView *host = hudSlotContent(idx);
+        if (!host) return @"小窗窗口建不出来";
         pv.frame = full;
         pv.layer.anchorPoint = CGPointZero; pv.layer.position = CGPointZero;
-        pv.transform = CGAffineTransformMakeScale(kWinK, kWinK);
-        [(gWHost ?: win.rootViewController.view) addSubview:pv];
-        win.hidden = NO;
-        winRefreshOrigin();
-        gWScene = scene; gWPresenter = presenter; gWView = pv; gWBid = [bid copy];
-        gWActive = YES;
+        pv.transform = CGAffineTransformMakeScale(hudSlotScale(idx), hudSlotScale(idx));
+        [host addSubview:pv];
+        PAWSlot *sl = [PAWSlot new];
+        sl.scene = scene; sl.presenter = presenter; sl.view = pv; sl.bid = bid; sl.idx = idx;
+        if (!gSlots) gSlots = [NSMutableArray array];
+        [gSlots addObject:sl];
+        wSetCur(sl);
         return nil;
     } @catch (NSException *e) {
         return [NSString stringWithFormat:@"异常 %@", e.reason ?: e.name];
@@ -203,7 +205,7 @@ static NSString *wBuildScene(NSString *bid, id identity, id predicate, id manage
 
 static long wContentState(void) {
     __block long st = -1;
-    wMain(^{ if (gWScene && wHas(gWScene, "contentState")) st = ((long (*)(id, SEL))objc_msgSend)(gWScene, sel_registerName("contentState")); });
+    wMain(^{ id sc = gCur.scene; if (sc && wHas(sc, "contentState")) st = ((long (*)(id, SEL))objc_msgSend)(sc, sel_registerName("contentState")); });
     return st;
 }
 
@@ -229,9 +231,14 @@ static int wMaxLuma(CGImageRef cg) {
 // 在小窗里打开 App(后台线程调用;会等到 App 画出第一帧,最多约 10 秒)
 static BOOL lOpen(NSString *bid, NSString **note) {
     if (!bid.length) { if (note) *note = @"包名为空"; return NO; }
-    // v0.9.80:小窗里已经是这个 App 且进程还活着,就不重开(以前会关掉重开,页面回到首页)
-    if (gWActive && [gWBid isEqualToString:bid] && wPid(bid) > 0) { if (note) *note = @"已在小窗里"; return YES; }
     if (NSThread.isMainThread) { if (note) *note = @"不能在主线程打开小窗"; return NO; }
+    // v0.9.81:这个 App 已经在某个小窗里且进程还活着,直接切过去(不杀不重开,页面保留)
+    __block PAWSlot *hit = nil;
+    wMain(^{ for (PAWSlot *x in gSlots) if ([x.bid isEqualToString:bid]) hit = x; });
+    if (hit) {
+        if (wPid(bid) > 0) { wMain(^{ wSetCur(hit); }); if (note) *note = @"切到已打开的小窗"; return YES; }
+        wMain(^{ lCloseSlot(hit); });
+    }
     wWatchFront();
     if (!gPAFront) { if (note) *note = @"PhoneAgent 不在前台,小窗看不到"; return NO; }
     NSArray *need = @[@"RBSProcessIdentity", @"RBSProcessPredicate", @"RBSProcessHandle", @"FBProcessManager",
@@ -240,8 +247,22 @@ static BOOL lOpen(NSString *bid, NSString **note) {
                       @"UIApplicationSceneSpecification", @"FBSMutableSceneParameters",
                       @"UIMutableApplicationSceneSettings", @"UIMutableApplicationSceneClientSettings"];
     for (NSString *n in need) if (!wC(n)) { if (note) *note = [@"系统缺少 " stringByAppendingString:n]; return NO; }
-    lClose();
-    if (!gWNoKill) winKill(bid); // v0.9.79:设置里可关掉“先结束”
+    // 已有 3 个小窗:关掉最久没用的那个;再找一个空编号
+    __block int idx = -1;
+    wMain(^{
+        if (gSlots.count >= WIN_MAX) {
+            PAWSlot *old = nil;
+            for (PAWSlot *x in gSlots) if (!old || x.used < old.used) old = x;
+            lCloseSlot(old);
+        }
+        for (int i = 0; i < WIN_MAX && idx < 0; i++) {
+            BOOL used = NO;
+            for (PAWSlot *x in gSlots) if (x.idx == i) used = YES;
+            if (!used) idx = i;
+        }
+    });
+    if (idx < 0) { if (note) *note = @"没有空的小窗"; return NO; }
+    if (!gWNoKill) winKill(bid); // 不在小窗里的 App 要先结束才嵌得出画面(0.9.80 真机验证)
     __block NSString *fail = @"启动超时";
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     __block id keepTx = nil;
@@ -264,7 +285,7 @@ static BOOL lOpen(NSString *bid, NSString **note) {
             if (!tx) { fail = @"启动事务创建失败"; dispatch_semaphore_signal(sem); return; }
             W1(tx, "setCompletionBlock:", (id)^{
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    fail = wBuildScene(bid, identity, predicate, manager);
+                    fail = wBuildScene(bid, identity, predicate, manager, idx);
                     dispatch_semaphore_signal(sem);
                 });
             });
@@ -277,12 +298,12 @@ static BOOL lOpen(NSString *bid, NSString **note) {
     });
     if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC))) != 0) {
         keepTx = nil;
-        lClose();
+        lCloseBid(bid);
         if (note) *note = @"启动超时(10 秒)";
         return NO;
     }
     keepTx = nil;
-    if (fail) { lClose(); if (note) *note = fail; return NO; }
+    if (fail) { lCloseBid(bid); if (note) *note = fail; return NO; }
     for (int i = 0; i < 40 && wContentState() != 2; i++) usleep(200 * 1000); // 等 App 画出第一帧(微信约 2~4 秒)
     usleep(500 * 1000);
     // v0.9.77:有的 App(美团)在小窗里一直全黑;等最多约 8 秒还是全黑,就关掉小窗,告诉 PhoneAgent 改用普通方式
@@ -293,7 +314,7 @@ static BOOL lOpen(NSString *bid, NSString **note) {
             if (u && wMaxLuma(u.CGImage) >= 16) black = NO;
             else usleep(750 * 1000);
         }
-        if (black) { lClose(); if (note) *note = @"画面全黑(这个 App 不支持小窗)"; return NO; }
+        if (black) { lCloseBid(bid); if (note) *note = @"画面全黑(这个 App 不支持小窗)"; return NO; }
     }
     if (note) *note = wContentState() == 2 ? @"已在小窗打开" : @"已在小窗打开(画面可能还在加载)";
     return YES;
@@ -337,6 +358,7 @@ static UIImage *lSnapshot(NSString **err) {
     if (!gWActive) { if (err) *err = @"小窗没开"; return nil; }
     __block UIImage *out = nil; __block NSMutableArray *why = [NSMutableArray array];
     wMain(^{
+        id gWScene = gCur.scene, gWPresenter = gCur.presenter; UIView *gWView = gCur.view;
         NSString *w = nil; CGImageRef cg = NULL;
         @try { cg = wSnapCG(gWScene ? W0(gWScene, "createSnapshot") : nil, &w); } @catch (NSException *x) { w = @"异常"; }
         if (!cg) { [why addObject:[@"1" stringByAppendingString:w ?: @""]]; w = nil;
@@ -383,8 +405,15 @@ BOOL winOpen(NSString *bid, NSString **note) {
 }
 void winClose(void) {
     if (gWHud) { lClose(); return; }
-    if (gRActive) hudRemoteClose();
+    if (gRActive) hudRemoteClose(nil);
     gRActive = NO; gRBid = nil;
+}
+// v0.9.81:只关某个 App 的小窗(结束这个 App 时用);关的是当前小窗就没有当前了
+void winCloseBid(NSString *bid) {
+    if (gWHud) { lCloseBid(bid); return; }
+    if (!bid.length) return;
+    hudRemoteClose(bid);
+    if ([bid isEqualToString:gRBid]) { gRActive = NO; gRBid = nil; }
 }
 UIImage *winSnapshot(NSString **err) {
     if (gWHud) return lSnapshot(err);

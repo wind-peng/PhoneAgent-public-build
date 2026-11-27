@@ -551,7 +551,7 @@ static NSArray *pidsForBundle(NSString *bid) {
 static BOOL closeApp(NSString *bid, NSString **note) {
     // v0.9.67 小窗模式:关小窗并结束这个 App 进程,不去多任务界面划
     if (winEnabled() && gAgentRunning) {
-        if ([bid isEqualToString:winBid()]) winClose();
+        winCloseBid(bid); // v0.9.81:这个 App 在哪个小窗里就关哪个
         winKill(bid);
         if (note) *note = @"已结束(小窗模式)";
         return YES;
