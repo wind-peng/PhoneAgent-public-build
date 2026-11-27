@@ -525,12 +525,19 @@ BOOL hudRemoteOpen(NSString *bid, NSString **note) {
     return [j[@"ok"] boolValue];
 }
 void hudRemoteClose(void) { if (gHudKey.length) hudReq(@"/close", @{}, 3, NULL); }
+// v0.9.75:有的 App(美团等)刚打开时还没画出来,快照会失败;最多重试 8 次(约 6 秒),失败时带上悬浮层给的原因
 UIImage *hudRemoteSnapshot(NSString **err) {
-    NSInteger st = 0;
-    NSData *d = hudReq(@"/snap", @{}, 5, &st);
-    UIImage *u = (st == 200 && d.length) ? [UIImage imageWithData:d] : nil;
-    if (!u && err) *err = [NSString stringWithFormat:@"悬浮小窗快照失败(HTTP %ld)", (long)st];
-    return u;
+    NSInteger st = 0; NSString *why = nil;
+    for (int i = 0; i < 8; i++) {
+        NSData *d = hudReq(@"/snap", @{}, 5, &st);
+        UIImage *u = (st == 200 && d.length) ? [UIImage imageWithData:d] : nil;
+        if (u) return u;
+        if (d.length) { NSDictionary *j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil]; if ([j isKindOfClass:NSDictionary.class] && [j[@"error"] length]) why = j[@"error"]; }
+        if (st == 0 && !hudAlive()) break; // 悬浮层进程没了,重试也没用
+        usleep(750 * 1000);
+    }
+    if (err) *err = [NSString stringWithFormat:@"悬浮小窗快照失败(HTTP %ld%@%@)", (long)st, why ? @"," : @"", why ?: @""];
+    return nil;
 }
 
 NSString *hudReadLog(void) { return [NSString stringWithContentsOfFile:HUD_LOG encoding:NSUTF8StringEncoding error:nil] ?: @""; }
