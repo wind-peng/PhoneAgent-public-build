@@ -5,6 +5,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <signal.h>
+#import <CoreImage/CoreImage.h>
 
 #define W0(o, s)        ((id (*)(id, SEL))objc_msgSend)((o), sel_registerName(s))
 #define W1(o, s, a)     ((id (*)(id, SEL, id))objc_msgSend)((o), sel_registerName(s), (a))
@@ -252,28 +253,75 @@ static BOOL lOpen(NSString *bid, NSString **note) {
 }
 
 // 小窗 App 的整屏快照(像素尺寸,如 1170×2532);深拷贝一份,免得快照对象释放后图被回收
+// 从快照对象拿图:先 capture,再取 CGImage,没有就取 IOSurface
+static CGImageRef wSnapCG(id snap, NSString **why) {
+    if (!snap) { *why = @"快照对象空"; return NULL; }
+    BOOL ok = wHas(snap, "capture") ? ((BOOL (*)(id, SEL))objc_msgSend)(snap, sel_registerName("capture")) : NO;
+    if (!ok) { *why = @"capture 失败"; return NULL; }
+    CGImageRef cg = wHas(snap, "CGImage") ? ((CGImageRef (*)(id, SEL))objc_msgSend)(snap, sel_registerName("CGImage")) : NULL;
+    if (cg) return CGImageRetain(cg);
+    for (NSString *n in @[@"IOSurface", @"fallbackIOSurface"]) {
+        if (!wHas(snap, n.UTF8String)) continue;
+        void *sf = ((void *(*)(id, SEL))objc_msgSend)(snap, sel_registerName(n.UTF8String));
+        if (!sf) continue;
+        CIImage *ci = [CIImage imageWithIOSurface:(IOSurfaceRef)sf];
+        CGImageRef c2 = ci ? [[CIContext contextWithOptions:nil] createCGImage:ci fromRect:ci.extent] : NULL;
+        if (c2) return c2;
+    }
+    *why = @"没有图像";
+    return NULL;
+}
+static UIImage *wCopyCG(CGImageRef cg) {
+    size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, 0, cs, kCGImageAlphaNoneSkipLast);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return nil;
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
+    CGImageRef copy = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    if (!copy) return nil;
+    UIImage *u = [UIImage imageWithCGImage:copy scale:1 orientation:UIImageOrientationUp];
+    CGImageRelease(copy);
+    return u;
+}
+// v0.9.76:有的 App(美团)用场景快照拿不到图,依次换 4 种办法:场景快照 → 带参数的场景快照 → presenter 快照 → 直接画小窗视图
 static UIImage *lSnapshot(NSString **err) {
     if (!gWActive) { if (err) *err = @"小窗没开"; return nil; }
-    __block UIImage *out = nil; __block NSString *e = nil;
+    __block UIImage *out = nil; __block NSMutableArray *why = [NSMutableArray array];
     wMain(^{
+        NSString *w = nil; CGImageRef cg = NULL;
+        @try { cg = wSnapCG(gWScene ? W0(gWScene, "createSnapshot") : nil, &w); } @catch (NSException *x) { w = @"异常"; }
+        if (!cg) { [why addObject:[@"1" stringByAppendingString:w ?: @""]]; w = nil;
+            @try {
+                id ctx = gWScene && wHas(gWScene, "snapshotContext") ? W0(gWScene, "snapshotContext") : nil;
+                if (ctx && wHas(ctx, "setScale:")) ((void (*)(id, SEL, double))objc_msgSend)(ctx, sel_registerName("setScale:"), UIScreen.mainScreen.scale);
+                cg = ctx && wHas(gWScene, "createSnapshotWithContext:") ? wSnapCG(W1(gWScene, "createSnapshotWithContext:", ctx), &w) : NULL;
+                if (!ctx) w = @"无参数";
+            } @catch (NSException *x) { w = @"异常"; }
+        }
+        if (!cg) { [why addObject:[@"2" stringByAppendingString:w ?: @""]]; w = nil;
+            @try { cg = gWPresenter && wHas(gWPresenter, "newSnapshot") ? wSnapCG(W0(gWPresenter, "newSnapshot"), &w) : NULL; if (!gWPresenter) w = @"无"; }
+            @catch (NSException *x) { w = @"异常"; }
+        }
+        if (cg) { out = wCopyCG(cg); CGImageRelease(cg); if (!out) [why addObject:@"拷贝失败"]; return; }
+        [why addObject:[@"3" stringByAppendingString:w ?: @""]];
+        // 4:直接把小窗里的视图按 App 原尺寸画出来
         @try {
-            id snap = gWScene ? W0(gWScene, "createSnapshot") : nil;
-            BOOL ok = snap && wHas(snap, "capture") ? ((BOOL (*)(id, SEL))objc_msgSend)(snap, sel_registerName("capture")) : NO;
-            CGImageRef cg = ok ? ((CGImageRef (*)(id, SEL))objc_msgSend)(snap, sel_registerName("CGImage")) : NULL;
-            if (!cg) { e = @"小窗快照失败"; return; }
-            size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
-            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-            CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, 0, cs, kCGImageAlphaNoneSkipLast);
-            CGColorSpaceRelease(cs);
-            if (!ctx) { e = @"快照拷贝失败"; return; }
-            CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
-            CGImageRef copy = CGBitmapContextCreateImage(ctx);
-            CGContextRelease(ctx);
-            if (copy) { out = [UIImage imageWithCGImage:copy scale:1 orientation:UIImageOrientationUp]; CGImageRelease(copy); }
-            else e = @"快照拷贝失败";
-        } @catch (NSException *x) { e = [NSString stringWithFormat:@"快照异常 %@", x.reason ?: x.name]; }
+            UIView *v = gWView;
+            if (v) {
+                CGSize sz = v.bounds.size;
+                UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat];
+                f.scale = UIScreen.mainScreen.scale; f.opaque = YES;
+                UIImage *img = [[[UIGraphicsImageRenderer alloc] initWithSize:sz format:f] imageWithActions:^(UIGraphicsImageRendererContext *c) {
+                    [v drawViewHierarchyInRect:CGRectMake(0, 0, sz.width, sz.height) afterScreenUpdates:NO];
+                }];
+                if (img.CGImage) out = wCopyCG(img.CGImage);
+            }
+            if (!out) [why addObject:@"4失败"];
+        } @catch (NSException *x) { [why addObject:@"4异常"]; }
     });
-    if (!out && err) *err = e;
+    if (!out && err) *err = [@"小窗快照失败:" stringByAppendingString:[why componentsJoinedByString:@";"]];
     return out;
 }
 
