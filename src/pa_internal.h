@@ -156,6 +156,7 @@ BOOL winSkipped(NSString *bid);
 void winSkipAdd(NSString *bid);
 BOOL winFallbackCast(void);
 int axBroadcastButton(CGPoint *center);
+BOOL axFindButton(NSArray *labels, CGPoint *center);
 void touchAdjust(double *x, double *y);
 void doTapRaw(double x, double y);
 void doSwipeSmooth(double x1, double y1, double x2, double y2, int ms, int holdMs);

@@ -285,6 +285,33 @@ int axBroadcastButton(CGPoint *center) {
     } @catch (NSException *e) {}
     return 0;
 }
+// v0.9.78:在屏幕中部按文字找按钮(完全一样才算),找到返回 YES 和按钮中心
+BOOL axFindButton(NSArray *labels, CGPoint *center) {
+    @try {
+        axInitOnce();
+        CGSize sz = UIScreen.mainScreen.bounds.size;
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        for (CGFloat y = sz.height * 0.35; y < sz.height * 0.75; y += 14) {
+            for (CGFloat fx = 0.2; fx <= 0.81; fx += 0.12) {
+                if (CFAbsoluteTimeGetCurrent() - t0 > 2.0) return NO;
+                id el = axHitAt(CGPointMake(sz.width * fx, y));
+                NSString *l = el ? axKV(el, @"label") : nil;
+                if (![l isKindOfClass:NSString.class]) continue;
+                l = [l stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+                if (![labels containsObject:l]) continue;
+                CGPoint c = CGPointMake(sz.width * fx, y);
+                id fv = axKV(el, @"frame");
+                if ([fv isKindOfClass:NSValue.class] && strcmp([(NSValue *)fv objCType], @encode(CGRect)) == 0) {
+                    CGRect r = [(NSValue *)fv CGRectValue];
+                    if (r.size.width > 10 && r.size.height > 10) c = CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r));
+                }
+                if (center) *center = c;
+                return YES;
+            }
+        }
+    } @catch (NSException *e) {}
+    return NO;
+}
 static NSString *axTidy(NSString *t) {
     t = [t stringByReplacingOccurrencesOfString:@"人民币" withString:@"¥"];
     { // v0.9.34:「128.2元」这类写法也统一成 ¥128.2

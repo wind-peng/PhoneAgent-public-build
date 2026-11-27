@@ -1290,7 +1290,9 @@ static void taskRunEnd(NSString *task, BOOL stopCast) {
         double okx = [ud doubleForKey:@"stop_ok_x"], oky = [ud doubleForKey:@"stop_ok_y"];
         if (okx <= 0) okx = 0.327; // 来自你发的截图:“好”按钮中心在屏幕宽的 32.7%、高的 56.6%
         if (oky <= 0) oky = 0.566;
-        doTap(sc.width * okx, sc.height * oky);
+        CGPoint okp = CGPointZero; // v0.9.78:先用无障碍找提示框里的「好」,找不到才按记住的位置点
+        if (axFindButton(@[@"好", @"OK"], &okp)) doTap(okp.x, okp.y);
+        else doTap(sc.width * okx, sc.height * oky);
         usleep(1000 * 1000);
         [NSNotificationCenter.defaultCenter postNotificationName:@"pa.closing" object:@NO];
     }
