@@ -89,19 +89,22 @@ static void wWatchFront(void) {
     });
 }
 
-// 结束已在跑的同名 App(lab13 时和其他改动一起加的,单独是否必要未验证;v0.9.79 可在设置里关掉做对比)
-BOOL gWNoKill = NO;
-void winKill(NSString *bid) {
-    if (!bid.length) return;
+// 结束已在跑的同名 App(0.9.79 真机验证:不结束也能嵌进小窗;只在设置里打开时才用)
+BOOL gWNoKill = YES; // v0.9.80:默认不先结束(0.9.79 真机:不结束也能打开)
+static int wPid(NSString *bid) {
+    if (!bid.length) return 0;
     @try {
         Class PC = wC(@"RBSProcessPredicate");
         id pred = [PC respondsToSelector:sel_registerName("predicateMatchingBundleIdentifier:")] ? W1(PC, "predicateMatchingBundleIdentifier:", bid) : nil;
         if (!pred) pred = W1(PC, "predicateMatchingIdentity:", W1(wC(@"RBSProcessIdentity"), "identityForEmbeddedApplicationIdentifier:", bid));
         NSError *err = nil;
         id h = pred ? ((id (*)(id, SEL, id, NSError **))objc_msgSend)(wC(@"RBSProcessHandle"), sel_registerName("handleForPredicate:error:"), pred, &err) : nil;
-        int pid = (h && wHas(h, "pid")) ? ((int (*)(id, SEL))objc_msgSend)(h, sel_registerName("pid")) : 0;
-        if (pid > 0) { kill(pid, SIGKILL); usleep(800 * 1000); }
-    } @catch (NSException *e) {}
+        return (h && wHas(h, "pid")) ? ((int (*)(id, SEL))objc_msgSend)(h, sel_registerName("pid")) : 0;
+    } @catch (NSException *e) { return 0; }
+}
+void winKill(NSString *bid) {
+    int pid = wPid(bid);
+    if (pid > 0) { kill(pid, SIGKILL); usleep(800 * 1000); }
 }
 
 static void lClose(void) {
@@ -226,6 +229,8 @@ static int wMaxLuma(CGImageRef cg) {
 // 在小窗里打开 App(后台线程调用;会等到 App 画出第一帧,最多约 10 秒)
 static BOOL lOpen(NSString *bid, NSString **note) {
     if (!bid.length) { if (note) *note = @"包名为空"; return NO; }
+    // v0.9.80:小窗里已经是这个 App 且进程还活着,就不重开(以前会关掉重开,页面回到首页)
+    if (gWActive && [gWBid isEqualToString:bid] && wPid(bid) > 0) { if (note) *note = @"已在小窗里"; return YES; }
     if (NSThread.isMainThread) { if (note) *note = @"不能在主线程打开小窗"; return NO; }
     wWatchFront();
     if (!gPAFront) { if (note) *note = @"PhoneAgent 不在前台,小窗看不到"; return NO; }
